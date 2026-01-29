@@ -5,11 +5,21 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
 from pathspec import PathSpec
 
 if TYPE_CHECKING:
     from know.config import Config
+
+# Tree-sitter imports (optional - falls back to regex if not available)
+try:
+    from tree_sitter import Language, Parser
+    from tree_sitter_languages import get_language, get_parser
+    TREESITTER_AVAILABLE = True
+except ImportError:
+    TREESITTER_AVAILABLE = False
 
 
 @dataclass
@@ -90,66 +100,64 @@ class CodebaseScanner:
         
         return True
     
-    def scan(self) -> Dict[str, int]:
-        """Scan codebase and return statistics."""
+    def scan(self, max_workers: Optional[int] = None) -> Dict[str, int]:
+        """Scan codebase and return statistics.
+        
+        Uses parallel processing for better performance on large codebases.
+        """
         self.modules = []
         
+        if max_workers is None:
+            max_workers = min(32, (os.cpu_count() or 1) + 4)
+        
+        # Collect all files to scan
+        files_to_scan: List[Tuple[Path, str]] = []
+        
+        # Python files
+        for path in self.root.rglob("*.py"):
+            if self._should_include(path):
+                files_to_scan.append((path, "python"))
+        
+        # TypeScript/JavaScript files (limit to avoid overload)
+        ts_files = []
+        for ext in [".ts", ".tsx", ".js", ".jsx"]:
+            for path in self.root.rglob(f"*{ext}"):
+                if self._should_include(path):
+                    ts_files.append((path, "typescript"))
+        
+        # Limit TS files for performance (prioritize non-test files)
+        ts_files.sort(key=lambda x: ("test" in str(x[0]).lower(), "spec" in str(x[0]).lower()))
+        files_to_scan.extend(ts_files[:500])  # Limit to 500 TS files
+        
+        # Go files
+        for path in self.root.rglob("*.go"):
+            if self._should_include(path):
+                files_to_scan.append((path, "go"))
+        
+        # Process files in parallel
         file_count = 0
         function_count = 0
         class_count = 0
         
-        # Find all Python files
-        for ext in [".py"]:
-            for path in self.root.rglob(f"*{ext}"):
-                if not self._should_include(path):
-                    continue
-                
-                try:
-                    module = self._parse_python_file(path)
-                    if module:
-                        self.modules.append(module)
-                        file_count += 1
-                        function_count += len(module.functions)
-                        class_count += len(module.classes)
-                        for cls in module.classes:
-                            function_count += len(cls.methods)
-                except Exception:
-                    continue
-        
-        # Find all TypeScript/JavaScript files
-        for ext in [".ts", ".tsx", ".js", ".jsx"]:
-            for path in self.root.rglob(f"*{ext}"):
-                if not self._should_include(path):
-                    continue
-                
-                try:
-                    module = self._parse_typescript_file(path)
-                    if module:
-                        self.modules.append(module)
-                        file_count += 1
-                        function_count += len(module.functions)
-                        class_count += len(module.classes)
-                        for cls in module.classes:
-                            function_count += len(cls.methods)
-                except Exception:
-                    continue
-        
-        # Find all Go files
-        for path in self.root.rglob("*.go"):
-            if not self._should_include(path):
-                continue
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {
+                executor.submit(self._parse_file_worker, path, lang): (path, lang)
+                for path, lang in files_to_scan
+            }
             
-            try:
-                module = self._parse_go_file(path)
-                if module:
-                    self.modules.append(module)
-                    file_count += 1
-                    function_count += len(module.functions)
-                    class_count += len(module.classes)
-                    for cls in module.classes:
-                        function_count += len(cls.methods)
-            except Exception:
-                continue
+            for future in as_completed(future_to_file):
+                path, lang = future_to_file[future]
+                try:
+                    module = future.result(timeout=5)  # 5 second timeout per file
+                    if module:
+                        self.modules.append(module)
+                        file_count += 1
+                        function_count += len(module.functions)
+                        class_count += len(module.classes)
+                        for cls in module.classes:
+                            function_count += len(cls.methods)
+                except Exception:
+                    continue
         
         return {
             "files": file_count,
@@ -157,6 +165,175 @@ class CodebaseScanner:
             "classes": class_count,
             "modules": len(self.modules)
         }
+    
+    def _parse_file_worker(self, path: Path, language: str) -> Optional[ModuleInfo]:
+        """Worker function for parallel parsing."""
+        try:
+            if language == "python":
+                return self._parse_python_file(path)
+            elif language == "typescript":
+                if TREESITTER_AVAILABLE:
+                    return self._parse_with_treesitter(path, language)
+                else:
+                    return self._parse_typescript_fast(path)
+            elif language == "go":
+                if TREESITTER_AVAILABLE:
+                    return self._parse_with_treesitter(path, language)
+                else:
+                    return self._parse_go_file(path)
+        except Exception:
+            return None
+        return None
+    
+    def _parse_with_treesitter(self, path: Path, language: str) -> Optional[ModuleInfo]:
+        """Parse file using tree-sitter (fast & accurate)."""
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+        
+        relative_path = path.relative_to(self.root)
+        module_name = str(relative_path.with_suffix("")).replace("/", ".")
+        
+        # Get parser for language
+        try:
+            parser = get_parser(language)
+        except Exception:
+            return None
+        
+        tree = parser.parse(bytes(content, "utf-8"))
+        root_node = tree.root_node
+        
+        module = ModuleInfo(
+            path=relative_path,
+            name=module_name,
+            docstring=None,
+            functions=[],
+            classes=[],
+            imports=[]
+        )
+        
+        # Walk the AST
+        self._walk_treesitter_tree(root_node, content, module)
+        
+        return module
+    
+    def _walk_treesitter_tree(self, node, content: str, module: ModuleInfo) -> None:
+        """Recursively walk tree-sitter AST."""
+        node_type = node.type
+        
+        # Language-agnostic node types
+        if node_type in ("function_declaration", "function_definition", "method_definition"):
+            func = self._extract_function_from_treesitter(node, content)
+            if func:
+                module.functions.append(func)
+        elif node_type in ("class_declaration", "class_definition", "struct_type"):
+            cls = self._extract_class_from_treesitter(node, content)
+            if cls:
+                module.classes.append(cls)
+        elif node_type in ("import_statement", "import_declaration"):
+            import_text = content[node.start_byte:node.end_byte]
+            module.imports.append(import_text.strip())
+        
+        # Recurse into children
+        for child in node.children:
+            self._walk_treesitter_tree(child, content, module)
+    
+    def _extract_function_from_treesitter(self, node, content: str) -> Optional[FunctionInfo]:
+        """Extract function info from tree-sitter node."""
+        name_node = None
+        for child in node.children:
+            if child.type in ("identifier", "property_identifier"):
+                name_node = child
+                break
+        
+        if not name_node:
+            return None
+        
+        name = content[name_node.start_byte:name_node.end_byte]
+        line_num = content[:node.start_byte].count('\n') + 1
+        
+        return FunctionInfo(
+            name=name,
+            line_number=line_num,
+            docstring=None,
+            signature=f"{name}()",
+            is_async=False,
+            is_method=False
+        )
+    
+    def _extract_class_from_treesitter(self, node, content: str) -> Optional[ClassInfo]:
+        """Extract class info from tree-sitter node."""
+        name_node = None
+        for child in node.children:
+            if child.type == "type_identifier" or child.type == "identifier":
+                name_node = child
+                break
+        
+        if not name_node:
+            return None
+        
+        name = content[name_node.start_byte:name_node.end_byte]
+        line_num = content[:node.start_byte].count('\n') + 1
+        
+        return ClassInfo(
+            name=name,
+            line_number=line_num,
+            docstring=None,
+            methods=[],
+            bases=[]
+        )
+    
+    def _parse_typescript_fast(self, path: Path) -> Optional[ModuleInfo]:
+        """Fast TypeScript parsing (simplified regex approach)."""
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+        
+        relative_path = path.relative_to(self.root)
+        module_name = str(relative_path.with_suffix("")).replace("/", ".")
+        
+        module = ModuleInfo(
+            path=relative_path,
+            name=module_name,
+            docstring=None,
+            functions=[],
+            classes=[],
+            imports=[]
+        )
+        
+        # Fast line-by-line parsing
+        lines = content.split('\n')
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            
+            # Function declarations (very fast check)
+            if line.startswith('function ') or line.startswith('export function ') or line.startswith('async function '):
+                match = re.search(r'function\s+(\w+)', line)
+                if match:
+                    module.functions.append(FunctionInfo(
+                        name=match.group(1),
+                        line_number=i,
+                        docstring=None,
+                        signature=f"{match.group(1)}()",
+                        is_async='async' in line,
+                        is_method=False
+                    ))
+            
+            # Class declarations
+            elif line.startswith('class ') or line.startswith('export class '):
+                match = re.search(r'class\s+(\w+)', line)
+                if match:
+                    module.classes.append(ClassInfo(
+                        name=match.group(1),
+                        line_number=i,
+                        docstring=None,
+                        methods=[],
+                        bases=[]
+                    ))
+        
+        return module
     
     def _parse_python_file(self, path: Path) -> Optional[ModuleInfo]:
         """Parse a Python file and extract information."""
