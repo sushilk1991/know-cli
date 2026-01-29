@@ -85,17 +85,39 @@ class DocUpdateHandler(FileSystemEventHandler):
         from know.scanner import CodebaseScanner
         from know.generator import DocGenerator
         
-        # Clear console for clean output
-        print(f"\n[dim]Detected changes in {len(self.pending_paths)} files, updating docs...[/dim]")
+        pending_count = len(self.pending_paths)
+        print(f"\n[dim]Detected changes in {pending_count} files, updating docs...[/dim]")
         
         try:
             scanner = CodebaseScanner(self.config)
             generator = DocGenerator(self.config)
             
+            # Filter to only code files we care about
+            code_paths = [
+                p for p in self.pending_paths 
+                if p.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".go"}
+            ]
+            
+            if code_paths:
+                # Use incremental scan for specific files
+                stats = scanner.scan_files(code_paths)
+            else:
+                # No code files changed, do full scan
+                stats = scanner.scan()
+            
             structure = scanner.get_structure()
             generator.generate_readme(structure)
             
-            print("[green]✓[/green] Documentation updated")
+            # Show efficiency stats
+            total = stats.get("files", 0)
+            changed = stats.get("changed_files", pending_count)
+            cached = total - changed
+            
+            if cached > 0:
+                print(f"[green]✓[/green] Documentation updated ({changed} changed, {cached} from cache)")
+            else:
+                print(f"[green]✓[/green] Documentation updated ({total} files)")
+                
         except Exception as e:
             print(f"[red]✗[/red] Update failed: {e}")
         
