@@ -134,6 +134,23 @@ class CodebaseScanner:
                 except Exception:
                     continue
         
+        # Find all Go files
+        for path in self.root.rglob("*.go"):
+            if not self._should_include(path):
+                continue
+            
+            try:
+                module = self._parse_go_file(path)
+                if module:
+                    self.modules.append(module)
+                    file_count += 1
+                    function_count += len(module.functions)
+                    class_count += len(module.classes)
+                    for cls in module.classes:
+                        function_count += len(cls.methods)
+            except Exception:
+                continue
+        
         return {
             "files": file_count,
             "functions": function_count,
@@ -328,6 +345,78 @@ class CodebaseScanner:
                 docstring=None,
                 methods=methods,
                 bases=[base_class] if base_class else []
+            )
+            module.classes.append(cls)
+        
+        return module
+    
+    def _parse_go_file(self, path: Path) -> Optional[ModuleInfo]:
+        """Parse a Go file and extract information."""
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+        
+        relative_path = path.relative_to(self.root)
+        module_name = str(relative_path.with_suffix("")).replace("/", ".")
+        
+        # Extract package doc
+        docstring = None
+        doc_match = re.search(r'^//\s*(.+?)\n(?://\s*(.+?)\n)*package\s+\w+', content, re.MULTILINE)
+        if doc_match:
+            lines = doc_match.group(0).split('\n')
+            doc_lines = [line.lstrip('/').strip() for line in lines if line.startswith('//')]
+            docstring = ' '.join(doc_lines)
+        
+        module = ModuleInfo(
+            path=relative_path,
+            name=module_name,
+            docstring=docstring,
+            functions=[],
+            classes=[],
+            imports=[]
+        )
+        
+        # Extract imports
+        import_block = re.search(r'import\s*\((.*?)\)', content, re.DOTALL)
+        if import_block:
+            for line in import_block.group(1).split('\n'):
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    module.imports.append(match.group(1))
+        else:
+            single_import = re.search(r'import\s+"([^"]+)"', content)
+            if single_import:
+                module.imports.append(single_import.group(1))
+        
+        # Extract functions
+        func_pattern = r'func\s+(?:\([^)]+\)\s+)?(\w+)\s*\([^)]*\)'
+        for match in re.finditer(func_pattern, content):
+            name = match.group(1)
+            line_num = content[:match.start()].count('\n') + 1
+            
+            func = FunctionInfo(
+                name=name,
+                line_number=line_num,
+                docstring=None,
+                signature=f"{name}()",
+                is_async=False,
+                is_method=False
+            )
+            module.functions.append(func)
+        
+        # Extract structs
+        struct_pattern = r'type\s+(\w+)\s+struct'
+        for match in re.finditer(struct_pattern, content):
+            name = match.group(1)
+            line_num = content[:match.start()].count('\n') + 1
+            
+            cls = ClassInfo(
+                name=name,
+                line_number=line_num,
+                docstring=None,
+                methods=[],
+                bases=[]
             )
             module.classes.append(cls)
         
