@@ -1,0 +1,49 @@
+project:
+  name: know-cli
+  description: ''
+  version: 1.0.0
+languages:
+- python
+- javascript
+- typescript
+- go
+- rust
+include:
+- src/
+- lib/
+- app/
+exclude:
+- '**/node_modules/**'
+- '**/.git/**'
+- '**/tests/**'
+- '**/__pycache__/**'
+- '**/vendor/**'
+- '**/.venv/**'
+- '**/venv/**'
+- '**/.know/**'
+ai:
+  provider: anthropic
+  model: claude-3-sonnet-20240229
+  api_key_env: ANTHROPIC_API_KEY
+  generate:
+    summaries: true
+    architecture: true
+    api_docs: true
+    onboarding: true
+output:
+  format: markdown
+  directory: docs
+  git:
+    auto_commit: false
+    commit_message: 'docs: update generated documentation'
+  watch:
+    enabled: true
+    debounce_seconds: 5
+diagrams:
+  format: mermaid
+  include_dependencies: true
+  max_depth: 3
+api:
+  frameworks: []
+  include_schemas: true
+  include_examples: true

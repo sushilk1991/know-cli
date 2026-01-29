@@ -1,0 +1,2 @@
+[console_scripts]
+know = know.cli:main
