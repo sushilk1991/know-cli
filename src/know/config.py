@@ -67,7 +67,9 @@ class Config:
     languages: List[str] = field(default_factory=lambda: [
         "python", "javascript", "typescript", "go", "rust"
     ])
-    include: List[str] = field(default_factory=lambda: ["src/", "lib/", "app/"])
+    include: List[str] = field(default_factory=lambda: [
+        "src/", "lib/", "app/", "packages/", "apps/", "cmd/", "internal/"
+    ])
     exclude: List[str] = field(default_factory=lambda: [
         "**/node_modules/**",
         "**/.git/**",
@@ -102,6 +104,9 @@ class Config:
         if detected_langs:
             config.languages = detected_langs
         
+        # Auto-detect include paths
+        config.detect_include_paths()
+        
         return config
     
     @staticmethod
@@ -128,6 +133,21 @@ class Config:
             languages.append("rust")
         
         return languages
+    
+    def detect_include_paths(self) -> None:
+        """Auto-detect common source directories."""
+        common_paths = [
+            "src", "lib", "app", "packages", "apps", "cmd", "internal",
+            "pkg", "api", "web", "server", "client", "frontend", "backend"
+        ]
+        
+        detected = []
+        for path in common_paths:
+            if (self.root / path).exists() and (self.root / path).is_dir():
+                detected.append(f"{path}/")
+        
+        if detected:
+            self.include = detected
     
     def save(self, path: Path) -> None:
         """Save configuration to YAML file."""
