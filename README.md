@@ -138,6 +138,217 @@ Automatically update docs on every commit:
 know hooks install
 ```
 
+## 🤖 Using with AI Agents (Claude Code, Codex, Cursor)
+
+**know** is designed specifically to make AI coding agents more effective. Here's how to integrate it:
+
+### Why AI Agents Love know
+
+- **📚 Complete Context**: Instead of showing agents partial files, they get the full codebase digest
+- **🏗️ Architecture Understanding**: Agents understand the big picture before diving into code
+- **⚡ Faster Onboarding**: New agents understand your codebase in seconds, not hours
+- **🔄 Always Current**: Documentation syncs with code, so agents work with up-to-date info
+
+### Setup for AI Agents
+
+#### 1. Initialize know in Your Project
+
+```bash
+cd your-project
+know init
+```
+
+This creates:
+- `.know/config.yaml` - Project configuration
+- `docs/` - Documentation directory
+- Index of your codebase for fast lookups
+
+#### 2. Generate AI-Optimized Digest
+
+```bash
+# Create LLM-friendly digest
+know digest --for-llm
+
+# Or create component-specific docs
+know explain -c AuthService
+know diagram --type architecture
+```
+
+#### 3. Configure Git Hooks (Auto-Update)
+
+```bash
+# Docs update automatically on every commit
+know hooks install
+```
+
+### Using with Claude Code
+
+Add this to your Claude Code context:
+
+```markdown
+## Project Context
+
+This project uses **know-cli** for documentation. 
+
+**Quick commands:**
+- Read `docs/digest-llm.md` for full codebase overview
+- Check `docs/architecture.md` for system design
+- Use `know explain -c <component>` to understand specific modules
+
+**Current state:**
+- Project: [Read docs/project-summary.md]
+- API: [Read docs/openapi.json if exists]
+- Components: [List from docs/ directory]
+```
+
+**In Claude Code, ask:**
+```
+"Read the digest-llm.md file to understand this codebase, then help me..."
+```
+
+### Using with Codex (GitHub Copilot)
+
+Create `.github/copilot-context.md`:
+
+```markdown
+# Copilot Context
+
+## Project Overview
+[Content from know digest --for-llm]
+
+## Key Components
+- AuthService: Handles authentication [docs/auth-service.md]
+- API Layer: REST endpoints [docs/openapi.json]
+- Database: Schema [docs/database-schema.md]
+
+## Architecture
+[Link to docs/architecture.md]
+
+## Code Patterns
+- Follow patterns in docs/code-patterns.md
+- Check similar implementations using know explain
+```
+
+### Using with Cursor
+
+Add to `.cursorrules`:
+
+```markdown
+# Cursor Rules
+
+## Before Coding
+1. Read `docs/digest-llm.md` for context
+2. Check `docs/architecture.md` for design patterns
+3. Use `know explain -c <component>` to understand existing code
+
+## Code Standards
+- Follow patterns documented in docs/code-patterns.md
+- Maintain architecture decisions from docs/adr/
+- Update know docs if adding new components
+
+## Helpful Commands
+- `know update` - Refresh docs before major changes
+- `know explain -c <name>` - Understand any component
+```
+
+### Best Practices for AI Agents
+
+#### 1. **Always Start with Digest**
+
+Before asking an AI agent to work on your code:
+
+```bash
+# Ensure digest is current
+know digest --for-llm
+```
+
+Then tell the agent:
+```
+"Please read docs/digest-llm.md first to understand the codebase structure."
+```
+
+#### 2. **Use Component Explanations**
+
+For specific tasks, generate targeted explanations:
+
+```bash
+# Before modifying auth system
+know explain -c Authentication
+# Creates: docs/component-authentication.md
+
+# Give this file to the AI agent
+```
+
+#### 3. **Keep Docs in Sync**
+
+With git hooks installed, docs auto-update. But for long sessions:
+
+```bash
+# Refresh mid-session if needed
+know update
+```
+
+#### 4. **Include Architecture Context**
+
+```bash
+# Generate architecture docs
+know diagram --type architecture
+know diagram --type component
+```
+
+AI agents work better when they see the visual structure.
+
+### Example Workflow
+
+```bash
+# 1. Initialize project
+cd my-project
+know init
+
+# 2. Generate all AI docs
+know digest --for-llm
+know diagram --type architecture
+know api --openapi
+
+# 3. Install git hooks (auto-update)
+know hooks install
+
+# 4. Commit docs
+git add docs/ .know/
+git commit -m "docs: Add know-cli documentation for AI agents"
+
+# 5. Now AI agents can:
+# - Read docs/digest-llm.md for full context
+# - Reference docs/architecture.md for design
+# - Check docs/openapi.json for API details
+```
+
+### Pro Tips
+
+1. **Include docs/ in git**: AI agents need to read these files
+2. **Keep ANTHROPIC_API_KEY set**: For AI-powered explanations
+3. **Use `--for-llm` flag**: Optimizes output for AI consumption
+4. **Generate before PRs**: Run `know update` before asking agents to review
+
+### Troubleshooting
+
+**Agent doesn't understand the codebase?**
+```bash
+know digest --for-llm --refresh
+# This regenerates with latest code
+```
+
+**Need specific component context?**
+```bash
+know explain -c ComponentName --detail high
+```
+
+**Architecture unclear?**
+```bash
+know diagram --type architecture --format mermaid
+# Include the diagram in your AI context
+```
+
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) file.
