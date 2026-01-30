@@ -37,7 +37,16 @@ class AISummarizer:
         self.api_key = os.getenv(config.ai.api_key_env)
         
         if not self.api_key and self.provider == "anthropic":
-            console.print("[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]")
+            console.print("""
+[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]
+
+To enable AI-powered features:
+1. Get an API key from https://console.anthropic.com/
+2. Set environment variable: [bold]export ANTHROPIC_API_KEY="your-key"[/bold]
+3. Add to your ~/.zshrc or ~/.bashrc to make it permanent
+
+See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
+""")
     
     def _call_claude(self, prompt: str, max_tokens: int = 4000) -> str:
         """Call Claude API."""
