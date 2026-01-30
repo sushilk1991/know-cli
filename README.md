@@ -20,19 +20,61 @@
 
 ## 🚀 Quick Start
 
+### 1. Get an AI API Key (Required for AI Features)
+
+**know** uses AI to generate intelligent documentation. You need an API key from one of these providers:
+
+**Option A: Anthropic (Claude)** ⭐ Recommended
+- Sign up at https://console.anthropic.com/
+- Get your API key from the dashboard
+- Set environment variable: `export ANTHROPIC_API_KEY="your-key-here"`
+- Add to your `~/.zshrc` or `~/.bashrc` to make it permanent
+
+**Option B: OpenAI (GPT-4)**
+- Get key from https://platform.openai.com/api-keys
+- Set: `export OPENAI_API_KEY="your-key-here"`
+- Update `.know/config.yaml` to use OpenAI
+
+**💡 Note:** This is different from Claude Code (the CLI tool) or GitHub Copilot. You need a direct API key from the provider.
+
+### 2. Install know
+
 ```bash
-# Install
 pip install know-cli
 
-# Initialize in your project
+# Or with pipx
+pipx install know-cli
+```
+
+### 3. Initialize Your Project
+
+```bash
 cd your-project
 know init
 
-# Generate documentation
+# Follow the prompts to configure
+```
+
+### 4. Generate Documentation
+
+```bash
+# Create AI-powered documentation
 know update
 
-# Start watching for changes
+# Generate LLM-optimized digest for AI agents
+know digest --for-llm
+
+# Start auto-updating on file changes
 know watch
+```
+
+### 5. Verify Setup
+
+```bash
+# Check if AI is working
+know explain -c <component-name>
+
+# Should see AI-generated explanation (not fallback)
 ```
 
 ## 📖 Commands
@@ -136,6 +178,89 @@ Automatically update docs on every commit:
 
 ```bash
 know hooks install
+```
+
+## 🔧 Troubleshooting
+
+### "ANTHROPIC_API_KEY not set" Error
+
+**Problem:** You're seeing: `⚠ ANTHROPIC_API_KEY not set. AI features will be limited.`
+
+**Solution:**
+1. Get an API key from https://console.anthropic.com/
+2. Set the environment variable:
+   ```bash
+   export ANTHROPIC_API_KEY="sk-ant-xxxxx"
+   ```
+3. Make it permanent by adding to `~/.zshrc` (macOS) or `~/.bashrc` (Linux)
+
+**💡 Important:** This is different from:
+- ❌ Claude Code CLI (doesn't provide API keys)
+- ❌ GitHub Copilot (uses different authentication)
+- ❌ Cursor editor (has its own key management)
+
+You need a direct API key from Anthropic's console.
+
+### "Cannot install tree-sitter-languages" Error
+
+**Problem:** Installation fails with `tree-sitter-languages` errors.
+
+**Cause:** You're using Python 3.13+ which doesn't have pre-built wheels.
+
+**Solution:**
+```bash
+# Option 1: Use Python 3.10-3.12
+pyenv install 3.12.1
+pyenv global 3.12.1
+pip install know-cli
+
+# Option 2: Install without parser extras (regex fallback)
+pip install know-cli
+# Tree-sitter features will be disabled, regex-based parsing still works
+```
+
+### Syntax Errors When Parsing Files
+
+**Problem:** Seeing `invalid syntax` errors for TypeScript/React files.
+
+**Cause:** Tree-sitter parser isn't installed or the file has syntax errors.
+
+**Solutions:**
+1. Install with parser support: `pip install "know-cli[parser]"`
+2. Check the file actually compiles (run `tsc --noEmit`)
+3. Add problematic files to `.know/config.yaml` exclude list
+
+### AI Explanations Not Working
+
+**Problem:** Getting fallback explanations instead of AI-generated ones.
+
+**Check:**
+```bash
+# Verify API key is set
+echo $ANTHROPIC_API_KEY
+
+# Should output your key (starts with sk-ant-)
+```
+
+**If not set:**
+```bash
+# Add to your shell profile
+echo 'export ANTHROPIC_API_KEY="your-key-here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### "Module not found" Errors
+
+**Problem:** `ModuleNotFoundError` when running know.
+
+**Solution:**
+```bash
+# Reinstall in clean environment
+pip uninstall know-cli
+pip install --upgrade know-cli
+
+# Or use pipx for isolation
+pipx install know-cli
 ```
 
 ## 🤖 Using with AI Agents (Claude Code, Codex, Cursor)
