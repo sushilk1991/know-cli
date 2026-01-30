@@ -28,7 +28,17 @@ class CodeComponent:
 
 
 class AISummarizer:
-    """AI-powered code summarization."""
+    """AI-powered code summarization with cost-optimized model selection."""
+    
+    # Model names
+    MODEL_SONNET = "claude-sonnet-4-5-20251022"
+    MODEL_HAIKU = "claude-haiku-4-5-20251022"
+    
+    # Pricing (per million tokens)
+    PRICING = {
+        MODEL_SONNET: {"input": 3.0, "output": 15.0},
+        MODEL_HAIKU: {"input": 1.0, "output": 5.0},
+    }
     
     def __init__(self, config: "Config"):
         self.config = config
@@ -45,21 +55,33 @@ To enable AI-powered features:
 2. Set environment variable: [bold]export ANTHROPIC_API_KEY="your-key"[/bold]
 3. Add to your ~/.zshrc or ~/.bashrc to make it permanent
 
+Cost estimates:
+- Haiku 4.5 (fast/small tasks): $1/million input, $5/million output
+- Sonnet 4.5 (complex tasks): $3/million input, $15/million output
+
 See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
 """)
     
-    def _call_claude(self, prompt: str, max_tokens: int = 2000) -> str:
-        """Call Claude API with cost optimization."""
+    def _call_claude(
+        self, 
+        prompt: str, 
+        max_tokens: int = 2000,
+        model: Optional[str] = None
+    ) -> str:
+        """Call Claude API with cost optimization and model selection."""
         try:
             import anthropic
             
             client = anthropic.Anthropic(api_key=self.api_key)
             
+            # Use specified model or fall back to config default
+            use_model = model or self.model
+            
             # Count input tokens for cost tracking
             input_tokens = client.count_tokens(prompt)
             
             message = client.messages.create(
-                model=self.model,
+                model=use_model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -68,13 +90,18 @@ See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
             output_tokens = message.usage.output_tokens
             total_tokens = input_tokens + output_tokens
             
-            # Sonnet 4.5 costs: $3/million input, $15/million output
-            input_cost = (input_tokens / 1_000_000) * 3.0
-            output_cost = (output_tokens / 1_000_000) * 15.0
+            # Calculate cost based on model used
+            pricing = self.PRICING.get(use_model, self.PRICING[self.MODEL_SONNET])
+            input_cost = (input_tokens / 1_000_000) * pricing["input"]
+            output_cost = (output_tokens / 1_000_000) * pricing["output"]
             total_cost = input_cost + output_cost
             
-            if total_cost > 0.01:  # Only show for expensive calls
-                console.print(f"[dim]💰 API call: {total_tokens:,} tokens (~${total_cost:.4f})[/dim]")
+            model_name = "Haiku" if use_model == self.MODEL_HAIKU else "Sonnet"
+            if total_cost > 0.005:  # Only show for notable calls
+                console.print(
+                    f"[dim]💰 {model_name}: {total_tokens:,} tokens "
+                    f"(~${total_cost:.4f})[/dim]"
+                )
             
             return message.content[0].text
         except ImportError:
@@ -85,18 +112,18 @@ See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
             return ""
     
     def explain_component(self, component: CodeComponent, detailed: bool = False) -> str:
-        """Generate explanation for a code component."""
+        """Generate explanation for a code component. Uses Haiku for speed/cost."""
         if not self.api_key:
             return self._fallback_explain(component)
         
         # Truncate content to reduce token usage
-        max_content = 2000 if detailed else 1000
+        max_content = 1500 if detailed else 800
         content = component.content[:max_content]
         if len(component.content) > max_content:
             content += "\n... [truncated]"
         
         detail_level = "detailed" if detailed else "concise"
-        max_tokens = 1500 if detailed else 800
+        max_tokens = 1000 if detailed else 500
         
         prompt = f"""Explain this {component.type}:
 
@@ -107,15 +134,19 @@ File: {component.file_path}
 {content}
 ```
 
-Provide a {detail_level} explanation covering:
-1. Purpose and functionality
+Provide a {detail_level} explanation:
+1. What it does
 2. Key inputs/outputs
 3. How it fits in the codebase
-4. Important patterns
 
 Be concise."""
         
-        return self._call_claude(prompt, max_tokens=max_tokens)
+        # Use Haiku for component explanations (cheaper, faster)
+        return self._call_claude(
+            prompt, 
+            max_tokens=max_tokens,
+            model=self.MODEL_HAIKU
+        )
     
     def _fallback_explain(self, component: CodeComponent) -> str:
         """Fallback explanation without AI."""
@@ -143,17 +174,17 @@ Be concise."""
         structure: Dict[str, Any],
         audience: str
     ) -> str:
-        """Generate onboarding guide for new team members."""
+        """Generate onboarding guide. Uses Sonnet for quality."""
         if not self.api_key:
             return self._fallback_onboarding(structure, audience)
         
         # Limit modules to reduce token usage
-        modules = structure.get("modules", [])[:15]  # Limit to 15
-        key_files = structure.get("key_files", [])[:10]  # Limit to 10
+        modules = structure.get("modules", [])[:20]
+        key_files = structure.get("key_files", [])[:10]
         
         prompt = f"""Create a concise onboarding guide for {audience}.
 
-Modules: {', '.join(modules[:15])}
+Modules: {', '.join(modules[:20])}
 Key Files: {', '.join(key_files[:10])}
 
 Include:
@@ -163,9 +194,14 @@ Include:
 4. Getting started steps
 5. Common commands
 
-Keep it under 1000 words. Be practical and direct."""
+Keep it under 800 words. Be practical and direct."""
         
-        return self._call_claude(prompt, max_tokens=2000)
+        # Use Sonnet for onboarding (better quality for complex task)
+        return self._call_claude(
+            prompt, 
+            max_tokens=1500,
+            model=self.MODEL_SONNET
+        )
     
     def _fallback_onboarding(self, structure: Dict[str, Any], audience: str) -> str:
         """Fallback onboarding without AI."""
@@ -203,18 +239,18 @@ Keep it under 1000 words. Be practical and direct."""
         structure: Dict[str, Any],
         compact: bool = False
     ) -> str:
-        """Generate AI-optimized codebase summary (like GitIngest)."""
+        """Generate AI-optimized codebase summary. Uses Sonnet for quality."""
         if not self.api_key:
             return self._fallback_digest(structure, compact)
         
         # Build context - limit to reduce tokens
-        module_limit = 30 if compact else 50
+        module_limit = 40 if compact else 60
         modules_summary = "\n".join([
-            f"- {m['name']}: {m.get('description', 'Module')[:80]}"
+            f"- {m['name']}: {m.get('description', 'Module')[:60]}"
             for m in structure.get("modules", [])[:module_limit]
         ])
         
-        max_tokens = 4000 if compact else 6000
+        max_tokens = 3000 if compact else 5000
         
         prompt = f"""Create a codebase digest for AI consumption.
 
@@ -231,7 +267,12 @@ Cover:
 Format as markdown.
 {"Be extremely concise." if compact else "Be comprehensive but focused."}"""
         
-        return self._call_claude(prompt, max_tokens=max_tokens)
+        # Use Sonnet for digest (needs higher quality)
+        return self._call_claude(
+            prompt, 
+            max_tokens=max_tokens,
+            model=self.MODEL_SONNET
+        )
     
     def _fallback_digest(self, structure: Dict[str, Any], compact: bool) -> str:
         """Fallback digest without AI."""
@@ -263,7 +304,7 @@ Format as markdown.
         return self.generate_llm_digest(structure, compact)
     
     def generate_readme_intro(self, structure: Dict[str, Any]) -> str:
-        """Generate README introduction."""
+        """Generate README introduction. Uses Haiku for simple task."""
         if not self.api_key:
             return f"""# {self.config.project.name}
 
@@ -279,10 +320,15 @@ Files: {structure.get('file_count', 'N/A')}
 
 Include:
 1. One-line pitch
-2. Problem it solves (1-2 sentences)
+2. Problem it solves (1 sentence)
 3. 3-4 key features
 4. Quick install hint
 
-Keep under 150 words. Professional tone."""
+Keep under 100 words. Professional tone."""
         
-        return self._call_claude(prompt, max_tokens=800)
+        # Use Haiku for README intro (simple task)
+        return self._call_claude(
+            prompt, 
+            max_tokens=600,
+            model=self.MODEL_HAIKU
+        )
