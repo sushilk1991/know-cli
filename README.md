@@ -315,6 +315,48 @@ know hooks install
 know watch
 ```
 
+### 🤖 GitHub Action (CI/CD)
+
+For teams using GitHub, there's an official GitHub Action that auto-generates docs on every PR:
+
+**Quick setup:**
+
+1. Add `ANTHROPIC_API_KEY` to your repository secrets (Settings → Secrets)
+
+2. Create `.github/workflows/docs.yml`:
+```yaml
+name: Documentation
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sushilk1991/know-cli/.github/actions/know-cli@main
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          comment-on-pr: 'true'
+```
+
+**What it does:**
+- Generates docs on every PR
+- Posts architecture summary as PR comment
+- Auto-commits updated docs
+- Shows structural changes vs base branch
+
+**Perfect for:**
+- Team workflows
+- Code reviews (reviewers see architecture context)
+- Keeping docs always in sync
+
 ## 🔧 Troubleshooting
 
 ### "ANTHROPIC_API_KEY not set" Error

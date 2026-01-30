@@ -1,0 +1,30 @@
+# Example: Auto-generate documentation on every PR and push
+# Copy this file to your repo: .github/workflows/know-docs.yml
+
+name: Documentation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Generate documentation
+        uses: sushilk1991/know-cli/.github/actions/know-cli@main
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          comment-on-pr: 'true'
+          generate-on-push: 'true'
