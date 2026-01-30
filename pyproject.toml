@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.1.12"
+version = "0.1.13"
 description = "Living documentation generator - docs that stay in sync with your code"
 readme = "README.md"
 license = "MIT"
