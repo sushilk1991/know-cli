@@ -48,18 +48,33 @@ To enable AI-powered features:
 See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
 """)
     
-    def _call_claude(self, prompt: str, max_tokens: int = 4000) -> str:
-        """Call Claude API."""
+    def _call_claude(self, prompt: str, max_tokens: int = 2000) -> str:
+        """Call Claude API with cost optimization."""
         try:
             import anthropic
             
             client = anthropic.Anthropic(api_key=self.api_key)
+            
+            # Count input tokens for cost tracking
+            input_tokens = client.count_tokens(prompt)
             
             message = client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}]
             )
+            
+            # Log usage for transparency
+            output_tokens = message.usage.output_tokens
+            total_tokens = input_tokens + output_tokens
+            
+            # Sonnet 4.5 costs: $3/million input, $15/million output
+            input_cost = (input_tokens / 1_000_000) * 3.0
+            output_cost = (output_tokens / 1_000_000) * 15.0
+            total_cost = input_cost + output_cost
+            
+            if total_cost > 0.01:  # Only show for expensive calls
+                console.print(f"[dim]💰 API call: {total_tokens:,} tokens (~${total_cost:.4f})[/dim]")
             
             return message.content[0].text
         except ImportError:
@@ -74,26 +89,33 @@ See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
         if not self.api_key:
             return self._fallback_explain(component)
         
-        detail_level = "detailed" if detailed else "concise"
+        # Truncate content to reduce token usage
+        max_content = 2000 if detailed else 1000
+        content = component.content[:max_content]
+        if len(component.content) > max_content:
+            content += "\n... [truncated]"
         
-        prompt = f"""Explain this {component.type} from a codebase:
+        detail_level = "detailed" if detailed else "concise"
+        max_tokens = 1500 if detailed else 800
+        
+        prompt = f"""Explain this {component.type}:
 
 Name: {component.name}
 File: {component.file_path}
 
 ```
-{component.content[:3000]}
+{content}
 ```
 
-Provide a {detail_level} explanation that covers:
-1. What this {component.type} does
-2. Key functionality
-3. How it fits into the codebase
-4. Important patterns or design decisions
+Provide a {detail_level} explanation covering:
+1. Purpose and functionality
+2. Key inputs/outputs
+3. How it fits in the codebase
+4. Important patterns
 
-Keep it clear and technical but accessible."""
+Be concise."""
         
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, max_tokens=max_tokens)
     
     def _fallback_explain(self, component: CodeComponent) -> str:
         """Fallback explanation without AI."""
@@ -125,27 +147,25 @@ Keep it clear and technical but accessible."""
         if not self.api_key:
             return self._fallback_onboarding(structure, audience)
         
-        # Summarize structure
-        modules = structure.get("modules", [])
-        key_files = structure.get("key_files", [])
+        # Limit modules to reduce token usage
+        modules = structure.get("modules", [])[:15]  # Limit to 15
+        key_files = structure.get("key_files", [])[:10]  # Limit to 10
         
-        prompt = f"""Create an onboarding guide for a new {audience} joining this codebase.
+        prompt = f"""Create a concise onboarding guide for {audience}.
 
-Project Structure:
-- Modules: {', '.join(modules[:10])}
-- Key Files: {', '.join(key_files[:10])}
+Modules: {', '.join(modules[:15])}
+Key Files: {', '.join(key_files[:10])}
 
-Generate a guide that includes:
-1. Project overview
-2. Architecture at a glance
-3. Key directories and their purposes
-4. Important patterns to know
-5. Getting started steps
-6. Common workflows
+Include:
+1. Project overview (2-3 sentences)
+2. Key directories
+3. Important patterns
+4. Getting started steps
+5. Common commands
 
-Make it welcoming and practical for someone new to the team."""
+Keep it under 1000 words. Be practical and direct."""
         
-        return self._call_claude(prompt, max_tokens=6000)
+        return self._call_claude(prompt, max_tokens=2000)
     
     def _fallback_onboarding(self, structure: Dict[str, Any], audience: str) -> str:
         """Fallback onboarding without AI."""
@@ -187,28 +207,31 @@ Make it welcoming and practical for someone new to the team."""
         if not self.api_key:
             return self._fallback_digest(structure, compact)
         
-        # Build context
+        # Build context - limit to reduce tokens
+        module_limit = 30 if compact else 50
         modules_summary = "\n".join([
-            f"- {m['name']}: {m.get('description', 'Module')[:100]}"
-            for m in structure.get("modules", [])[:50]
+            f"- {m['name']}: {m.get('description', 'Module')[:80]}"
+            for m in structure.get("modules", [])[:module_limit]
         ])
         
-        prompt = f"""Create an AI-optimized codebase digest for LLM consumption.
+        max_tokens = 4000 if compact else 6000
+        
+        prompt = f"""Create a codebase digest for AI consumption.
 
-This should be a dense, information-rich summary that helps an AI understand:
-1. The overall architecture and patterns
-2. Key abstractions and data models
-3. Important business logic locations
+Structure:
+{modules_summary}
+
+Cover:
+1. Architecture overview
+2. Key abstractions/models
+3. Business logic locations
 4. Testing patterns
 5. Integration points
 
-Codebase Structure:
-{modules_summary}
-
-Format the output as structured markdown with clear sections.
-{"Keep it compact and dense." if compact else "Provide comprehensive detail."}"""
+Format as markdown.
+{"Be extremely concise." if compact else "Be comprehensive but focused."}"""
         
-        return self._call_claude(prompt, max_tokens=8000)
+        return self._call_claude(prompt, max_tokens=max_tokens)
     
     def _fallback_digest(self, structure: Dict[str, Any], compact: bool) -> str:
         """Fallback digest without AI."""
@@ -246,25 +269,20 @@ Format the output as structured markdown with clear sections.
 
 {self.config.project.description}
 
-*Generated by [know](https://github.com/vic/know-cli)*
+*Generated by [know](https://github.com/sushilk1991/know-cli)*
 """
         
-        prompt = f"""Write a compelling README introduction for this project:
+        prompt = f"""Write a README intro for {self.config.project.name}.
 
-Name: {self.config.project.name}
 Description: {self.config.project.description}
-Version: {self.config.project.version}
-
 Files: {structure.get('file_count', 'N/A')}
-Modules: {structure.get('module_count', 'N/A')}
 
-Write in a professional, clear style suitable for GitHub.
 Include:
-1. One-sentence description
-2. What problem it solves
-3. Key features
-4. Quick getting started hint
+1. One-line pitch
+2. Problem it solves (1-2 sentences)
+3. 3-4 key features
+4. Quick install hint
 
-Keep it under 200 words."""
+Keep under 150 words. Professional tone."""
         
-        return self._call_claude(prompt)
+        return self._call_claude(prompt, max_tokens=800)

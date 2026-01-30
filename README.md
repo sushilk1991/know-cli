@@ -37,6 +37,12 @@
 
 **💡 Note:** This is different from Claude Code (the CLI tool) or GitHub Copilot. You need a direct API key from the provider.
 
+**💰 Cost Estimation:**
+- Uses Claude Sonnet 4.5 ($3/million input tokens, $15/million output tokens)
+- Typical project scan: ~$0.02-0.10
+- Large codebase: ~$0.50-1.00
+- Daily watch mode: ~$0.01-0.05/day (only processes changed files)
+
 ### 2. Install know
 
 ```bash

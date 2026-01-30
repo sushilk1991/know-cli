@@ -17,7 +17,7 @@ class ProjectConfig:
 @dataclass
 class AIConfig:
     provider: str = "anthropic"
-    model: str = "claude-3-sonnet-20240229"
+    model: str = "claude-sonnet-4-5-20251022"
     api_key_env: str = "ANTHROPIC_API_KEY"
     generate: dict = field(default_factory=lambda: {
         "summaries": True,
