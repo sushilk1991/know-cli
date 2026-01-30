@@ -199,8 +199,8 @@ See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
                 if cached:
                     return cached
             
-            # Count input tokens
-            input_tokens = client.count_tokens(prompt)
+            # Estimate input tokens (rough approximation: 1 token ≈ 4 chars)
+            input_tokens = len(prompt) // 4
             
             # Make API call
             message = client.messages.create(
