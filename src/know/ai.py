@@ -142,9 +142,9 @@ class AIResponseCache:
 class AISummarizer:
     """AI-powered code summarization with aggressive token optimization."""
     
-    # Model names - use latest aliases to avoid date-based failures
-    MODEL_SONNET = "claude-3-5-sonnet-latest"
-    MODEL_HAIKU = "claude-3-haiku-latest"
+    # Model names - using latest available models
+    MODEL_SONNET = "claude-sonnet-4-5-20250929"
+    MODEL_HAIKU = "claude-haiku-4-5-20251001"
     
     # Pricing (per million tokens)
     PRICING = {
@@ -208,7 +208,10 @@ class AISummarizer:
             if not cache_key:
                 console.print(f"[dim]({total_tokens:,} tokens)[/dim]")
             
-            response = message.content[0].text
+            # Extract text from the response content
+            # Anthropic returns a list of content blocks (TextBlock objects)
+            content_block = message.content[0]
+            response = content_block.text
             
             # Cache the response
             if cache_key:
@@ -222,26 +225,47 @@ class AISummarizer:
             console.print(f"[red]✗ AI call failed: {e}[/red]")
             return ""
     
-    def explain_component(self, component: CodeComponent, detailed: bool = False) -> str:
-        """Generate explanation with aggressive token optimization."""
+    def explain_component(self, component, detailed: bool = False) -> str:
+        """Generate explanation with aggressive token optimization.
+        
+        Args:
+            component: Either a CodeComponent object or a dict with name, type, content keys
+            detailed: Whether to generate a detailed explanation
+        """
         if not self.api_key:
             return self._fallback_explain(component)
         
+        # Handle both CodeComponent objects and dicts
+        if isinstance(component, dict):
+            comp_name = component.get("name", "Unknown")
+            comp_type = component.get("type", "component")
+            comp_content = component.get("content", "")
+            comp_signature = component.get("signature", "")
+        else:
+            comp_name = component.name
+            comp_type = component.type
+            comp_content = component.content
+            comp_signature = getattr(component, "signature", "")
+        
         # Compress code first
-        compressed = self.optimizer.compress_code(component.content, max_chars=1200)
+        compressed = self.optimizer.compress_code(comp_content, max_chars=1200)
         
         # For simple components, just extract signatures
-        if not detailed and len(component.content) > 2000:
-            compressed = self.optimizer.extract_key_signatures(component.content)
+        if not detailed and len(comp_content) > 2000:
+            compressed = self.optimizer.extract_key_signatures(comp_content)
+        
+        # Include signature if available
+        if comp_signature and not detailed:
+            compressed = f"{comp_signature}\n\n{compressed}"
         
         detail_level = "detailed" if detailed else "concise"
         max_tokens = 800 if detailed else 400
         
         # Create cache key
-        cache_key = f"{component.name}:{component.type}:{hashlib.sha256(compressed.encode()).hexdigest()[:16]}"
+        cache_key = f"{comp_name}:{comp_type}:{hashlib.sha256(compressed.encode()).hexdigest()[:16]}"
         
         # Ultra-short prompt
-        prompt = f"""Explain {component.type} `{component.name}`:
+        prompt = f"""Explain {comp_type} `{comp_name}`:
 
 ```
 {compressed}
@@ -260,21 +284,39 @@ class AISummarizer:
             task_type="explain"
         )
     
-    def _fallback_explain(self, component: CodeComponent) -> str:
-        """Fallback explanation without AI."""
+    def _fallback_explain(self, component) -> str:
+        """Fallback explanation without AI.
+        
+        Args:
+            component: Either a CodeComponent object or a dict
+        """
+        # Handle both CodeComponent objects and dicts
+        if isinstance(component, dict):
+            comp_name = component.get("name", "Unknown")
+            comp_type = component.get("type", "component")
+            comp_path = component.get("path", "")
+            comp_docstring = component.get("content", "")  # dict uses 'content' for docstring
+            comp_signature = component.get("signature", "")
+        else:
+            comp_name = component.name
+            comp_type = component.type
+            comp_path = component.file_path
+            comp_docstring = component.docstring or ""
+            comp_signature = component.signature
+        
         lines = [
-            f"## {component.name}",
-            f"**Type:** {component.type}",
-            f"**File:** `{component.file_path}`",
+            f"## {comp_name}",
+            f"**Type:** {comp_type}",
+            f"**File:** `{comp_path}`",
             "",
         ]
         
-        if component.docstring:
-            lines.append(component.docstring[:500])
+        if comp_docstring:
+            lines.append(comp_docstring[:500])
             lines.append("")
         
-        if component.signature:
-            lines.append(f"**Signature:** `{component.signature}`")
+        if comp_signature:
+            lines.append(f"**Signature:** `{comp_signature}`")
             lines.append("")
         
         lines.append("*Set ANTHROPIC_API_KEY for AI-powered explanations*")
@@ -359,8 +401,9 @@ Create a 400-word guide:
         structure_hash = hashlib.sha256(modules_summary.encode()).hexdigest()[:16]
         cache_key = f"digest:{compact}:{structure_hash}"
         
-        # Check cache
-        cached = self.cache.get(cache_key, "digest", self.MODEL_SONNET)
+        # Check cache - use the configured model
+        use_model = self.model if self.model else self.MODEL_SONNET
+        cached = self.cache.get(cache_key, "digest", use_model)
         if cached:
             return cached
         
@@ -382,7 +425,7 @@ Summarize:
         return self._call_claude(
             prompt, 
             max_tokens=max_tokens,
-            model=self.MODEL_SONNET,
+            model=use_model,
             cache_key=cache_key,
             task_type="digest"
         )
