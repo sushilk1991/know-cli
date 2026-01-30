@@ -117,10 +117,10 @@ def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str
         
         return str(module.path), language, module_dict
     except ParseError as e:
-        logger.warning(f"Parse error in {path}: {e}")
+        logger.debug(f"Parse error in {path}: {e}")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error parsing {path}: {e}")
+        logger.debug(f"Unexpected error parsing {path}: {e}")
         return None
 
 
@@ -246,7 +246,7 @@ class CodebaseScanner:
                     self.modules.append(module)
                     cached_count += 1
             except (KeyError, TypeError) as e:
-                logger.warning(f"Failed to load cached module: {e}")
+                logger.debug(f"Failed to load cached module: {e}")
         
         files_to_parse = [(p, lang) for p, lang in files_to_scan if str(p) in changed_set]
         
@@ -300,7 +300,7 @@ class CodebaseScanner:
                         try:
                             index.cache_file(abs_path, lang, module_dict)
                         except Exception as e:
-                            logger.warning(f"Failed to cache {rel_path}: {e}")
+                            logger.debug(f"Failed to cache {rel_path}: {e}")
                         
                         # Convert back to ModuleInfo
                         module = self._module_from_dict(module_dict)
@@ -316,11 +316,11 @@ class CodebaseScanner:
                         failed_count += 1
                 except Exception as e:
                     task = futures[future]
-                    logger.error(f"Error processing {task[0]}: {e}")
+                    logger.debug(f"Error processing {task[0]}: {e}")
                     failed_count += 1
         
         if failed_count > 0:
-            logger.warning(f"Failed to parse {failed_count} files")
+            logger.debug(f"Failed to parse {failed_count} files")
         
         logger.info(f"Scan complete: {file_count} files, {function_count} functions, {class_count} classes")
         
@@ -495,7 +495,7 @@ class CodebaseScanner:
                                     docstring=ast.get_docstring(node)
                                 ))
             except Exception as e:
-                logger.warning(f"Error extracting routes from {module.path}: {e}")
+                logger.debug(f"Error extracting routes from {module.path}: {e}")
 
         return routes
 
@@ -534,7 +534,7 @@ class CodebaseScanner:
                 try:
                     index.cache_file(path, parser.language, self._module_to_dict(module))
                 except Exception as e:
-                    logger.warning(f"Failed to cache {path}: {e}")
+                    logger.debug(f"Failed to cache {path}: {e}")
                 
                 # Replace or append
                 existing_idx = None
@@ -554,9 +554,9 @@ class CodebaseScanner:
                         function_count += len(cls.methods)
                             
             except ParseError as e:
-                logger.warning(f"Parse error: {e}")
+                logger.debug(f"Parse error: {e}")
             except Exception as e:
-                logger.error(f"Error processing {path}: {e}")
+                logger.debug(f"Error processing {path}: {e}")
         
         return {
             "files": file_count,

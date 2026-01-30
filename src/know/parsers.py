@@ -155,7 +155,7 @@ class TypeScriptParser(BaseParser):
                 self._lang = get_language("typescript")
                 self._parser = Parser(self._lang)
             except Exception as e:
-                logger.warning(f"Tree-sitter not available for TypeScript: {e}")
+                logger.debug(f"Tree-sitter not available for TypeScript: {e}")
                 self.use_treesitter = False
     
     def parse(self, path: Path, root: Path) -> ModuleInfo:
@@ -315,7 +315,7 @@ class GoParser(BaseParser):
                 self._lang = get_language("go")
                 self._parser = Parser(self._lang)
             except Exception as e:
-                logger.warning(f"Tree-sitter not available for Go: {e}")
+                logger.debug(f"Tree-sitter not available for Go: {e}")
                 self.use_treesitter = False
     
     def parse(self, path: Path, root: Path) -> ModuleInfo:
