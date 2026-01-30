@@ -142,10 +142,10 @@ class PythonParser(BaseParser):
 
 class TypeScriptParser(BaseParser):
     """Parser for TypeScript/JavaScript files."""
-    
+
     language = "typescript"
     extensions = {".ts", ".tsx", ".js", ".jsx"}
-    
+
     def __init__(self, use_treesitter: bool = False):
         self.use_treesitter = use_treesitter
         if use_treesitter:
@@ -157,10 +157,18 @@ class TypeScriptParser(BaseParser):
             except Exception as e:
                 logger.debug(f"Tree-sitter not available for TypeScript: {e}")
                 self.use_treesitter = False
-    
+
     def parse(self, path: Path, root: Path) -> ModuleInfo:
+        # Always use regex for TSX/JSX files (tree-sitter struggles with JSX syntax)
+        if path.suffix in ('.tsx', '.jsx'):
+            return self._parse_with_regex(path, root)
+
         if self.use_treesitter:
-            return self._parse_with_treesitter(path, root)
+            try:
+                return self._parse_with_treesitter(path, root)
+            except Exception:
+                # Fall back to regex on tree-sitter failure
+                return self._parse_with_regex(path, root)
         return self._parse_with_regex(path, root)
     
     def _parse_with_treesitter(self, path: Path, root: Path) -> ModuleInfo:

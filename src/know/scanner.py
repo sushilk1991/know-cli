@@ -450,7 +450,7 @@ class CodebaseScanner:
         return results
 
     def extract_api_routes(self) -> List[APIRoute]:
-        """Extract API routes from codebase."""
+        """Extract API routes from Python codebase."""
         routes = []
 
         if not self.modules:
@@ -459,6 +459,10 @@ class CodebaseScanner:
         route_decorators = ["route", "get", "post", "put", "delete", "patch"]
 
         for module in self.modules:
+            # Only process Python files
+            if not str(module.path).endswith('.py'):
+                continue
+                
             try:
                 content = (self.root / module.path).read_text()
                 tree = ast.parse(content)
