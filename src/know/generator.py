@@ -38,14 +38,18 @@ class DocGenerator:
         ai = AISummarizer(self.config)
         intro = ai.generate_readme_intro(structure)
         
-        lines = [
-            f"# {self.config.project.name}",
-            "",
-            intro,
-            "",
-            "## 📁 Project Structure",
-            "",
-        ]
+        # Check if intro already has a title (fallback does)
+        if intro.strip().startswith("# "):
+            lines = [intro, "", "## 📁 Project Structure", ""]
+        else:
+            lines = [
+                f"# {self.config.project.name}",
+                "",
+                intro,
+                "",
+                "## 📁 Project Structure",
+                "",
+            ]
         
         # Add module overview
         for module in structure.get("modules", [])[:15]:

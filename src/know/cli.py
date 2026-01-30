@@ -648,8 +648,121 @@ def completion(shell: Optional[str]) -> None:
     console.print(f"[bold]know completion --shell {shell} >> {get_shell_config_path(shell)}[/bold]")
 
 
+@cli.command()
+@click.argument("query")
+@click.option(
+    "--top-k",
+    "-k",
+    type=int,
+    default=10,
+    help="Number of results to show"
+)
+@click.option(
+    "--index",
+    is_flag=True,
+    help="Index the codebase before searching"
+)
+@click.pass_context
+def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
+    """Search code semantically using embeddings."""
+    config = ctx.obj["config"]
+    
+    from know.semantic_search import SemanticSearcher
+    
+    searcher = SemanticSearcher()
+    
+    if index:
+        if not ctx.obj.get("quiet"):
+            console.print(f"[dim]Indexing {config.root}...[/dim]")
+        count = searcher.index_directory(config.root)
+        if not ctx.obj.get("quiet"):
+            console.print(f"[green]✓[/green] Indexed {count} files")
+    
+    if not ctx.obj.get("quiet"):
+        console.print(f"[dim]Searching for: {query}[/dim]")
+    
+    # Avoid re-indexing if we just did it manually
+    results = searcher.search_code(query, config.root, top_k, auto_index=not index)
+    
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"results": results}))
+    elif ctx.obj.get("quiet"):
+        for r in results:
+            click.echo(f"{r['score']:.3f} {r['path']}")
+    else:
+        if not results:
+            console.print("[yellow]No results found[/yellow]")
+            return
+        
+        console.print(f"\n[bold]Top {len(results)} results:[/bold]\n")
+        for i, r in enumerate(results, 1):
+            score_color = "green" if r['score'] > 0.7 else "yellow" if r['score'] > 0.4 else "dim"
+            console.print(f"{i}. [{score_color}]{r['score']:.3f}[/{score_color}] {r['path']}")
+            if r['preview']:
+                preview = r['preview'][:200].replace('\n', ' ')
+                console.print(f"   [dim]{preview}...[/dim]")
+            console.print()
+
+
+@cli.command()
+@click.option(
+    "--since",
+    "-s",
+    default="1 week ago",
+    help="Time period to analyze (e.g., '1 week ago', '3 days ago')"
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    help="Output file path"
+)
+@click.pass_context
+def diff(ctx: click.Context, since: str, output: Optional[str]) -> None:
+    """Show architectural changes since a given time."""
+    config = ctx.obj["config"]
+    
+    from know.diff import ArchitectureDiff
+    
+    differ = ArchitectureDiff(config.root)
+    
+    if not ctx.obj.get("quiet"):
+        console.print(f"[dim]Analyzing changes since: {since}[/dim]")
+    
+    try:
+        diff_content = differ.generate_diff(since)
+        
+        if output:
+            output_path = Path(output)
+            output_path.write_text(diff_content)
+            if not ctx.obj.get("quiet"):
+                console.print(f"[green]✓[/green] Diff saved to {output_path}")
+        else:
+            # Save to docs by default
+            output_path = config.root / "docs" / "architecture-diff.md"
+            output_path.write_text(diff_content)
+            if not ctx.obj.get("quiet"):
+                console.print(f"[green]✓[/green] Diff saved to docs/architecture-diff.md")
+        
+        if ctx.obj.get("json"):
+            import json
+            click.echo(json.dumps({"output": str(output_path)}))
+        elif not ctx.obj.get("quiet"):
+            # Show summary
+            console.print("\n" + diff_content.split("---")[0])  # Show only summary section
+            
+    except Exception as e:
+        if ctx.obj.get("json"):
+            import json
+            click.echo(json.dumps({"error": str(e)}))
+        else:
+            console.print(f"[red]✗[/red] Error generating diff: {e}")
+        sys.exit(1)
+
+
 def get_shell_config_path(shell: str) -> str:
-    """Get the default config path for a shell."""
+    """Get the config file path for a shell."""
     home = Path.home()
     if shell == "bash":
         return str(home / ".bashrc")
@@ -657,7 +770,7 @@ def get_shell_config_path(shell: str) -> str:
         return str(home / ".zshrc")
     elif shell == "fish":
         return str(home / ".config" / "fish" / "config.fish")
-    return "~/.bashrc"
+    return str(home / ".profile")
 
 
 def main() -> None:
