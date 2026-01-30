@@ -10,25 +10,28 @@
 ## 📁 Project Structure
 
 - **[src.know.logger](src/know/logger.py)** - Logging configuration for know.
+- **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
 - **[src.know.ai](src/know/ai.py)** - AI integration for intelligent code understanding with advanced token optimization.
 - **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
 - **[src.know.cli](src/know/cli.py)** - CLI entry point for know.
 - **[src.know.exceptions](src/know/exceptions.py)** - Custom exceptions for know-cli.
+- **[src.know.diff](src/know/diff.py)** - Diff mode for tracking architectural changes safely using git worktrees.
 - **[src.know.generator](src/know/generator.py)** - Documentation generator.
 - **[src.know.parsers](src/know/parsers.py)** - Parser strategy pattern for language-specific parsing.
+- **[src.know.quality](src/know/quality.py)** - Code quality metrics and dashboard.
 - **[src.know.git_hooks](src/know/git_hooks.py)** - Git hook management.
 - **[src.know.config](src/know/config.py)** - Configuration management for know.
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.models](src/know/models.py)** - Data models for know-cli.
 - **[src.know.scanner](src/know/scanner.py)** - Codebase scanner for AST analysis.
-- **[src.know.index](src/know/index.py)** - Index management for incremental code scanning.
+- ... and 1 more modules
 
 ## 📊 Statistics
 
-- **Files:** 13
-- **Modules:** 13
-- **Functions:** 21
-- **Classes:** 33
+- **Files:** 16
+- **Modules:** 16
+- **Functions:** 23
+- **Classes:** 38
 
 ---
 
