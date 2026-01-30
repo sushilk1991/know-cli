@@ -25,17 +25,81 @@
 **know** uses AI to generate intelligent documentation. You need an API key from one of these providers:
 
 **Option A: Anthropic (Claude)** ⭐ Recommended
-- Sign up at https://console.anthropic.com/
-- Get your API key from the dashboard
-- Set environment variable: `export ANTHROPIC_API_KEY="your-key-here"`
-- Add to your `~/.zshrc` or `~/.bashrc` to make it permanent
+
+1. **Sign up** at https://console.anthropic.com/
+2. **Get your API key** from the dashboard (starts with `sk-ant-`)
+3. **Add to your shell profile** (choose based on your shell):
+
+   **For Zsh (macOS default, most modern systems):**
+   ```bash
+   echo 'export ANTHROPIC_API_KEY="sk-ant-xxxxx-your-key-here"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
+
+   **For Bash (Linux, older macOS):**
+   ```bash
+   echo 'export ANTHROPIC_API_KEY="sk-ant-xxxxx-your-key-here"' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+   **For Fish shell:**
+   ```bash
+   set -Ux ANTHROPIC_API_KEY "sk-ant-xxxxx-your-key-here"
+   ```
+
+4. **Verify it works:**
+   ```bash
+   echo $ANTHROPIC_API_KEY
+   # Should output: sk-ant-xxxxx-your-key-here
+   ```
 
 **Option B: OpenAI (GPT-4)**
-- Get key from https://platform.openai.com/api-keys
-- Set: `export OPENAI_API_KEY="your-key-here"`
-- Update `.know/config.yaml` to use OpenAI
+
+1. Get key from https://platform.openai.com/api-keys (starts with `sk-`)
+2. Add to your shell profile:
+
+   **Zsh:**
+   ```bash
+   echo 'export OPENAI_API_KEY="sk-xxxxx-your-key-here"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
+
+   **Bash:**
+   ```bash
+   echo 'export OPENAI_API_KEY="sk-xxxxx-your-key-here"' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+3. Update `.know/config.yaml` to use OpenAI:
+   ```yaml
+   ai:
+     provider: "openai"
+     model: "gpt-4"
+     api_key_env: "OPENAI_API_KEY"
+   ```
 
 **💡 Note:** This is different from Claude Code (the CLI tool) or GitHub Copilot. You need a direct API key from the provider.
+
+### Quick Setup Verification
+
+After adding the API key, verify everything is working:
+
+```bash
+# 1. Check the key is set
+echo $ANTHROPIC_API_KEY
+
+# 2. Test in a project
+cd your-project
+know init
+know explain -c <some-component>
+
+# 3. You should see AI-generated output (not fallback text)
+```
+
+**Troubleshooting:**
+- If `echo $ANTHROPIC_API_KEY` shows nothing, the key wasn't saved properly
+- Try opening a new terminal window and run the echo command again
+- Make sure you used `>>` (append) not `>` (overwrite) when adding to your profile
 
 **💰 Cost Estimation (Aggressive Optimization):**
 - **Haiku 4.5** (small/fast tasks): $1/million input, $5/million output
