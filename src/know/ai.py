@@ -156,27 +156,13 @@ class AISummarizer:
         self.config = config
         self.provider = config.ai.provider
         self.model = config.ai.model
-        self.api_key = os.getenv(config.ai.api_key_env)
+        self.api_key = os.getenv(config.ai.api_key_env, "").strip()
         self.cache = AIResponseCache()
         self.optimizer = TokenOptimizer()
         
+        # Only show warning if key is genuinely not set
         if not self.api_key and self.provider == "anthropic":
-            console.print("""
-[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]
-
-To enable AI-powered features:
-1. Get an API key from https://console.anthropic.com/
-2. Set environment variable: [bold]export ANTHROPIC_API_KEY="your-key"[/bold]
-3. Add to your ~/.zshrc or ~/.bashrc to make it permanent
-
-Cost estimates with optimizations:
-- Haiku 4.5: $1/million input, $5/million output
-- Sonnet 4.5: $3/million input, $15/million output
-- Caching reduces repeated calls by ~60%
-- Code compression saves ~40% tokens
-
-See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
-""")
+            console.print("[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]")
     
     def _call_claude(
         self, 
@@ -218,12 +204,9 @@ See troubleshooting: https://github.com/sushilk1991/know-cli#troubleshooting
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
             total_cost = input_cost + output_cost
             
-            model_name = "Haiku" if use_model == self.MODEL_HAIKU else "Sonnet"
-            savings = "(cached)" if cache_key else ""
-            console.print(
-                f"[dim]💰 {model_name}: {total_tokens:,} tokens "
-                f"(~${total_cost:.4f}) {savings}[/dim]"
-            )
+            # Only show cost for non-cached responses
+            if not cache_key:
+                console.print(f"[dim]({total_tokens:,} tokens)[/dim]")
             
             response = message.content[0].text
             
