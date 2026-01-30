@@ -282,6 +282,39 @@ Automatically update docs on every commit:
 know hooks install
 ```
 
+### 🔄 `know watch` vs Git Hooks: What's the Difference?
+
+Both keep your docs in sync, but work differently:
+
+| Feature | `know watch` | `know hooks install` |
+|---------|--------------|----------------------|
+| **When it runs** | While you're coding | When you commit code |
+| **Process** | Background daemon | Pre-commit hook |
+| **Scope** | All file changes | Only staged changes |
+| **Best for** | Active development | CI/CD, team workflows |
+| **Setup** | Run manually | One-time install |
+| **Resource use** | Continuous (light) | Only on commit |
+
+**Use `know watch` when:**
+- You're actively developing and want docs updated in real-time
+- Working on complex refactors
+- Want to see immediate feedback
+
+**Use Git Hooks when:**
+- You want docs committed alongside code
+- Working in a team (ensures docs are always committed)
+- Want CI/CD to have updated docs
+- Don't want a background process running
+
+**Can use both together:**
+```bash
+# Install git hooks for team workflow
+know hooks install
+
+# Also run watch during active development
+know watch
+```
+
 ## 🔧 Troubleshooting
 
 ### "ANTHROPIC_API_KEY not set" Error
