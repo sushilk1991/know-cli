@@ -8,6 +8,27 @@
 
 **know** is a CLI tool that automatically generates and maintains documentation for your codebase. It uses AST analysis to understand your code structure and AI to generate intelligent summaries that stay in sync as your code evolves.
 
+## 🤖 Built for AI Coding Agents
+
+**Claude Code, GitHub Copilot, Cursor** — know gives your AI agent superpowers:
+
+```bash
+# Semantic search: Find code by concept, not keywords
+know search "authentication flow"  # Finds "login", "oauth", "signin"
+
+# Instant context: Explain any component
+know explain -c UserService  # Deep understanding without reading files
+
+# AI-ready digest: Feed your entire codebase to Claude
+know digest --for-llm  # Optimized for AI context windows
+```
+
+**Why AI agents love know:**
+- ⚡ **Fast**: Local semantic search (no API calls, ~50ms)
+- 🔒 **Private**: Embeddings stored locally in SQLite
+- 💰 **Free**: No per-search costs, run 1000x a day
+- 🎯 **Precise**: Finds related code even without keyword matches
+
 ## ✨ Features
 
 - **🔄 Continuous Sync** - Documentation updates automatically via git hooks
@@ -539,6 +560,44 @@ know explain -c <component-name>
 know hooks install  # Auto-update on commit
 # or
 know watch          # Real-time updates while coding
+```
+
+### Claude Code Integration
+
+**know** works seamlessly with Claude Code's embedded context:
+
+```bash
+# Semantic search from within Claude Code
+$ know search "authentication flow"
+# Returns relevant files instantly using local embeddings
+
+# Quick component lookup
+$ know explain -c "UserAuth"
+# AI explains the component without leaving your editor
+
+# Generate context for Claude
+$ know digest --for-llm --compact
+# Creates bite-sized summary perfect for Claude's context window
+```
+
+**Why this matters for Claude Code:**
+- ⚡ **Fast**: Local semantic search (no API calls)
+- 🎯 **Precise**: Embeddings find related code even without keyword matches
+- 🔒 **Private**: All embeddings stored locally in SQLite
+- 💰 **Free**: No per-search costs, run it 100x a day
+
+**Example workflow:**
+```bash
+# Terminal 1: Your dev server
+$ npm run dev
+[error occurs...]
+
+# Same terminal: Quick search
+$ know search "file upload error"
+# Finds: src/lib/upload.ts, src/components/dropzone.tsx
+
+# Tell Claude Code:
+# "Check src/lib/upload.ts, the handleFileUpload function seems broken"
 ```
 
 ### Pro Tips
