@@ -479,7 +479,7 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
 )
 @click.option(
     "--only",
-    type=click.Choice(["readme", "diagrams", "api", "onboarding"]),
+    type=click.Choice(["system", "diagrams", "api", "onboarding"]),
     help="Update only specific docs",
 )
 @click.pass_context
@@ -497,11 +497,11 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
     
     results = []
     
-    if only == "readme" or update_all:
-        path = generator.generate_readme(structure)
-        results.append({"type": "readme", "path": str(path)})
+    if only == "system" or update_all:
+        path = generator.generate_system_doc(structure)
+        results.append({"type": "system", "path": str(path)})
         if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
-            console.print(f"[green]✓[/green] README: [cyan]{path}[/cyan]")
+            console.print(f"[green]✓[/green] System doc: [cyan]{path}[/cyan]")
     
     if only == "diagrams" or update_all:
         path = generator.generate_c4_diagram(structure)

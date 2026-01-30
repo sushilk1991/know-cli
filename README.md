@@ -142,8 +142,13 @@ know init
 ### 4. Generate Documentation
 
 ```bash
-# Create AI-powered documentation
+# Create AI-powered documentation (generates docs/arc.md by default)
 know update
+
+# Generate specific docs only
+know update --only system      # docs/arc.md
+know update --only diagrams    # docs/architecture.md
+know update --only api         # docs/openapi.json
 
 # Generate LLM-optimized digest for AI agents
 know digest --for-llm
@@ -151,6 +156,14 @@ know digest --for-llm
 # Start auto-updating on file changes
 know watch
 ```
+
+**Note:** By default, `know` generates documentation in the `docs/` folder:
+- `docs/arc.md` - System overview and project structure
+- `docs/architecture.md` - Architecture diagrams
+- `docs/onboarding-*.md` - Onboarding guides
+- `docs/digest-llm.md` - AI-optimized codebase summary
+
+This keeps generated docs separate from your README.md. If you want to update README.md instead, you can customize the output path in `.know/config.yaml` (see Configuration section).
 
 ### 5. Verify Setup
 
@@ -228,11 +241,16 @@ exclude:
 
 ai:
   provider: "anthropic"
-  model: "claude-3-sonnet-20240229"
+  model: "claude-haiku-4-5-20251022"  # or claude-sonnet-4-5-20251022
   api_key_env: "ANTHROPIC_API_KEY"
 
 output:
   directory: "docs"
+  
+  # Optional: Customize the main system doc filename
+  # Default is "arc.md" in the docs/ folder
+  # Set to "README.md" to update your project's README instead
+  # system_doc: "arc.md"
 ```
 
 ## 🔧 Installation
