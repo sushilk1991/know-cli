@@ -142,9 +142,9 @@ class AIResponseCache:
 class AISummarizer:
     """AI-powered code summarization with aggressive token optimization."""
     
-    # Model names
-    MODEL_SONNET = "claude-sonnet-4-5-20251022"
-    MODEL_HAIKU = "claude-haiku-4-5-20251022"
+    # Model names - use latest aliases to avoid date-based failures
+    MODEL_SONNET = "claude-3-5-sonnet-latest"
+    MODEL_HAIKU = "claude-3-haiku-latest"
     
     # Pricing (per million tokens)
     PRICING = {
