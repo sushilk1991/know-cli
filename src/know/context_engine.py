@@ -750,6 +750,13 @@ class ContextEngine:
                 lines.append(chunk.body)
                 lines.append("")
 
+        # Memories
+        if result.get("memories_context"):
+            lines.append("### Memories (Cross-Session Knowledge)")
+            lines.append("")
+            lines.append(result["memories_context"])
+            lines.append("")
+
         # Overview
         if result["overview"]:
             lines.append("### Project Context")
@@ -783,6 +790,7 @@ class ContextEngine:
             "tests": [_chunk_to_dict(c) for c in result["test_chunks"]],
             "summaries": [_chunk_to_dict(c) for c in result["summary_chunks"]],
             "overview": result["overview"],
+            "memories": result.get("memories_context", ""),
             "source_files": list({c.file_path for c in result["code_chunks"]}),
         }
         return json.dumps(payload, indent=2)

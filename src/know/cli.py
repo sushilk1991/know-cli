@@ -237,6 +237,21 @@ def explain(ctx: click.Context, component: str, detailed: bool) -> None:
             console.print(f"[red]✗[/red] Error: {e}")
         sys.exit(1)
     
+    # Auto-store explanation as memory
+    try:
+        from know.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(config)
+        # Store a summary — first 300 chars — as an auto-memory
+        summary = explanation[:300].strip()
+        if summary:
+            kb.remember(
+                f"[{component}] {summary}",
+                source="auto-explain",
+                tags=component,
+            )
+    except Exception:
+        pass
+
     if ctx.obj.get("json"):
         import json
         click.echo(json.dumps({
@@ -451,7 +466,19 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
     
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(digest_content)
-    
+
+    # Auto-store digest insights as memories
+    try:
+        from know.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(config)
+        # Extract first 3 non-empty lines as key insights
+        digest_lines = [l.strip() for l in digest_content.splitlines() if l.strip() and not l.startswith("#")]
+        for insight in digest_lines[:3]:
+            if len(insight) > 20:
+                kb.remember(insight[:500], source="auto-digest", tags="digest")
+    except Exception:
+        pass
+
     lines = len(digest_content.splitlines())
     chars = len(digest_content)
     
@@ -623,8 +650,13 @@ def uninstall(ctx: click.Context) -> None:
     is_flag=True,
     help="Index the codebase before searching"
 )
+@click.option(
+    "--chunk",
+    is_flag=True,
+    help="Search at function/class level (chunk embeddings)"
+)
 @click.pass_context
-def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
+def search(ctx: click.Context, query: str, top_k: int, index: bool, chunk: bool) -> None:
     """Search code semantically using embeddings."""
     config = ctx.obj["config"]
     
@@ -635,39 +667,59 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
     if index:
         if not ctx.obj.get("quiet"):
             console.print(f"[dim]Indexing {config.root}...[/dim]")
-        count = searcher.index_directory(config.root)
+        if chunk:
+            count = searcher.index_chunks(config.root)
+        else:
+            count = searcher.index_directory(config.root)
         if not ctx.obj.get("quiet"):
-            console.print(f"[green]✓[/green] Indexed {count} files")
+            console.print(f"[green]✓[/green] Indexed {count} {'chunks' if chunk else 'files'}")
     
     if not ctx.obj.get("quiet"):
         console.print(f"[dim]Searching for: {query}[/dim]")
     
-    # Avoid re-indexing if we just did it manually
-    results = searcher.search_code(query, config.root, top_k, auto_index=not index)
-    
+    import time as _time
+    t0 = _time.monotonic()
+
+    if chunk:
+        results = searcher.search_chunks(query, config.root, top_k, auto_index=not index)
+    else:
+        results = searcher.search_code(query, config.root, top_k, auto_index=not index)
+
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+
+    # Track stats
+    try:
+        from know.stats import StatsTracker
+        StatsTracker(config).record_search(query, len(results), duration_ms)
+    except Exception:
+        pass
+
     if ctx.obj.get("json"):
         import json
         click.echo(json.dumps({"results": results}))
     elif ctx.obj.get("quiet"):
         for r in results:
-            click.echo(f"{r['score']:.3f} {r['path']}")
+            click.echo(f"{r['score']:.3f} {r.get('path', r.get('name', ''))}")
     else:
         if not results:
             console.print("[yellow]No results found[/yellow]")
-            return
+            sys.exit(2)
         
         console.print(f"\n[bold]Top {len(results)} results:[/bold]\n")
         for i, r in enumerate(results, 1):
             score_color = "green" if r['score'] > 0.7 else "yellow" if r['score'] > 0.4 else "dim"
-            console.print(f"{i}. [{score_color}]{r['score']:.3f}[/{score_color}] {r['path']}")
-            if r['preview']:
+            label = r.get("path", r.get("name", ""))
+            if chunk and r.get("name"):
+                label = f"{r['path']}:{r['name']}" if r.get("path") else r["name"]
+            console.print(f"{i}. [{score_color}]{r['score']:.3f}[/{score_color}] {label}")
+            if r.get('preview'):
                 preview = r['preview'][:200].replace('\n', ' ')
                 console.print(f"   [dim]{preview}...[/dim]")
             console.print()
 
 
 @cli.command()
-@click.argument("query")
+@click.argument("query", required=False, default=None)
 @click.option(
     "--budget",
     "-b",
@@ -695,7 +747,7 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
 @click.pass_context
 def context(
     ctx: click.Context,
-    query: str,
+    query: Optional[str],
     budget: int,
     output_format: str,
     no_tests: bool,
@@ -703,12 +755,25 @@ def context(
 ) -> None:
     """Build LLM-optimized context for a query.
     
+    Supports STDIN: echo "query" | know context --budget 4000
+    
     Example: know context "help me fix the auth bug" --budget 8000
     """
     config = ctx.obj["config"]
 
-    if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+    # STDIN support: read query from pipe if not provided as argument
+    if query is None:
+        if not sys.stdin.isatty():
+            query = sys.stdin.read().strip()
+        if not query:
+            click.echo("Error: query is required (pass as argument or via STDIN)", err=True)
+            sys.exit(1)
+
+    if not ctx.obj.get("quiet") and not ctx.obj.get("json") and output_format != "agent":
         console.print(f'[dim]Building context for: "{query}" (budget {budget} tokens)[/dim]')
+
+    import time as _time
+    t0 = _time.monotonic()
 
     from know.context_engine import ContextEngine
 
@@ -719,6 +784,27 @@ def context(
         include_tests=not no_tests,
         include_imports=not no_imports,
     )
+
+    # Inject relevant memories into context
+    try:
+        from know.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase(config)
+        memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+        if memory_ctx:
+            result["memories_context"] = memory_ctx
+    except Exception:
+        pass
+
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+
+    # Track stats
+    try:
+        from know.stats import StatsTracker
+        StatsTracker(config).record_context(
+            query, budget, result["used_tokens"], duration_ms,
+        )
+    except Exception:
+        pass
 
     if ctx.obj.get("json") or output_format == "agent":
         click.echo(engine.format_agent_json(result))
@@ -869,6 +955,342 @@ def diff(ctx: click.Context, since: str, output: Optional[str]) -> None:
         else:
             console.print(f"[red]✗[/red] Error generating diff: {e}")
         sys.exit(1)
+
+
+# ===================================================================
+# Week 3: Knowledge base commands
+# ===================================================================
+
+@cli.command()
+@click.argument("text")
+@click.option("--tags", "-t", default="", help="Comma-separated tags")
+@click.option("--source", "-s", default="manual", help="Memory source (manual, auto-explain, auto-digest)")
+@click.pass_context
+def remember(ctx: click.Context, text: str, tags: str, source: str) -> None:
+    """Store a memory for cross-session recall.
+
+    Example: know remember "The auth system uses JWT with Redis session store"
+    """
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(config)
+    mem_id = kb.remember(text, source=source, tags=tags)
+
+    # Track stats
+    try:
+        from know.stats import StatsTracker
+        StatsTracker(config).record_remember(text, source)
+    except Exception:
+        pass
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"id": mem_id, "text": text, "source": source}))
+    elif ctx.obj.get("quiet"):
+        click.echo(str(mem_id))
+    else:
+        console.print(f"[green]✓[/green] Remembered (id={mem_id}): {text[:80]}")
+
+
+@cli.command()
+@click.argument("query")
+@click.option("--top-k", "-k", type=int, default=5, help="Max results")
+@click.pass_context
+def recall(ctx: click.Context, query: str, top_k: int) -> None:
+    """Recall memories semantically similar to a query.
+
+    Example: know recall "how does auth work?"
+    """
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    import time as _time
+    t0 = _time.monotonic()
+
+    kb = KnowledgeBase(config)
+    memories = kb.recall(query, top_k=top_k)
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+
+    # Track stats
+    try:
+        from know.stats import StatsTracker
+        StatsTracker(config).record_recall(query, len(memories), duration_ms)
+    except Exception:
+        pass
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"query": query, "results": [m.to_dict() for m in memories]}))
+    elif ctx.obj.get("quiet"):
+        for m in memories:
+            click.echo(f"{m.id}\t{m.text}")
+    else:
+        if not memories:
+            console.print("[yellow]No matching memories found[/yellow]")
+            sys.exit(2)
+        console.print(f"\n[bold]Recalled {len(memories)} memories:[/bold]\n")
+        for m in memories:
+            console.print(f"  [cyan]#{m.id}[/cyan] [{m.source}] {m.text}")
+            console.print(f"       [dim]{m.created_at}[/dim]")
+        console.print()
+
+
+@cli.command()
+@click.argument("memory_id", type=int)
+@click.pass_context
+def forget(ctx: click.Context, memory_id: int) -> None:
+    """Delete a memory by ID.
+
+    Example: know forget 3
+    """
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(config)
+    deleted = kb.forget(memory_id)
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"id": memory_id, "deleted": deleted}))
+    elif ctx.obj.get("quiet"):
+        click.echo("1" if deleted else "0")
+    else:
+        if deleted:
+            console.print(f"[green]✓[/green] Forgot memory #{memory_id}")
+        else:
+            console.print(f"[red]✗[/red] Memory #{memory_id} not found")
+            sys.exit(1)
+
+
+@cli.group()
+def memories() -> None:
+    """Manage stored memories (list, export, import)."""
+    pass
+
+
+@memories.command(name="list")
+@click.option("--source", "-s", default=None, help="Filter by source")
+@click.pass_context
+def memories_list(ctx: click.Context, source: Optional[str]) -> None:
+    """List all stored memories."""
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(config)
+    mems = kb.list_all(source=source)
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps([m.to_dict() for m in mems]))
+    elif ctx.obj.get("quiet"):
+        for m in mems:
+            click.echo(f"{m.id}\t{m.source}\t{m.text}")
+    else:
+        if not mems:
+            console.print("[yellow]No memories stored yet[/yellow]")
+            sys.exit(2)
+        console.print(f"\n[bold]📝 {len(mems)} memories:[/bold]\n")
+        for m in mems:
+            console.print(f"  [cyan]#{m.id}[/cyan] [{m.source}] {m.text}")
+            if m.tags:
+                console.print(f"       tags: {m.tags}")
+            console.print(f"       [dim]{m.created_at}[/dim]")
+        console.print()
+
+
+@memories.command(name="export")
+@click.pass_context
+def memories_export(ctx: click.Context) -> None:
+    """Export all memories as JSON (to stdout)."""
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(config)
+    click.echo(kb.export_json())
+
+
+@memories.command(name="import")
+@click.argument("file", type=click.Path(exists=True))
+@click.pass_context
+def memories_import(ctx: click.Context, file: str) -> None:
+    """Import memories from a JSON file."""
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    data = Path(file).read_text()
+    kb = KnowledgeBase(config)
+    count = kb.import_json(data)
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"imported": count}))
+    elif ctx.obj.get("quiet"):
+        click.echo(str(count))
+    else:
+        console.print(f"[green]✓[/green] Imported {count} memories")
+
+
+# ===================================================================
+# Week 3: Stats & Status commands
+# ===================================================================
+
+@cli.command()
+@click.pass_context
+def stats(ctx: click.Context) -> None:
+    """Show usage statistics and ROI."""
+    config = ctx.obj["config"]
+
+    from know.stats import StatsTracker
+    from know.knowledge_base import KnowledgeBase
+
+    tracker = StatsTracker(config)
+    summary = tracker.get_summary()
+
+    # Codebase info
+    scanner = CodebaseScanner(config)
+    try:
+        structure = scanner.get_structure()
+        py_files = structure.get("file_count", len(structure.get("modules", [])))
+        functions = structure.get("function_count", 0)
+    except Exception:
+        py_files = 0
+        functions = 0
+
+    # Memory info
+    try:
+        kb = KnowledgeBase(config)
+        total_mem = kb.count()
+        manual_mem = kb.count(source="manual")
+        auto_mem = total_mem - manual_mem
+    except Exception:
+        total_mem = manual_mem = auto_mem = 0
+
+    if ctx.obj.get("json"):
+        import json
+        data = {**summary, "memories_total": total_mem,
+                "memories_manual": manual_mem, "memories_auto": auto_mem,
+                "project_files": py_files, "project_functions": functions}
+        click.echo(json.dumps(data, indent=2))
+        return
+
+    console.print("\n[bold]📊 know-cli Statistics[/bold]")
+    console.print("─────────────────────")
+    console.print(f"  Project: {config.project.name or config.root.name} ({py_files} files, {functions} functions)")
+    console.print()
+
+    console.print(f"  [bold]Knowledge Base:[/bold]")
+    console.print(f"    {total_mem} memories ({manual_mem} manual, {auto_mem} auto)")
+    console.print()
+
+    console.print(f"  [bold]Context Engine:[/bold]")
+    console.print(f"    Queries served: {summary['context_queries']}")
+    if summary["context_queries"] > 0:
+        console.print(f"    Avg budget utilization: {summary['context_budget_util']}%")
+        console.print(f"    Avg response time: {summary['context_avg_ms']}ms")
+    console.print()
+
+    console.print(f"  [bold]Search:[/bold]")
+    console.print(f"    Queries: {summary['search_queries']}")
+    if summary["search_queries"] > 0:
+        console.print(f"    Avg response time: {summary['search_avg_ms']}ms")
+    console.print()
+
+    console.print(f"  [bold]Memory Ops:[/bold]")
+    console.print(f"    Remember calls: {summary['remember_count']}")
+    console.print(f"    Recall calls: {summary['recall_count']}")
+    console.print()
+
+
+@cli.command()
+@click.pass_context
+def status(ctx: click.Context) -> None:
+    """Quick project health check."""
+    config = ctx.obj["config"]
+
+    from know import __version__
+
+    # Codebase info
+    scanner = CodebaseScanner(config)
+    try:
+        structure = scanner.get_structure()
+        modules = structure.get("modules", [])
+        n_files = structure.get("file_count", len(modules))
+        n_functions = structure.get("function_count", 0)
+    except Exception:
+        n_files = n_functions = 0
+
+    # Index info
+    index_chunks = 0
+    index_age = "unknown"
+    cache_dir = config.root / ".know" / "cache"
+    if cache_dir.exists():
+        for db_file in cache_dir.glob("*.db"):
+            try:
+                import time as _time
+                mtime = db_file.stat().st_mtime
+                age_s = _time.time() - mtime
+                if age_s < 3600:
+                    index_age = f"{int(age_s / 60)}m ago"
+                elif age_s < 86400:
+                    index_age = f"{int(age_s / 3600)}h ago"
+                else:
+                    index_age = f"{int(age_s / 86400)}d ago"
+            except Exception:
+                pass
+
+    # Memories
+    mem_count = 0
+    try:
+        from know.knowledge_base import KnowledgeBase
+        mem_count = KnowledgeBase(config).count()
+    except Exception:
+        pass
+
+    # Cache size
+    cache_size = "0 B"
+    total_bytes = 0
+    know_dir = config.root / ".know"
+    if know_dir.exists():
+        for f in know_dir.rglob("*"):
+            if f.is_file():
+                total_bytes += f.stat().st_size
+        if total_bytes > 1024 * 1024:
+            cache_size = f"{total_bytes / 1024 / 1024:.1f} MB"
+        elif total_bytes > 1024:
+            cache_size = f"{total_bytes / 1024:.1f} KB"
+        else:
+            cache_size = f"{total_bytes} B"
+
+    # Config check
+    config_ok = (config.root / ".know" / "config.yaml").exists()
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({
+            "version": __version__,
+            "project": str(config.root),
+            "files": n_files,
+            "functions": n_functions,
+            "index_age": index_age,
+            "memories": mem_count,
+            "cache_size": cache_size,
+            "config_ok": config_ok,
+        }, indent=2))
+        return
+
+    console.print(f"\n[green]✓[/green] [bold]know-cli v{__version__}[/bold]")
+    console.print(f"  Project: {config.root}")
+    console.print(f"  Files: {n_files} Python")
+    console.print(f"  Functions: {n_functions}")
+    console.print(f"  Indexed: {index_age}")
+    console.print(f"  Memories: {mem_count}")
+    console.print(f"  Cache: {cache_size}")
+    if config_ok:
+        console.print("  Config: .know/config.yaml [green]✓[/green]")
+    else:
+        console.print("  Config: [red]not initialized[/red]")
+    console.print()
 
 
 def get_shell_config_path(shell: str) -> str:

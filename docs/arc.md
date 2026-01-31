@@ -14,6 +14,7 @@ know-cli is a command-line interface tool designed to help users quickly access 
 
 - **[src.know.index](src/know/index.py)** - Index management for incremental code scanning.
 - **[src.know.ai](src/know/ai.py)** - AI integration for intelligent code understanding with advanced token optimization.
+- **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
 - **[src.know.models](src/know/models.py)** - Data models for know-cli.
 - **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
 - **[src.know.quality](src/know/quality.py)** - Code quality metrics and dashboard.
@@ -26,15 +27,14 @@ know-cli is a command-line interface tool designed to help users quickly access 
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.scanner](src/know/scanner.py)** - Codebase scanner for AST analysis.
 - **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
-- **[src.know.config](src/know/config.py)** - Configuration management for know.
-- ... and 4 more modules
+- ... and 6 more modules
 
 ## 📊 Statistics
 
-- **Files:** 19
-- **Modules:** 19
-- **Functions:** 34
-- **Classes:** 41
+- **Files:** 21
+- **Modules:** 21
+- **Functions:** 43
+- **Classes:** 44
 
 ---
 

@@ -4,6 +4,7 @@
 graph TB
     index["index\n(1f, 1c)"]
     ai["ai\n(0f, 4c)"]
+    stats["stats\n(0f, 1c)"]
     models["models\n(0f, 4c)"]
     watcher["watcher\n(0f, 2c)"]
     quality["quality\n(0f, 2c)"]
@@ -11,22 +12,24 @@ graph TB
     logger["logger\n(2f, 0c)"]
     generator["generator\n(0f, 1c)"]
     parsers["parsers\n(0f, 5c)"]
-    cli["cli\n(20f, 0c)"]
+    cli["cli\n(29f, 0c)"]
     semantic_search["semantic_search\n(0f, 2c)"]
     __init__["__init__"]
     scanner["scanner\n(1f, 1c)"]
     token_counter["token_counter\n(3f, 0c)"]
+    knowledge_base["knowledge_base\n(0f, 2c)"]
     config["config\n(1f, 6c)"]
     import_graph["import_graph\n(0f, 1c)"]
     git_hooks["git_hooks\n(0f, 1c)"]
     diff["diff\n(0f, 1c)"]
-    context_engine["context_engine\n(6f, 2c)"]
 
     index --> exceptions
     index --> logger
     index --> config
     index --> scanner
     ai --> config
+    stats --> logger
+    stats --> config
     watcher --> config
     watcher --> scanner
     watcher --> generator
@@ -47,6 +50,8 @@ graph TB
     cli --> context_engine
     cli --> import_graph
     cli --> diff
+    cli --> knowledge_base
+    cli --> stats
     semantic_search --> context_engine
     __init__ --> cli
     scanner --> exceptions
@@ -55,6 +60,9 @@ graph TB
     scanner --> models
     scanner --> config
     scanner --> index
+    knowledge_base --> logger
+    knowledge_base --> config
+    knowledge_base --> token_counter
     import_graph --> logger
     import_graph --> config
     git_hooks --> config
