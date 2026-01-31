@@ -726,8 +726,9 @@ def context(
         click.echo(engine.format_markdown(result))
     else:
         md = engine.format_markdown(result)
+        from rich.markup import escape
         console.print(Panel(
-            md,
+            escape(md),
             title=f"🧠 Context ({result['budget_display']})",
             border_style="blue",
         ))
@@ -890,10 +891,11 @@ def main() -> None:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]Unexpected error:[/red] {e}")
+        from rich.markup import escape
+        console.print(f"[red]Unexpected error:[/red] {escape(str(e))}")
         if os.environ.get("KNOW_DEBUG"):
             import traceback
-            console.print(traceback.format_exc())
+            console.print(escape(traceback.format_exc()))
         sys.exit(1)
 
 
