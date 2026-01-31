@@ -667,6 +667,154 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
 
 
 @cli.command()
+@click.argument("query")
+@click.option(
+    "--budget",
+    "-b",
+    type=int,
+    default=8000,
+    help="Token budget (default 8000)",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["markdown", "agent"]),
+    default="markdown",
+    help="Output format (markdown or agent JSON)",
+)
+@click.option(
+    "--no-tests",
+    is_flag=True,
+    help="Skip test file inclusion",
+)
+@click.option(
+    "--no-imports",
+    is_flag=True,
+    help="Skip import expansion",
+)
+@click.pass_context
+def context(
+    ctx: click.Context,
+    query: str,
+    budget: int,
+    output_format: str,
+    no_tests: bool,
+    no_imports: bool,
+) -> None:
+    """Build LLM-optimized context for a query.
+    
+    Example: know context "help me fix the auth bug" --budget 8000
+    """
+    config = ctx.obj["config"]
+
+    if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+        console.print(f'[dim]Building context for: "{query}" (budget {budget} tokens)[/dim]')
+
+    from know.context_engine import ContextEngine
+
+    engine = ContextEngine(config)
+    result = engine.build_context(
+        query,
+        budget=budget,
+        include_tests=not no_tests,
+        include_imports=not no_imports,
+    )
+
+    if ctx.obj.get("json") or output_format == "agent":
+        click.echo(engine.format_agent_json(result))
+    elif ctx.obj.get("quiet"):
+        click.echo(engine.format_markdown(result))
+    else:
+        md = engine.format_markdown(result)
+        console.print(Panel(
+            md,
+            title=f"🧠 Context ({result['budget_display']})",
+            border_style="blue",
+        ))
+
+
+@cli.command()
+@click.argument("file_path")
+@click.pass_context
+def graph(ctx: click.Context, file_path: str) -> None:
+    """Show import graph for a file.
+    
+    Example: know graph src/know/ai.py
+    """
+    config = ctx.obj["config"]
+
+    from know.import_graph import ImportGraph
+    from know.scanner import CodebaseScanner
+
+    # Ensure graph is built
+    scanner = CodebaseScanner(config)
+    structure = scanner.get_structure()
+    ig = ImportGraph(config)
+    ig.build(structure["modules"])
+
+    # Resolve the module name from the file path
+    stem = Path(file_path).stem
+    # Try full module name first
+    rel = str(Path(file_path).with_suffix("")).replace("/", ".").replace("\\", ".")
+
+    output = ig.format_graph(rel)
+
+    if ctx.obj.get("json"):
+        import json
+        data = {
+            "module": rel,
+            "imports": ig.imports_of(rel),
+            "imported_by": ig.imported_by(rel),
+        }
+        click.echo(json.dumps(data, indent=2))
+    elif ctx.obj.get("quiet"):
+        click.echo(output)
+    else:
+        console.print(Panel(
+            output,
+            title=f"📊 Import Graph: {file_path}",
+            border_style="green",
+        ))
+
+
+@cli.command()
+@click.option("--chunks", is_flag=True, help="Index at function/class level (default)")
+@click.option("--files", "file_level", is_flag=True, help="Index at file level (legacy)")
+@click.pass_context
+def reindex(ctx: click.Context, chunks: bool, file_level: bool) -> None:
+    """Rebuild search embeddings from scratch.
+    
+    By default indexes at function/class level for precise search.
+    """
+    config = ctx.obj["config"]
+
+    from know.semantic_search import SemanticSearcher
+
+    if not ctx.obj.get("quiet"):
+        console.print("[dim]Clearing existing embeddings...[/dim]")
+
+    searcher = SemanticSearcher(project_root=config.root)
+    searcher.clear_cache()
+
+    if file_level and not chunks:
+        if not ctx.obj.get("quiet"):
+            console.print("[dim]Indexing at file level...[/dim]")
+        count = searcher.index_directory(config.root)
+    else:
+        if not ctx.obj.get("quiet"):
+            console.print("[dim]Indexing at function/class level...[/dim]")
+        count = searcher.index_chunks(config.root)
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"indexed": count}))
+    elif ctx.obj.get("quiet"):
+        click.echo(count)
+    else:
+        console.print(f"[green]✓[/green] Indexed [bold]{count}[/bold] chunks")
+
+
+@cli.command()
 @click.option(
     "--since",
     "-s",

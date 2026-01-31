@@ -25,16 +25,16 @@ know-cli is a command-line interface tool designed to help users quickly access 
 - **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.scanner](src/know/scanner.py)** - Codebase scanner for AST analysis.
+- **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
 - **[src.know.config](src/know/config.py)** - Configuration management for know.
-- **[src.know.git_hooks](src/know/git_hooks.py)** - Git hook management.
-- ... and 1 more modules
+- ... and 4 more modules
 
 ## 📊 Statistics
 
-- **Files:** 16
-- **Modules:** 16
-- **Functions:** 22
-- **Classes:** 38
+- **Files:** 19
+- **Modules:** 19
+- **Functions:** 34
+- **Classes:** 41
 
 ---
 

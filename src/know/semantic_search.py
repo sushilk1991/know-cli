@@ -1,6 +1,12 @@
-"""Semantic code search using real embeddings and vector similarity."""
+"""Semantic code search using real embeddings and vector similarity.
+
+Supports both file-level (v1) and function-level (v2) embeddings.
+Function-level uses AST to split Python files into individual chunks
+(functions, classes, module summaries).
+"""
 
 import hashlib
+import json
 import sqlite3
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -393,3 +399,128 @@ class SemanticSearcher:
     def clear_cache(self):
         """Clear all cached embeddings for current model."""
         self.cache.clear_model(self.model_name)
+
+    # ------------------------------------------------------------------
+    # Function-level (chunk) embeddings
+    # ------------------------------------------------------------------
+    def index_chunks(self, root: Path, extensions: List[str] = None) -> int:
+        """Index code at function/class level for Python files.
+        
+        Non-Python files fall back to file-level embedding.
+        Returns number of chunks indexed.
+        """
+        from know.context_engine import extract_chunks_from_file
+
+        if extensions is None:
+            extensions = [".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cpp", ".c", ".h"]
+
+        ignore_spec = None
+        gitignore_path = root / ".gitignore"
+        if gitignore_path.exists() and pathspec:
+            try:
+                with open(gitignore_path, "r") as f:
+                    ignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", f)
+            except Exception:
+                pass
+
+        count = 0
+
+        with self.cache:
+            for ext in extensions:
+                for file_path in root.rglob(f"*{ext}"):
+                    # Skip ignored directories
+                    if any(part.startswith(".") or part in {"node_modules", "__pycache__", "venv", ".git", "dist", "build"}
+                           for part in file_path.parts):
+                        continue
+                    if ignore_spec:
+                        try:
+                            rel_path = file_path.relative_to(root)
+                            if ignore_spec.match_file(str(rel_path)):
+                                continue
+                        except ValueError:
+                            pass
+
+                    # Check file size
+                    try:
+                        if file_path.stat().st_size > self.MAX_FILE_SIZE:
+                            continue
+                    except OSError:
+                        continue
+
+                    chunks = extract_chunks_from_file(file_path, root)
+                    for chunk in chunks:
+                        chunk_key = f"{chunk.file_path}::{chunk.name}::{chunk.line_start}"
+                        # Build text for embedding
+                        embed_text = f"{chunk.name} {chunk.signature}\n{chunk.docstring}\n{chunk.body[:2000]}"
+                        content_hash = hashlib.sha256(embed_text.encode()).hexdigest()[:16]
+
+                        # Check cache
+                        cached = self.cache.get(chunk_key, content_hash, self.model_name)
+                        if cached is not None:
+                            count += 1
+                            continue
+
+                        try:
+                            embedding = self._get_embedding(embed_text)
+                            # Store with metadata in file_path field as JSON-encoded key
+                            metadata = json.dumps({
+                                "file": chunk.file_path,
+                                "name": chunk.name,
+                                "type": chunk.chunk_type,
+                                "line_start": chunk.line_start,
+                                "line_end": chunk.line_end,
+                            })
+                            self.cache.set(chunk_key, content_hash, embedding, self.model_name)
+                            count += 1
+                        except Exception:
+                            pass
+
+        return count
+
+    def search_chunks(self, query: str, root: Path, top_k: int = 20, auto_index: bool = True) -> List[dict]:
+        """Search at function/class level with metadata.
+        
+        Returns list of dicts with: path, name, type, line_start, line_end, score, preview.
+        """
+        if auto_index:
+            self.index_chunks(root)
+
+        # Get query embedding
+        query_embedding = self._get_embedding(query)
+
+        # Get all embeddings
+        file_paths, embeddings_matrix = self.cache.get_all_embeddings(self.model_name)
+        if not file_paths or embeddings_matrix.size == 0:
+            return []
+
+        # Cosine similarity
+        similarities = self._cosine_similarity(query_embedding, embeddings_matrix)
+        top_indices = np.argpartition(similarities, -min(top_k, len(similarities)))[-top_k:]
+        top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
+
+        results = []
+        for i in top_indices:
+            if similarities[i] <= 0:
+                continue
+            chunk_key = file_paths[i]
+            # Parse chunk key: "file_path::name::line_start"
+            parts = chunk_key.split("::")
+            if len(parts) >= 3:
+                results.append({
+                    "path": parts[0],
+                    "name": parts[1],
+                    "line_start": int(parts[2]) if parts[2].isdigit() else 1,
+                    "score": round(float(similarities[i]), 3),
+                    "chunk_key": chunk_key,
+                })
+            else:
+                # File-level embedding (old style)
+                results.append({
+                    "path": chunk_key,
+                    "name": Path(chunk_key).stem,
+                    "line_start": 1,
+                    "score": round(float(similarities[i]), 3),
+                    "chunk_key": chunk_key,
+                })
+
+        return results
