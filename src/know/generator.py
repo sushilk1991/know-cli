@@ -1,8 +1,9 @@
 """Documentation generator."""
 
+import ast
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from know.config import Config
@@ -106,12 +107,62 @@ class DocGenerator:
         else:
             return self._generate_c4_plantuml(structure, output)
     
+    def _resolve_imports(self, structure: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """Use AST to resolve import relationships between project modules.
+        
+        Returns list of (source_module, target_module) edges.
+        """
+        # Build a set of known module names for matching
+        module_names: Dict[str, str] = {}  # short_name -> full_name
+        for module in structure.get("modules", []):
+            full_name = module["name"]
+            short_name = full_name.split(".")[-1]
+            module_names[short_name] = full_name
+            module_names[full_name] = full_name
+        
+        edges: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        
+        for module in structure.get("modules", []):
+            mod_path = self.config.root / module["path"]
+            if not mod_path.exists() or not str(mod_path).endswith(".py"):
+                continue
+            
+            try:
+                source = mod_path.read_text(encoding="utf-8", errors="ignore")
+                tree = ast.parse(source)
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            
+            source_name = module["name"].split(".")[-1]
+            
+            for node in ast.walk(tree):
+                targets: List[str] = []
+                
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        targets.append(alias.name.split(".")[-1])
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        targets.append(node.module.split(".")[-1])
+                
+                for target in targets:
+                    if target in module_names and target != source_name:
+                        edge = (source_name, target)
+                        if edge not in seen:
+                            seen.add(edge)
+                            edges.append(edge)
+        
+        return edges
+
     def _generate_mermaid_diagram(
         self,
         structure: Dict[str, Any],
         output: Optional[str] = None
     ) -> Path:
-        """Generate Mermaid diagram."""
+        """Generate Mermaid diagram with real import-based edges."""
+        edges = self._resolve_imports(structure)
+        
         lines = [
             "# Architecture Diagram",
             "",
@@ -119,11 +170,27 @@ class DocGenerator:
             "graph TB",
         ]
         
-        # Add modules as nodes
-        for i, module in enumerate(structure.get("modules", [])[:20]):
-            node_id = f"M{i}"
+        # Collect nodes that participate in edges
+        nodes_in_edges: Set[str] = set()
+        for src, tgt in edges:
+            nodes_in_edges.add(src)
+            nodes_in_edges.add(tgt)
+        
+        # Add all modules as nodes
+        for module in structure.get("modules", [])[:20]:
             name = module['name'].split('.')[-1]
-            lines.append(f'    {node_id}["{name}"]')
+            func_count = module.get('function_count', 0)
+            class_count = module.get('class_count', 0)
+            label = f"{name}"
+            if func_count or class_count:
+                label += f"\\n({func_count}f, {class_count}c)"
+            lines.append(f'    {name}["{label}"]')
+        
+        # Add edges
+        if edges:
+            lines.append("")
+            for src, tgt in edges:
+                lines.append(f"    {src} --> {tgt}")
         
         lines.extend([
             "```",
@@ -198,7 +265,9 @@ class DocGenerator:
         structure: Dict[str, Any],
         output: Optional[str] = None
     ) -> Path:
-        """Generate dependency graph."""
+        """Generate dependency graph with real import edges."""
+        edges = self._resolve_imports(structure)
+        
         lines = [
             "# Dependency Graph",
             "",
@@ -206,11 +275,17 @@ class DocGenerator:
             "graph LR",
         ]
         
-        # Simplified dependency visualization
+        # Add modules as nodes
         modules = structure.get("modules", [])[:15]
         for module in modules:
             name = module['name'].split('.')[-1]
             lines.append(f'    {name}[{name}]')
+        
+        # Add edges
+        if edges:
+            lines.append("")
+            for src, tgt in edges:
+                lines.append(f"    {src} --> {tgt}")
         
         lines.extend([
             "```",

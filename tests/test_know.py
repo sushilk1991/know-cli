@@ -202,9 +202,9 @@ function greet(name: string): string {
         structure = scanner.get_structure()
         
         assert structure["file_count"] > 0
-        # Should detect the Python file
-        py_files = [f for f in structure.get("files", []) if f.endswith(".py")]
-        assert len(py_files) > 0
+        # Should detect the Python file via modules list
+        py_modules = [m for m in structure.get("modules", []) if m["path"].endswith(".py")]
+        assert len(py_modules) > 0
     
     def test_scan_counts_functions_and_classes(self, temp_project):
         """Test that scanner counts functions and classes."""

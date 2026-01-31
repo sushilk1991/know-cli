@@ -30,9 +30,13 @@ class ParseError(ScanError):
         return f"{self.path}: {self.args[0]}"
 
 
-class IndexError(KnowError):
+class IndexingError(KnowError):
     """Index/database errors."""
     pass
+
+
+# Backward compatibility alias (deprecated — use IndexingError instead)
+IndexError = IndexingError
 
 
 class AIError(KnowError):

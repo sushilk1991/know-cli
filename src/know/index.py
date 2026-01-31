@@ -15,7 +15,7 @@ except ImportError:
     XXHASH_AVAILABLE = False
     import hashlib
 
-from know.exceptions import IndexError
+from know.exceptions import IndexingError
 from know.logger import get_logger
 
 if TYPE_CHECKING:

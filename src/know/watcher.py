@@ -4,11 +4,14 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Set
 
+from rich.console import Console
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 if TYPE_CHECKING:
     from know.config import Config
+
+console = Console()
 
 
 class DocUpdateHandler(FileSystemEventHandler):
@@ -45,33 +48,51 @@ class DocUpdateHandler(FileSystemEventHandler):
         self.on_modified(event)
     
     def _should_ignore(self, path: Path) -> bool:
-        """Check if file should be ignored."""
-        ignore_patterns = [
+        """Check if file should be ignored using path component matching."""
+        # Directories/files to ignore (matched against individual path components)
+        ignore_dirs = {
             ".git",
             ".know",
             "__pycache__",
-            ".pyc",
-            ".pyo",
             ".venv",
             "venv",
             "node_modules",
             ".idea",
             ".vscode",
-            ".DS_Store",
+        }
+        
+        # File patterns to ignore (matched against filename)
+        ignore_suffixes = {
+            ".pyc",
+            ".pyo",
             ".swp",
             ".swo",
             "~",
-        ]
+        }
         
-        path_str = str(path)
+        ignore_files = {
+            ".DS_Store",
+        }
         
-        for pattern in ignore_patterns:
-            if pattern in path_str:
+        # Check individual path components (prevents "docs" matching "dockerfiles")
+        for part in path.parts:
+            if part in ignore_dirs:
+                return True
+        
+        # Check filename patterns
+        filename = path.name
+        if filename in ignore_files:
+            return True
+        for suffix in ignore_suffixes:
+            if filename.endswith(suffix):
                 return True
         
         # Check if in output directory
-        if self.config.output.directory in path_str:
+        try:
+            path.relative_to(Path(self.config.output.directory).resolve())
             return True
+        except ValueError:
+            pass
         
         return False
     
@@ -86,7 +107,7 @@ class DocUpdateHandler(FileSystemEventHandler):
         from know.generator import DocGenerator
         
         pending_count = len(self.pending_paths)
-        print(f"\n[dim]Detected changes in {pending_count} files, updating docs...[/dim]")
+        console.print(f"\n[dim]Detected changes in {pending_count} files, updating docs...[/dim]")
         
         try:
             scanner = CodebaseScanner(self.config)
@@ -114,12 +135,15 @@ class DocUpdateHandler(FileSystemEventHandler):
             cached = total - changed
             
             if cached > 0:
-                print(f"[green]✓[/green] Documentation updated ({changed} changed, {cached} from cache)")
+                console.print(
+                    f"[green]✓[/green] Documentation updated "
+                    f"({changed} changed, {cached} from cache)"
+                )
             else:
-                print(f"[green]✓[/green] Documentation updated ({total} files)")
+                console.print(f"[green]✓[/green] Documentation updated ({total} files)")
                 
         except Exception as e:
-            print(f"[red]✗[/red] Update failed: {e}")
+            console.print(f"[red]✗[/red] Update failed: {e}")
         
         self.pending_paths.clear()
 
@@ -150,13 +174,6 @@ class FileWatcher:
             self.observer.stop()
         
         self.observer.join()
-    
-    def run_daemon(self) -> None:
-        """Run as a daemon process."""
-        import daemon
-        
-        with daemon.DaemonContext():
-            self.run()
     
     def stop(self) -> None:
         """Stop the watcher."""

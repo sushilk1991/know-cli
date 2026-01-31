@@ -39,11 +39,15 @@ class TokenOptimizer:
         """Compress code by removing comments and excess whitespace."""
         import re
         
-        # Remove single-line comments (but not URLs)
+        # Remove single-line C-style comments (but not URLs)
         content = re.sub(r'(?<!:)//.*$', '', content, flags=re.MULTILINE)
         
-        # Remove multi-line comments
+        # Remove multi-line C-style comments
         content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        
+        # Remove Python-style # comments (but not shebangs and not inside strings)
+        # This handles standalone and inline comments
+        content = re.sub(r'(?<!["\'])#(?!!/).*$', '', content, flags=re.MULTILINE)
         
         # Remove docstrings (Python-style)
         content = re.sub(r'""".*?"""', '"""..."""', content, flags=re.DOTALL)
@@ -68,7 +72,7 @@ class TokenOptimizer:
         
         # Match function signatures
         func_pattern = r'((?:async\s+)?(?:def|function)\s+\w+\s*\([^)]*\)(?:\s*->\s*\w+)?:?)'
-        class_pattern = r'((?:export\s+)?(?:class|interface)\s+\w+(?:\s*(?:extends|implements)\s+\w+)?)'
+        class_pattern = r'((?:export\s+)?(?:class|interface)\s+\w+(?:\s*(?:extends|implements)\s+\w+)?:?)'
         
         funcs = re.findall(func_pattern, content)[:max_items]
         classes = re.findall(class_pattern, content)[:max_items]
@@ -164,19 +168,32 @@ class AISummarizer:
         if not self.api_key and self.provider == "anthropic":
             console.print("[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]")
     
+    # Default API timeout in seconds (configurable via KNOW_API_TIMEOUT env var)
+    API_TIMEOUT = int(os.getenv("KNOW_API_TIMEOUT", "30"))
+    
     def _call_claude(
         self, 
         prompt: str, 
         max_tokens: int = 2000,
         model: Optional[str] = None,
         cache_key: Optional[str] = None,
-        task_type: str = "general"
+        task_type: str = "general",
+        timeout: Optional[int] = None
     ) -> str:
-        """Call Claude API with caching and cost optimization."""
+        """Call Claude API with caching, cost optimization, and timeout.
+        
+        Args:
+            timeout: Request timeout in seconds. Defaults to API_TIMEOUT (30s).
+        """
         try:
             import anthropic
+            import httpx
             
-            client = anthropic.Anthropic(api_key=self.api_key)
+            request_timeout = timeout or self.API_TIMEOUT
+            client = anthropic.Anthropic(
+                api_key=self.api_key,
+                timeout=httpx.Timeout(request_timeout, connect=10.0),
+            )
             use_model = model or self.model
             
             # Check cache first
@@ -188,7 +205,7 @@ class AISummarizer:
             # Estimate input tokens (rough approximation: 1 token ≈ 4 chars)
             input_tokens = len(prompt) // 4
             
-            # Make API call
+            # Make API call with timeout
             message = client.messages.create(
                 model=use_model,
                 max_tokens=max_tokens,

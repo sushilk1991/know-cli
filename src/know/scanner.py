@@ -250,18 +250,15 @@ class CodebaseScanner:
         
         files_to_parse = [(p, lang) for p, lang in files_to_scan if str(p) in changed_set]
         
+        # Count from the already-converted ModuleInfo objects (no double-counting)
         file_count = cached_count
-        function_count = sum(len(m.functions) for m in self.modules)
-        class_count = sum(len(m.classes) for m in self.modules)
-        
-        for cached in cached_modules:
-            try:
-                function_count += len(cached.get("functions", []))
-                class_count += len(cached.get("classes", []))
-                for cls in cached.get("classes", []):
-                    function_count += len(cls.get("methods", []))
-            except (KeyError, TypeError):
-                pass
+        function_count = 0
+        class_count = 0
+        for m in self.modules:
+            function_count += len(m.functions)
+            class_count += len(m.classes)
+            for cls in m.classes:
+                function_count += len(cls.methods)
 
         # Prepare tasks for parallel processing
         tasks = [

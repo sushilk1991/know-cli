@@ -531,14 +531,8 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
 
 
 @cli.command()
-@click.option(
-    "--daemon",
-    "-d",
-    is_flag=True,
-    help="Run as daemon process",
-)
 @click.pass_context
-def watch(ctx: click.Context, daemon: bool) -> None:
+def watch(ctx: click.Context) -> None:
     """Watch for file changes and auto-update docs."""
     config = ctx.obj["config"]
     
@@ -552,10 +546,7 @@ def watch(ctx: click.Context, daemon: bool) -> None:
     watcher = FileWatcher(config)
     
     try:
-        if daemon:
-            watcher.run_daemon()
-        else:
-            watcher.run()
+        watcher.run()
     except KeyboardInterrupt:
         if not ctx.obj.get("quiet"):
             console.print("\n[yellow]👋 Stopped watching[/yellow]")
@@ -619,36 +610,6 @@ def uninstall(ctx: click.Context) -> None:
 
 
 @cli.command()
-@click.option(
-    "--shell",
-    type=click.Choice(["bash", "zsh", "fish"]),
-    help="Shell type (auto-detected if not specified)",
-)
-def completion(shell: Optional[str]) -> None:
-    """Generate shell completion script."""
-    import click_completion
-    
-    if not shell:
-        # Auto-detect
-        shell = os.path.basename(os.environ.get("SHELL", ""))
-        if shell not in ["bash", "zsh", "fish"]:
-            console.print("[red]Could not detect shell. Please specify --shell.[/red]")
-            console.print("\nExample:")
-            console.print("  [bold]know completion --shell bash[/bold]")
-            sys.exit(1)
-    
-    script = click_completion.get_code(shell, prog_name="know")
-    
-    console.print(f"[dim]# Add this to your shell configuration file:[/dim]")
-    console.print(f"[dim]# ({get_shell_config_path(shell)})[/dim]")
-    console.print()
-    console.print(script)
-    console.print()
-    console.print(f"[dim]# Or run this command to add it automatically:[/dim]")
-    console.print(f"[bold]know completion --shell {shell} >> {get_shell_config_path(shell)}[/bold]")
-
-
-@cli.command()
 @click.argument("query")
 @click.option(
     "--top-k",
@@ -669,7 +630,7 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool) -> None:
     
     from know.semantic_search import SemanticSearcher
     
-    searcher = SemanticSearcher()
+    searcher = SemanticSearcher(project_root=config.root)
     
     if index:
         if not ctx.obj.get("quiet"):

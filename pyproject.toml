@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.1.23"
+version = "0.2.0"
 description = "Living documentation generator - docs that stay in sync with your code"
 readme = "README.md"
 license = "MIT"
@@ -26,21 +26,20 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1.0",
-    "click-completion>=0.5.2",
     "rich>=13.0.0",
     "pyyaml>=6.0",
-    "jinja2>=3.1.0",
     "watchdog>=3.0.0",
     "anthropic>=0.8.0",
-    "gitpython>=3.1.0",
-    "pydantic>=2.0.0",
+    "httpx>=0.24.0",
     "pathspec>=0.11.0",
     "xxhash>=3.0.0",
-    "fastembed>=0.3.0",
-    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
+search = [
+    "fastembed>=0.3.0",
+    "numpy>=1.24.0",
+]
 parser = [
     "tree-sitter>=0.20.0",
     "tree-sitter-languages>=1.10.0",

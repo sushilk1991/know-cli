@@ -16,15 +16,7 @@ POST_COMMIT_HOOK = '''#!/bin/bash
 if command -v know &> /dev/null; then
     echo "🧠 Updating documentation..."
     know update --quiet
-    
-    # Check if docs were updated
-    if git diff --quiet HEAD docs/ 2>/dev/null; then
-        echo "✓ Documentation up to date"
-    else
-        git add docs/
-        git commit --amend --no-edit --quiet
-        echo "✓ Documentation updated and amended"
-    fi
+    echo "✓ Documentation updated (run 'git add docs/ && git commit' to include)"
 fi
 '''
 
@@ -35,9 +27,9 @@ PRE_COMMIT_HOOK = '''#!/bin/bash
 if [ -f ".know/config.yaml" ]; then
     echo "🧠 Validating documentation..."
     
-    # You can add validation logic here
-    # For now, just check that docs exist
-    if [ ! -d "docs" ] && [ ! -f "README.md" ]; then
+    # Check that docs directory exists (arc.md is the primary output)
+    DOCS_DIR=$(grep -oP 'directory:\\s*\\K.*' .know/config.yaml 2>/dev/null || echo "docs")
+    if [ ! -d "$DOCS_DIR" ]; then
         echo "⚠ Warning: No documentation found. Run 'know init' to generate."
     fi
 fi

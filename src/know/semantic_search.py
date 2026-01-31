@@ -13,13 +13,27 @@ except ImportError:
 
 
 class EmbeddingCache:
-    """Cache for code embeddings using binary storage with persistent connection support."""
+    """Cache for code embeddings using binary storage with persistent connection support.
     
-    def __init__(self, cache_dir: Path = None):
+    Embeddings are scoped per project to prevent cross-project contamination.
+    Each project gets its own table based on a hash of the project root path.
+    """
+    
+    def __init__(self, cache_dir: Path = None, project_root: Path = None):
         self.cache_dir = cache_dir or Path.home() / ".cache" / "know-cli"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.cache_dir / "embeddings-v2.db"
         self._conn = None
+        
+        # Project scoping: use hash of project root to isolate embeddings
+        if project_root:
+            self._project_id = hashlib.sha256(
+                str(project_root.resolve()).encode()
+            ).hexdigest()[:16]
+        else:
+            self._project_id = "global"
+        self._table = f"embeddings_{self._project_id}"
+        
         self._init_db()
     
     def __enter__(self):
@@ -40,12 +54,12 @@ class EmbeddingCache:
         return sqlite3.connect(self.db_path)
 
     def _init_db(self):
-        """Initialize SQLite cache for embeddings."""
+        """Initialize SQLite cache for embeddings (project-scoped table)."""
         conn = self._get_conn()
         try:
             with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS embeddings (
+                conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {self._table} (
                         file_hash TEXT PRIMARY KEY,
                         file_path TEXT NOT NULL,
                         content_hash TEXT NOT NULL,
@@ -55,15 +69,17 @@ class EmbeddingCache:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_path ON embeddings(file_path)
+                conn.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_path_{self._project_id}
+                    ON {self._table}(file_path)
                 """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_model ON embeddings(model)
+                conn.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_model_{self._project_id}
+                    ON {self._table}(model)
                 """)
                 # Clean old entries (30 days)
                 conn.execute(
-                    "DELETE FROM embeddings WHERE created_at < datetime('now', '-30 days')"
+                    f"DELETE FROM {self._table} WHERE created_at < datetime('now', '-30 days')"
                 )
         finally:
             if not self._conn:
@@ -74,7 +90,7 @@ class EmbeddingCache:
         conn = self._get_conn()
         try:
             cursor = conn.execute(
-                """SELECT embedding, dim FROM embeddings 
+                f"""SELECT embedding, dim FROM {self._table} 
                    WHERE file_path = ? AND content_hash = ? AND model = ?""",
                 (file_path, content_hash, model)
             )
@@ -99,7 +115,7 @@ class EmbeddingCache:
         try:
             with conn:
                 conn.execute(
-                    """INSERT OR REPLACE INTO embeddings 
+                    f"""INSERT OR REPLACE INTO {self._table} 
                        (file_hash, file_path, content_hash, embedding, model, dim)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (file_hash, file_path, content_hash, embedding_bytes, model, dim)
@@ -124,7 +140,7 @@ class EmbeddingCache:
         try:
             with conn:
                 conn.executemany(
-                    """INSERT OR REPLACE INTO embeddings 
+                    f"""INSERT OR REPLACE INTO {self._table} 
                        (file_hash, file_path, content_hash, embedding, model, dim)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     data
@@ -147,7 +163,7 @@ class EmbeddingCache:
         try:
             for fp, ch, md in keys:
                 cursor = conn.execute(
-                    """SELECT embedding, dim FROM embeddings 
+                    f"""SELECT embedding, dim FROM {self._table} 
                        WHERE file_path = ? AND content_hash = ? AND model = ?""",
                     (fp, ch, md)
                 )
@@ -165,7 +181,7 @@ class EmbeddingCache:
         conn = self._get_conn()
         try:
             cursor = conn.execute(
-                "SELECT file_path, embedding, dim FROM embeddings WHERE model = ?",
+                f"SELECT file_path, embedding, dim FROM {self._table} WHERE model = ?",
                 (model,)
             )
             rows = cursor.fetchall()
@@ -191,7 +207,7 @@ class EmbeddingCache:
         conn = self._get_conn()
         try:
             with conn:
-                conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
+                conn.execute(f"DELETE FROM {self._table} WHERE model = ?", (model,))
         finally:
             if not self._conn:
                 conn.close()
@@ -205,9 +221,10 @@ class SemanticSearcher:
     MODEL_DIM = 384
     MAX_FILE_SIZE = 1024 * 1024  # 1MB
     
-    def __init__(self, model_name: Optional[str] = None):
+    def __init__(self, model_name: Optional[str] = None, project_root: Optional[Path] = None):
         self.model_name = model_name or self.DEFAULT_MODEL
-        self.cache = EmbeddingCache()
+        self.project_root = project_root
+        self.cache = EmbeddingCache(project_root=project_root)
         self._embedding_model = None
     
     def _get_embedding_model(self):

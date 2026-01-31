@@ -10,8 +10,6 @@ languages:
 - rust
 include:
 - src/
-- lib/
-- app/
 exclude:
 - '**/node_modules/**'
 - '**/.git/**'
@@ -23,7 +21,7 @@ exclude:
 - '**/.know/**'
 ai:
   provider: anthropic
-  model: claude-3-sonnet-20240229
+  model: claude-sonnet-4-5-20250929
   api_key_env: ANTHROPIC_API_KEY
   generate:
     summaries: true
