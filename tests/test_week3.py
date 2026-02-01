@@ -550,7 +550,8 @@ class TestCLIStatsStatus:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "version" in data
-        assert data["version"] == "0.2.2"
+        from know import __version__
+        assert data["version"] == __version__
 
 
 # ---------------------------------------------------------------------------
@@ -629,9 +630,12 @@ class TestSearchChunkFlag:
 class TestVersion:
     def test_version_matches(self):
         from know import __version__
-        assert __version__ == "0.2.2"
+        # Version should be at least 0.2.2 (may be bumped in later weeks)
+        parts = [int(x) for x in __version__.split(".")]
+        assert parts >= [0, 2, 2]
 
     def test_pyproject_version(self):
+        from know import __version__
         pyproject = Path(__file__).parent.parent / "pyproject.toml"
         content = pyproject.read_text()
-        assert 'version = "0.2.2"' in content
+        assert f'version = "{__version__}"' in content

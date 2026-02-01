@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.2.2"
-description = "Living documentation generator - docs that stay in sync with your code"
+version = "0.3.0"
+description = "Context Intelligence for AI Coding Agents — smart, token-budgeted code context"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Vic", email = "vic@example.com" }
 ]
-keywords = ["documentation", "cli", "codebase", "ai", "generator"]
+keywords = ["ai", "context", "coding-agent", "mcp", "cli", "codebase", "llm", "tokens", "embeddings"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -40,6 +40,9 @@ search = [
     "fastembed>=0.3.0",
     "numpy>=1.24.0",
 ]
+mcp = [
+    "mcp>=1.0.0",
+]
 parser = [
     "tree-sitter>=0.20.0",
     "tree-sitter-languages>=1.10.0",
@@ -47,6 +50,7 @@ parser = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",

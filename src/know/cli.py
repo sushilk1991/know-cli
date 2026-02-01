@@ -43,6 +43,7 @@ def get_output_format(json_output: bool, quiet: bool) -> str:
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Only show errors")
 @click.option("--json", "json_output", is_flag=True, help="Output in JSON format")
+@click.option("--time", "show_time", is_flag=True, help="Show execution time")
 @click.option(
     "--log-file",
     type=click.Path(),
@@ -55,9 +56,10 @@ def cli(
     verbose: bool, 
     quiet: bool,
     json_output: bool,
+    show_time: bool,
     log_file: Optional[str]
 ) -> None:
-    """Living documentation generator for codebases."""
+    """know — Context Intelligence for AI Coding Agents."""
     ctx.ensure_object(dict)
     
     # Validate flag combinations
@@ -76,6 +78,14 @@ def cli(
     ctx.obj["verbose"] = verbose
     ctx.obj["quiet"] = quiet
     ctx.obj["json"] = json_output
+    ctx.obj["show_time"] = show_time
+    
+    # Record start time for --time flag
+    if show_time:
+        import time as _time
+        global _timing_start, _timing_enabled
+        _timing_start = _time.monotonic()
+        _timing_enabled = True
     
     # Load configuration
     try:
@@ -1293,6 +1303,68 @@ def status(ctx: click.Context) -> None:
     console.print()
 
 
+# ===================================================================
+# Week 4: MCP Server commands
+# ===================================================================
+
+@cli.group()
+def mcp() -> None:
+    """MCP (Model Context Protocol) server for AI agents."""
+    pass
+
+
+@mcp.command(name="serve")
+@click.option("--sse", is_flag=True, help="Use SSE transport instead of stdio")
+@click.option("--port", type=int, default=3000, help="Port for SSE transport (default 3000)")
+@click.pass_context
+def mcp_serve(ctx: click.Context, sse: bool, port: int) -> None:
+    """Start the MCP server.
+
+    Default: stdio transport (for Claude Desktop).
+    Use --sse for web clients.
+
+    \b
+    Examples:
+      know mcp serve                    # stdio transport
+      know mcp serve --sse --port 3000  # SSE transport
+    """
+    try:
+        from know.mcp_server import run_server
+    except ImportError:
+        click.echo(
+            "Error: The 'mcp' package is required.\n\n"
+            "  pip install mcp\n\n"
+            "Or install know-cli with:\n\n"
+            "  pip install know-cli[mcp]\n",
+            err=True,
+        )
+        sys.exit(1)
+
+    config = ctx.obj["config"]
+    run_server(sse=sse, port=port, project_root=config.root)
+
+
+@mcp.command(name="config")
+@click.pass_context
+def mcp_config(ctx: click.Context) -> None:
+    """Print Claude Desktop configuration snippet.
+
+    Copy the output into your Claude Desktop config file.
+    """
+    try:
+        from know.mcp_server import print_config
+    except ImportError:
+        click.echo(
+            "Error: The 'mcp' package is required.\n\n"
+            "  pip install mcp\n",
+            err=True,
+        )
+        sys.exit(1)
+
+    config = ctx.obj["config"]
+    print_config(project_root=config.root)
+
+
 def get_shell_config_path(shell: str) -> str:
     """Get the config file path for a shell."""
     home = Path.home()
@@ -1305,8 +1377,28 @@ def get_shell_config_path(shell: str) -> str:
     return str(home / ".profile")
 
 
+# Global timing state — set by --time flag, read at exit
+_timing_start: Optional[float] = None
+_timing_enabled: bool = False
+
+
+def _print_timing():
+    """Print execution time if --time flag was set."""
+    global _timing_start, _timing_enabled
+    if _timing_enabled and _timing_start is not None:
+        import time as _time
+        elapsed = _time.monotonic() - _timing_start
+        if elapsed < 1:
+            console.print(f"[dim]⏱ {elapsed * 1000:.0f}ms[/dim]", highlight=False)
+        else:
+            console.print(f"[dim]⏱ {elapsed:.2f}s[/dim]", highlight=False)
+
+
 def main() -> None:
     """Entry point."""
+    import atexit
+    atexit.register(_print_timing)
+
     try:
         cli()
     except KnowError as e:
