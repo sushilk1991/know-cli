@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Vic", email = "vic@example.com" }
+    { name = "Sushil Kumar", email = "sushilk.1991@gmail.com" }
 ]
 keywords = ["ai", "context", "coding-agent", "mcp", "cli", "codebase", "llm", "tokens", "embeddings"]
 classifiers = [
