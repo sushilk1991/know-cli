@@ -15,21 +15,21 @@
 - **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
 - **[src.know.models](src/know/models.py)** - Data models for know-cli.
 - **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
+- **[src.know.model_router](src/know/model_router.py)** - Smart model router for cost-optimized AI interactions.
 - **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
 - **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.cli](src/know/cli.py)** - CLI entry point for know.
 - **[src.know.generator](src/know/generator.py)** - Documentation generator.
 - **[src.know.config](src/know/config.py)** - Configuration management for know.
-- **[src.know.import_graph](src/know/import_graph.py)** - Import graph: tracks dependencies between project modules.
-- ... and 7 more modules
+- ... and 8 more modules
 
 ## 📊 Statistics
 
-- **Files:** 22
-- **Modules:** 22
-- **Functions:** 55
-- **Classes:** 44
+- **Files:** 23
+- **Modules:** 23
+- **Functions:** 57
+- **Classes:** 47
 
 ---
 

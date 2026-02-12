@@ -10,10 +10,11 @@ graph TB
     watcher["watcher\n(0f, 2c)"]
     models["models\n(0f, 4c)"]
     token_counter["token_counter\n(4f, 0c)"]
-    stats["stats\n(0f, 1c)"]
+    model_router["model_router\n(0f, 2c)"]
+    stats["stats\n(0f, 2c)"]
     semantic_search["semantic_search\n(0f, 2c)"]
     __init__["__init__"]
-    cli["cli\n(33f, 0c)"]
+    cli["cli\n(35f, 0c)"]
     generator["generator\n(0f, 1c)"]
     config["config\n(1f, 6c)"]
     import_graph["import_graph\n(0f, 1c)"]
@@ -21,7 +22,6 @@ graph TB
     git_hooks["git_hooks\n(0f, 1c)"]
     mcp_server["mcp_server\n(5f, 0c)"]
     scanner["scanner\n(1f, 1c)"]
-    parsers["parsers\n(0f, 5c)"]
 
     ai --> config
     diff --> config
@@ -54,6 +54,7 @@ graph TB
     cli --> diff
     cli --> knowledge_base
     cli --> stats
+    cli --> model_router
     cli --> mcp_server
     generator --> config
     generator --> scanner
