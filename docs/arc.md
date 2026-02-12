@@ -7,28 +7,28 @@
 
 ## 📁 Project Structure
 
-- **[src.know.logger](src/know/logger.py)** - Logging configuration for know.
-- **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
-- **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
 - **[src.know.ai](src/know/ai.py)** - AI integration for intelligent code understanding with advanced token optimization.
-- **[src.know.import_graph](src/know/import_graph.py)** - Import graph: tracks dependencies between project modules.
-- **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
-- **[src.know.cli](src/know/cli.py)** - CLI entry point for know.
-- **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
-- **[src.know.mcp_server](src/know/mcp_server.py)** - MCP (Model Context Protocol) server for know-cli.
-- **[src.know.exceptions](src/know/exceptions.py)** - Custom exceptions for know-cli.
 - **[src.know.diff](src/know/diff.py)** - Diff mode for tracking architectural changes safely using git worktrees.
+- **[src.know.knowledge_base](src/know/knowledge_base.py)** - Knowledge base: cross-session memory for AI agents.
+- **[src.know.index](src/know/index.py)** - Index management for incremental code scanning.
+- **[src.know.logger](src/know/logger.py)** - Logging configuration for know.
+- **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
+- **[src.know.models](src/know/models.py)** - Data models for know-cli.
+- **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
+- **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
+- **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
+- **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
+- **[src.know.cli](src/know/cli.py)** - CLI entry point for know.
 - **[src.know.generator](src/know/generator.py)** - Documentation generator.
-- **[src.know.parsers](src/know/parsers.py)** - Parser strategy pattern for language-specific parsing.
-- **[src.know.quality](src/know/quality.py)** - Code quality metrics and dashboard.
-- **[src.know.git_hooks](src/know/git_hooks.py)** - Git hook management.
+- **[src.know.config](src/know/config.py)** - Configuration management for know.
+- **[src.know.import_graph](src/know/import_graph.py)** - Import graph: tracks dependencies between project modules.
 - ... and 7 more modules
 
 ## 📊 Statistics
 
 - **Files:** 22
 - **Modules:** 22
-- **Functions:** 52
+- **Functions:** 55
 - **Classes:** 44
 
 ---
