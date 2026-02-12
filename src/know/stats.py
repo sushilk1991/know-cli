@@ -19,6 +19,74 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+class TokenSavingsCalculator:
+    """Calculate token savings from using know-cli context optimization.
+    
+    Compares optimized context (what know-cli generates) vs naive context
+    (dumping entire files) to show ROI and cost savings.
+    """
+    
+    # Average tokens per naive context dump (full files)
+    AVG_TOKENS_NAIVE = 50000  # Claude Code default context
+    
+    # Pricing per 1M tokens (as of 2024)
+    GPT4_PRICE_PER_1M = 10.00  # $10/1M input tokens for GPT-4 Turbo
+    CLAUDE_PRICE_PER_1M = 15.00  # $15/1M input tokens for Claude 3 Opus
+    
+    def calculate_savings(
+        self, 
+        used_tokens: int, 
+        naive_tokens: int = None,
+        model: str = "claude"
+    ) -> dict:
+        """Calculate savings from using optimized context.
+        
+        Args:
+            used_tokens: Tokens actually used by know-cli context
+            naive_tokens: Tokens that would be used without optimization
+            model: Model for cost calculation ("gpt4" or "claude")
+        
+        Returns:
+            Dict with savings metrics including dollar amounts
+        """
+        naive = naive_tokens or self.AVG_TOKENS_NAIVE
+        saved = max(0, naive - used_tokens)  # Can't save more than 100%
+        pct = (saved / naive) * 100 if naive > 0 else 0
+        
+        # Cost savings based on model
+        price_per_1m = self.CLAUDE_PRICE_PER_1M if model == "claude" else self.GPT4_PRICE_PER_1M
+        dollar_savings = (saved / 1_000_000) * price_per_1m
+        
+        return {
+            "tokens_used": used_tokens,
+            "tokens_naive": naive,
+            "tokens_saved": saved,
+            "percent_saved": round(pct, 1),
+            "dollar_savings": round(dollar_savings, 4),
+            "model": model,
+            "price_per_1m": price_per_1m,
+        }
+    
+    def calculate_cumulative_savings(
+        self, 
+        events: list, 
+        model: str = "claude"
+    ) -> dict:
+        """Calculate total savings across multiple context queries.
+        
+        Args:
+            events: List of events with 'tokens_used' field
+            model: Model for cost calculation
+        
+        Returns:
+            Dict with cumulative savings metrics
+        """
+        total_used = sum(e.get("tokens_used", 0) for e in events)
+        total_naive = len(events) * self.AVG_TOKENS_NAIVE
+        
+        return self.calculate_savings(total_used, total_naive, model)
+
+
 class StatsTracker:
     """Project-local usage statistics backed by SQLite."""
 
@@ -161,3 +229,99 @@ class StatsTracker:
             "remember_count": rem[0],
             "recall_count": rec[0],
         }
+
+    # ------------------------------------------------------------------
+    # Burn rate analytics
+    # ------------------------------------------------------------------
+    def get_burn_rate(self, days: int = 30) -> Dict[str, Any]:
+        """Get token usage over time for burn rate calculations.
+        
+        Args:
+            days: Number of days to analyze
+        
+        Returns:
+            Dict with daily/weekly/monthly breakdowns and projections
+        """
+        conn = self._get_conn()
+        
+        # Get daily token usage for the period
+        rows = conn.execute("""
+            SELECT 
+                DATE(created_at) as day,
+                SUM(tokens_used) as tokens,
+                COUNT(*) as queries
+            FROM events 
+            WHERE event_type = 'context' 
+              AND created_at >= DATE('now', ?)
+            GROUP BY day
+            ORDER BY day DESC
+        """, (f"-{days} days",)).fetchall()
+        
+        daily_data = [
+            {"day": r["day"], "tokens": r["tokens"], "queries": r["queries"]}
+            for r in rows
+        ]
+        
+        # Calculate totals and averages
+        total_tokens = sum(r["tokens"] for r in rows)
+        total_queries = sum(r["queries"] for r in rows)
+        
+        # Daily average (non-zero days only)
+        active_days = len(rows) if rows else 1
+        daily_avg = total_tokens / active_days if active_days > 0 else 0
+        
+        # Weekly projection
+        weekly_tokens = daily_avg * 7
+        monthly_tokens = daily_avg * 30
+        
+        # Cost projections (Claude pricing)
+        PRICE_PER_1M = 15.0
+        daily_cost = (daily_avg / 1_000_000) * PRICE_PER_1M
+        weekly_cost = (weekly_tokens / 1_000_000) * PRICE_PER_1M
+        monthly_cost = (monthly_tokens / 1_000_000) * PRICE_PER_1M
+        
+        # Calculate savings
+        calculator = TokenSavingsCalculator()
+        savings = calculator.calculate_savings(
+            total_tokens, 
+            len(rows) * calculator.AVG_TOKENS_NAIVE
+        )
+        
+        return {
+            "period_days": days,
+            "total_tokens": total_tokens,
+            "total_queries": total_queries,
+            "active_days": active_days,
+            "daily_avg_tokens": round(daily_avg),
+            "daily_data": daily_data[:14],  # Last 14 days
+            "projections": {
+                "daily_tokens": round(daily_avg),
+                "daily_cost": round(daily_cost, 2),
+                "weekly_tokens": round(weekly_tokens),
+                "weekly_cost": round(weekly_cost, 2),
+                "monthly_tokens": round(monthly_tokens),
+                "monthly_cost": round(monthly_cost, 2),
+            },
+            "savings": savings,
+        }
+    
+    def get_project_breakdown(self) -> list:
+        """Get per-project token breakdown (for multi-project setups).
+        
+        Returns:
+            List of dicts with project stats
+        """
+        # For single-project setups, return just this project
+        conn = self._get_conn()
+        
+        total = conn.execute(
+            "SELECT SUM(tokens_used) FROM events WHERE event_type = 'context'"
+        ).fetchone()[0] or 0
+        
+        return [{
+            "project": str(self.root.name),
+            "tokens": total,
+            "queries": conn.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'context'"
+            ).fetchone()[0],
+        }]
