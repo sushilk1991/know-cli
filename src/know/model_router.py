@@ -183,10 +183,26 @@ class SmartModelRouter:
         """
         # Detect complexity and adjust threshold if needed
         complexity = self._detect_complexity(task)
+        task_lower = task.lower()
+        
         if complexity == "simple":
             quality_threshold = min(quality_threshold, 0.75)
         elif complexity == "expert":
             quality_threshold = max(quality_threshold, 0.90)
+        
+        # For coding tasks, require at least gpt-5-mini quality
+        coding_keywords = ["code", "fix", "bug", "implement", "refactor", "write", "create", "build", "debug", "function", "class", "api"]
+        if any(kw in task_lower for kw in coding_keywords):
+            quality_threshold = max(quality_threshold, 0.88)  # gpt-5-mini level minimum
+        
+        # For reasoning tasks, require strong model
+        reasoning_keywords = ["reason", "think", "analyze", "research", "solve", "explain", "design", "architecture"]
+        if any(kw in task_lower for kw in reasoning_keywords):
+            quality_threshold = max(quality_threshold, 0.90)  # o4-mini level minimum
+        
+        # For complex tasks, always use best quality
+        if complexity == "expert":
+            quality_threshold = max(quality_threshold, 0.95)
         
         # Filter candidates by quality and context
         candidates = []
@@ -200,12 +216,19 @@ class SmartModelRouter:
             best = max(self.models.items(), key=lambda x: x[1].quality_score)
             return best[0]
         
-        # Sort by cost (prefer speed if requested)
+        # Sort by VALUE: balance quality and cost
+        # Value = quality^2 / cost - quality matters more than cost
+        # This ensures decent quality while still being cost-effective
+        def value_score(info):
+            cost = max(info.cost_per_1m_input, 0.01)
+            return (info.quality_score ** 2) / cost
+        
         if prefer_speed:
-            # Use a combination of cost and quality as tiebreaker
-            candidates.sort(key=lambda x: (x[1].cost_per_1m_input, -x[1].quality_score))
+            # Prefer faster models as tiebreaker
+            candidates.sort(key=lambda x: (value_score(x[1]), -x[1].cost_per_1m_input), reverse=True)
         else:
-            candidates.sort(key=lambda x: x[1].cost_per_1m_input)
+            # Best value: quality weighted heavily
+            candidates.sort(key=lambda x: value_score(x[1]), reverse=True)
         
         return candidates[0][0]
     
