@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,11 @@ class KnowledgeBase:
     Stores memories with optional embedding vectors for semantic recall.
     Falls back to text-matching when fastembed is unavailable.
     """
+    
+    # Class-level embedding model cache
+    _embedding_model_cache: Dict[str, Any] = {}
+    _embedding_lock: Optional[threading.Lock] = None
+    _cache_initialized: bool = False
 
     def __init__(self, config: "Config"):
         self.config = config
@@ -262,16 +268,51 @@ class KnowledgeBase:
         return json.dumps([m.to_dict() for m in memories], indent=2)
 
     def import_json(self, data: str) -> int:
-        """Import memories from JSON string.  Returns count imported."""
+        """Import memories from JSON string with batch transaction.  Returns count imported."""
         records = json.loads(data)
+        if not records:
+            return 0
+        
+        conn = self._get_conn()
         count = 0
-        for rec in records:
-            self.remember(
-                text=rec["text"],
-                source=rec.get("source", "manual"),
-                tags=rec.get("tags", ""),
-            )
-            count += 1
+        
+        try:
+            with conn:
+                # Batch insert for performance
+                values = []
+                for rec in records:
+                    text = rec["text"]
+                    source = rec.get("source", "manual")
+                    tags = rec.get("tags", "")
+                    embedding_blob = self._embed_text(text)
+                    
+                    values.append((
+                        text,
+                        source,
+                        tags,
+                        embedding_blob,
+                        str(self.root)
+                    ))
+                
+                conn.executemany(
+                    """INSERT INTO memories (text, source, tags, embedding, project_root)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    values
+                )
+                count = conn.total_changes
+        except Exception:
+            # Fallback to individual inserts on error
+            for rec in records:
+                try:
+                    self.remember(
+                        text=rec["text"],
+                        source=rec.get("source", "manual"),
+                        tags=rec.get("tags", ""),
+                    )
+                    count += 1
+                except Exception:
+                    pass
+        
         return count
 
     # ------------------------------------------------------------------
@@ -303,14 +344,49 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
     # Embedding helpers
     # ------------------------------------------------------------------
-    def _embed_text(self, text: str) -> Optional[bytes]:
-        """Embed text using fastembed.  Returns raw bytes or None."""
+    _embedding_model_cache: Dict[str, Any] = {}
+    _cache_initialized = False
+    
+    def _get_embedding_model(self):
+        """Get cached embedding model (thread-safe)."""
+        model_name = "BAAI/bge-small-en-v1.5"
+        
+        # Lazy initialization of lock
+        if not KnowledgeBase._cache_initialized:
+            KnowledgeBase._embedding_lock = threading.Lock()
+            KnowledgeBase._cache_initialized = True
+        
+        # Check cache first
+        if model_name in KnowledgeBase._embedding_model_cache:
+            return KnowledgeBase._embedding_model_cache[model_name]
+        
+        # Load and cache
         try:
             from fastembed import TextEmbedding
+            
+            with KnowledgeBase._embedding_lock:
+                # Double-check after acquiring lock
+                if model_name in KnowledgeBase._embedding_model_cache:
+                    return KnowledgeBase._embedding_model_cache[model_name]
+                
+                model = TextEmbedding(model_name=model_name)
+                KnowledgeBase._embedding_model_cache[model_name] = model
+                return model
+        except Exception:
+            return None
+    
+    def _embed_text(self, text: str) -> Optional[bytes]:
+        """Embed text using fastembed with model caching. Returns raw bytes or None."""
+        try:
             import numpy as np
-
-            model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-            emb = np.array(list(model.embed([text[:8000]]))[0], dtype=np.float32)
+            
+            model = self._get_embedding_model()
+            if model is None:
+                return None
+            
+            # Truncate to 8000 chars for efficiency
+            text = text[:8000]
+            emb = np.array(list(model.embed([text]))[0], dtype=np.float32)
             return emb.tobytes()
         except Exception:
             return None

@@ -24,6 +24,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -35,6 +37,30 @@ if TYPE_CHECKING:
     from know.config import Config
 
 logger = get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Embedding model caching - avoid reloading on every call
+# ---------------------------------------------------------------------------
+_EMBEDDING_MODEL_CACHE = None
+_EMBEDDING_MODEL_LOCK = threading.Lock()
+
+def _get_cached_embedding_model():
+    """Get or create cached embedding model for semantic search (thread-safe)."""
+    global _EMBEDDING_MODEL_CACHE
+    if _EMBEDDING_MODEL_CACHE is None:
+        with _EMBEDDING_MODEL_LOCK:
+            if _EMBEDDING_MODEL_CACHE is None:
+                try:
+                    from fastembed import TextEmbedding
+                    import time
+                    start = time.time()
+                    _EMBEDDING_MODEL_CACHE = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+                    logger.debug(f"Loaded embedding model in {time.time()-start:.2f}s")
+                except ImportError:
+                    logger.debug("fastembed not available for semantic scoring")
+                    return None
+    return _EMBEDDING_MODEL_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -264,25 +290,74 @@ def _extract_signatures(file_path: Path) -> str:
     return "\n".join(sigs)
 
 
+# Batch git recency cache to avoid repeated subprocess calls
+_GIT_RECENCY_CACHE: Dict[str, Dict[str, float]] = {}
+_GIT_RECENCY_CACHE_TIME: Dict[str, float] = {}
+_GIT_RECENCY_CACHE_TTL = 300  # 5 minute TTL
+
+def _get_batch_file_recency(root: Path, rel_paths: List[str]) -> Dict[str, float]:
+    """Get recency scores for multiple files in a single git command batch.
+    
+    Uses a file-based cache to avoid repeated git calls.
+    """
+    import time
+    
+    # Check if we have a valid cached result
+    cache_key = str(root)
+    now = time.time()
+    
+    if cache_key in _GIT_RECENCY_CACHE:
+        cache_age = now - _GIT_RECENCY_CACHE_TIME.get(cache_key, 0)
+        if cache_age < _GIT_RECENCY_CACHE_TTL:
+            return {p: _GIT_RECENCY_CACHE[cache_key].get(p, 0.0) for p in rel_paths}
+    
+    # Build fresh cache
+    scores: Dict[str, float] = {}
+    
+    try:
+        # Get recent commits with file changes in one command
+        result = subprocess.run(
+            ["git", "log", "--name-only", "--format=%ct", "-30", "--pretty=format:%ct"],
+            capture_output=True, text=True, cwd=root, timeout=10,
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if output:
+                current_time = None
+                for line in output.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Check if this is a timestamp
+                    if line.isdigit():
+                        current_time = int(line)
+                    elif current_time and line in rel_paths:
+                        age_days = (time.time() - current_time) / 86400
+                        score = max(0.0, 1.0 - age_days / 30.0)
+                        if line not in scores or score > scores[line]:
+                            scores[line] = score
+        
+        # Store in cache
+        _GIT_RECENCY_CACHE[cache_key] = scores
+        _GIT_RECENCY_CACHE_TIME[cache_key] = now
+        
+    except Exception:
+        pass
+    
+    return {p: scores.get(p, 0.0) for p in rel_paths}
+
+
 def _git_file_recency(root: Path, rel_path: str) -> float:
     """Return a 0-1 recency score based on git log.
     
     1.0 = modified in last day, decays linearly over 30 days.
     Returns 0.0 if git is unavailable.
+    
+    Note: Single-file version - use batch version for multiple files.
     """
-    try:
-        result = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "--", rel_path],
-            capture_output=True, text=True, cwd=root, timeout=5,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return 0.0
-        import time
-        last_modified = int(result.stdout.strip())
-        age_days = (time.time() - last_modified) / 86400
-        return max(0.0, 1.0 - age_days / 30.0)
-    except Exception:
-        return 0.0
+    scores = _get_batch_file_recency(root, [rel_path])
+    return scores.get(rel_path, 0.0)
 
 
 def _find_test_files(root: Path, source_path: str) -> List[Path]:
@@ -477,10 +552,13 @@ class ContextEngine:
         Uses compact text (name + signature + docstring + body[:300])
         to keep embedding fast while retaining semantic meaning.
         """
-        from fastembed import TextEmbedding
         import numpy as np
 
-        model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        # Use cached model to avoid reloading on every call
+        model = _get_cached_embedding_model()
+        if model is None:
+            from fastembed import TextEmbedding
+            model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
         # Embed query
         query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
@@ -527,12 +605,16 @@ class ContextEngine:
     # Internal: recency
     # ------------------------------------------------------------------
     def _apply_recency_boost(self, chunks: List[CodeChunk]):
-        """Apply git recency boost to chunks."""
-        seen: Dict[str, float] = {}
+        """Apply git recency boost to chunks using batch operations."""
+        # Collect unique files
+        unique_files: set = {c.file_path for c in chunks}
+        
+        # Batch fetch recency scores
+        recency_scores = _get_batch_file_recency(self.root, list(unique_files))
+        
+        # Apply to all chunks
         for chunk in chunks:
-            if chunk.file_path not in seen:
-                seen[chunk.file_path] = _git_file_recency(self.root, chunk.file_path)
-            chunk.recency_boost = seen[chunk.file_path]
+            chunk.recency_boost = recency_scores.get(chunk.file_path, 0.0)
 
     # ------------------------------------------------------------------
     # Internal: import expansion

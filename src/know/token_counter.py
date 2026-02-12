@@ -1,11 +1,31 @@
 """Token counting for context budget management.
 
-Uses a simple word-based estimation that's fast and dependency-free.
+Uses tiktoken when available for accurate counting, falls back to
+a simple word-based estimation that's fast and dependency-free.
 Roughly approximates GPT/Claude tokenization (~1.3 tokens per word).
 """
 
 import re
 from typing import Optional
+from functools import lru_cache
+
+# Try to import tiktoken for accurate token counting
+try:
+    import tiktoken
+    _tiktoken_available = True
+except ImportError:
+    _tiktoken_available = False
+
+# Cache tokenizer instances by model
+@lru_cache(maxsize=4)
+def _get_tokenizer(model_name: str = "cl100k_base"):
+    """Get cached tokenizer instance."""
+    if _tiktoken_available:
+        try:
+            return tiktoken.get_encoding(model_name)
+        except Exception:
+            pass
+    return None
 
 
 # Average tokens-per-word ratio for code (empirically ~1.3 for Python/JS)
@@ -16,12 +36,15 @@ TEXT_TOKENS_PER_WORD = 1.2
 TOKENS_PER_LINE_OVERHEAD = 0.5
 
 
-def count_tokens(text: str, mode: str = "code") -> int:
+def count_tokens(text: str, mode: str = "code", model: str = "cl100k_base") -> int:
     """Estimate token count for a string.
+    
+    Uses tiktoken for accurate counting when available, falls back to heuristic.
     
     Args:
         text: The text to count tokens for.
         mode: "code" for source code, "text" for natural language.
+        model: Tokenizer model to use (e.g., "cl100k_base" for Claude/GPT-4).
     
     Returns:
         Estimated token count.
@@ -29,6 +52,15 @@ def count_tokens(text: str, mode: str = "code") -> int:
     if not text:
         return 0
     
+    # Try tiktoken first for accurate counting
+    tokenizer = _get_tokenizer(model)
+    if tokenizer:
+        try:
+            return len(tokenizer.encode(text))
+        except Exception:
+            pass
+    
+    # Fallback to heuristic estimation
     # Split on whitespace and punctuation boundaries (how tokenizers roughly work)
     # This counts words + standalone punctuation/operators
     words = re.findall(r'\w+|[^\w\s]', text)

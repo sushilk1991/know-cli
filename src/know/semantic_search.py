@@ -158,25 +158,39 @@ class EmbeddingCache:
     def batch_get(self, keys: List[Tuple[str, str, str]]) -> dict:
         """Batch get embeddings. keys = [(file_path, content_hash, model), ...]
         Returns dict: {(file_path, content_hash, model): embedding}
+        
+        Uses efficient batch query with proper parameterization.
         """
         if not keys:
             return {}
-            
-        # Simplified batch get (could be optimized with IN clause but requires constructing query)
-        # For now, just iterate with the persistent connection
+        
+        # Group by model (usually all same model)
+        by_model: dict = {}
+        for fp, ch, md in keys:
+            if md not in by_model:
+                by_model[md] = []
+            by_model[md].append((fp, ch))
+        
         results = {}
         conn = self._get_conn()
         try:
-            for fp, ch, md in keys:
-                cursor = conn.execute(
-                    f"""SELECT embedding, dim FROM {self._table} 
-                       WHERE file_path = ? AND content_hash = ? AND model = ?""",
-                    (fp, ch, md)
-                )
-                row = cursor.fetchone()
-                if row:
-                    embedding = np.frombuffer(row[0], dtype=np.float32).reshape(row[1])
-                    results[(fp, ch, md)] = embedding
+            for model, model_keys in by_model.items():
+                # Build efficient batch query
+                placeholders = ','.join(['(?,?)'] * len(model_keys))
+                flat_values = [v for pair in model_keys for v in pair]
+                
+                # Query all matching records for this model
+                query = f"""
+                    SELECT file_path, content_hash, embedding, dim 
+                    FROM {self._table} 
+                    WHERE model = ? AND (file_path, content_hash) IN ({placeholders})
+                """
+                cursor = conn.execute(query, (model, *flat_values))
+                
+                for row in cursor:
+                    key = (row[0], row[1], model)
+                    embedding = np.frombuffer(row[2], dtype=np.float32).reshape(row[3])
+                    results[key] = embedding
         finally:
             if not self._conn:
                 conn.close()
@@ -227,18 +241,58 @@ class SemanticSearcher:
     MODEL_DIM = 384
     MAX_FILE_SIZE = 1024 * 1024  # 1MB
     
+    # Class-level cache for embedding models (shared across instances)
+    _model_cache: "Dict[str, Any]" = {}
+    _model_lock: "Optional[Any]" = None  # Initialized in __init__
+    
     def __init__(self, model_name: Optional[str] = None, project_root: Optional[Path] = None):
         self.model_name = model_name or self.DEFAULT_MODEL
         self.project_root = project_root
         self.cache = EmbeddingCache(project_root=project_root)
         self._embedding_model = None
+        # Initialize lock if not already
+        import threading
+        if SemanticSearcher._model_lock is None:
+            SemanticSearcher._model_lock = threading.Lock()
     
     def _get_embedding_model(self):
-        """Lazy load the embedding model."""
+        """Lazy load the embedding model with caching."""
         if self._embedding_model is None:
+            cache_key = self.model_name
+            
+            # Thread-safe check
+            if SemanticSearcher._model_lock:
+                with SemanticSearcher._model_lock:
+                    if cache_key in SemanticSearcher._model_cache:
+                        self._embedding_model = SemanticSearcher._model_cache[cache_key]
+                        return self._embedding_model
+            elif cache_key in SemanticSearcher._model_cache:
+                return SemanticSearcher._model_cache[cache_key]
+            
             try:
                 from fastembed import TextEmbedding
-                self._embedding_model = TextEmbedding(model_name=self.model_name)
+                import time
+                
+                start_time = time.time()
+                model = TextEmbedding(model_name=self.model_name)
+                load_time = time.time() - start_time
+                
+                # Cache the model
+                if SemanticSearcher._model_lock:
+                    with SemanticSearcher._model_lock:
+                        SemanticSearcher._model_cache[cache_key] = model
+                else:
+                    SemanticSearcher._model_cache[cache_key] = model
+                
+                # Log slow model loads
+                if load_time > 1.0:
+                    import logging
+                    logging.getLogger("know").debug(
+                        f"Embedding model loaded in {load_time:.2f}s"
+                    )
+                
+                self._embedding_model = model
+                
             except ImportError:
                 raise ImportError(
                     "fastembed is required for semantic search. "
