@@ -39,66 +39,100 @@ class SmartModelRouter:
         # Returns "gemini-1.5-flash" (cheapest that meets threshold)
     """
     
-    # Default model configurations with current pricing (2024)
+    # Default model configurations with 2026 pricing
     MODELS: Dict[str, ModelInfo] = {
-        # OpenAI models
-        "gpt-4o-mini": ModelInfo(
-            name="gpt-4o-mini",
-            cost_per_1m_input=0.15,
-            cost_per_1m_output=0.60,
-            quality_score=0.80,
-            max_context=128000,
-            strengths=["fast", "cheap", "good for simple tasks"],
-        ),
-        "gpt-4o": ModelInfo(
-            name="gpt-4o",
-            cost_per_1m_input=2.50,
-            cost_per_1m_output=10.00,
-            quality_score=0.95,
-            max_context=128000,
-            strengths=["complex reasoning", "multi-step", "nuanced tasks"],
-        ),
-        # Anthropic models
-        "claude-3-haiku": ModelInfo(
-            name="claude-3-haiku",
-            cost_per_1m_input=0.25,
-            cost_per_1m_output=1.25,
-            quality_score=0.75,
-            max_context=200000,
-            strengths=["fast", "cheap", "good for simple tasks"],
-        ),
-        "claude-3-sonnet": ModelInfo(
-            name="claude-3-sonnet",
+        # OpenAI 2026
+        "gpt-4.5": ModelInfo(
+            name="gpt-4.5",
             cost_per_1m_input=3.00,
-            cost_per_1m_output=15.00,
-            quality_score=0.95,
-            max_context=200000,
-            strengths=["balanced", "complex reasoning", "coding"],
-        ),
-        "claude-3-opus": ModelInfo(
-            name="claude-3-opus",
-            cost_per_1m_input=15.00,
-            cost_per_1m_output=75.00,
+            cost_per_1m_output=12.00,
             quality_score=0.98,
-            max_context=200000,
-            strengths=["best quality", "complex reasoning", "nuanced"],
+            max_context=256000,
+            strengths=["reasoning", "coding", "multimodal"],
         ),
-        # Google models
-        "gemini-1.5-flash": ModelInfo(
-            name="gemini-1.5-flash",
-            cost_per_1m_input=0.075,
+        "gpt-4.5-mini": ModelInfo(
+            name="gpt-4.5-mini",
+            cost_per_1m_input=0.20,
+            cost_per_1m_output=0.80,
+            quality_score=0.85,
+            max_context=256000,
+            strengths=["fast", "cheap", "simple tasks"],
+        ),
+        # Anthropic 2026
+        "claude-4-opus": ModelInfo(
+            name="claude-4-opus",
+            cost_per_1m_input=20.00,
+            cost_per_1m_output=80.00,
+            quality_score=0.99,
+            max_context=300000,
+            strengths=["expert reasoning", "complex coding", "research"],
+        ),
+        "claude-4-sonnet": ModelInfo(
+            name="claude-4-sonnet",
+            cost_per_1m_input=3.50,
+            cost_per_1m_output=15.00,
+            quality_score=0.97,
+            max_context=300000,
+            strengths=["coding", "reasoning", "long context"],
+        ),
+        "claude-4-haiku": ModelInfo(
+            name="claude-4-haiku",
+            cost_per_1m_input=0.30,
+            cost_per_1m_output=1.50,
+            quality_score=0.82,
+            max_context=300000,
+            strengths=["fast", "cheap", "simple tasks"],
+        ),
+        # Kimi (ByteDance) 2026
+        "kimi-k2.5-pro": ModelInfo(
+            name="kimi-k2.5-pro",
+            cost_per_1m_input=0.25,
+            cost_per_1m_output=1.00,
+            quality_score=0.92,
+            max_context=200000,
+            strengths=["fast", "coding", "reasoning"],
+        ),
+        "kimi-k2.5": ModelInfo(
+            name="kimi-k2.5",
+            cost_per_1m_input=0.10,
+            cost_per_1m_output=0.40,
+            quality_score=0.80,
+            max_context=200000,
+            strengths=["cheap", "fast", "simple tasks"],
+        ),
+        # Google Gemini 2026
+        "gemini-2.5-pro": ModelInfo(
+            name="gemini-2.5-pro",
+            cost_per_1m_input=1.50,
+            cost_per_1m_output=6.00,
+            quality_score=0.95,
+            max_context=500000,
+            strengths=["long context", "multimodal", "reasoning"],
+        ),
+        "gemini-2.5-flash": ModelInfo(
+            name="gemini-2.5-flash",
+            cost_per_1m_input=0.10,
+            cost_per_1m_output=0.40,
+            quality_score=0.82,
+            max_context=500000,
+            strengths=["fast", "cheap", "simple tasks"],
+        ),
+        # GLM (Zhipu) 2026
+        "glm-5": ModelInfo(
+            name="glm-5",
+            cost_per_1m_input=0.08,
             cost_per_1m_output=0.30,
             quality_score=0.85,
-            max_context=1000000,
-            strengths=["very cheap", "large context", "fast"],
+            max_context=200000,
+            strengths=["cheap", "coding", "multilingual"],
         ),
-        "gemini-1.5-pro": ModelInfo(
-            name="gemini-1.5-pro",
-            cost_per_1m_input=1.25,
-            cost_per_1m_output=5.00,
-            quality_score=0.92,
-            max_context=1000000,
-            strengths=["large context", "complex reasoning"],
+        "glm-5-plus": ModelInfo(
+            name="glm-5-plus",
+            cost_per_1m_input=0.50,
+            cost_per_1m_output=2.00,
+            quality_score=0.94,
+            max_context=200000,
+            strengths=["reasoning", "coding", "long context"],
         ),
     }
     
