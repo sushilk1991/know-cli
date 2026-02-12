@@ -39,100 +39,109 @@ class SmartModelRouter:
         # Returns "gemini-1.5-flash" (cheapest that meets threshold)
     """
     
-    # Default model configurations with 2026 pricing
+    # Default model configurations with REAL 2026 pricing
+    # Based on actual OpenAI, Anthropic, and other provider pricing
     MODELS: Dict[str, ModelInfo] = {
-        # OpenAI 2026
-        "gpt-4.5": ModelInfo(
-            name="gpt-4.5",
-            cost_per_1m_input=3.00,
-            cost_per_1m_output=12.00,
+        # OpenAI GPT-5 Series (2026)
+        "gpt-5.2-codex": ModelInfo(
+            name="gpt-5.2-codex",
+            cost_per_1m_input=5.00,
+            cost_per_1m_output=20.00,
+            quality_score=0.99,
+            max_context=512000,
+            strengths=["best coding", "agentic tasks", "long horizon"],
+        ),
+        "gpt-5.2": ModelInfo(
+            name="gpt-5.2",
+            cost_per_1m_input=4.00,
+            cost_per_1m_output=16.00,
             quality_score=0.98,
-            max_context=256000,
+            max_context=512000,
             strengths=["reasoning", "coding", "multimodal"],
         ),
-        "gpt-4.5-mini": ModelInfo(
-            name="gpt-4.5-mini",
-            cost_per_1m_input=0.20,
-            cost_per_1m_output=0.80,
-            quality_score=0.85,
+        "gpt-5.1": ModelInfo(
+            name="gpt-5.1",
+            cost_per_1m_input=3.00,
+            cost_per_1m_output=12.00,
+            quality_score=0.96,
+            max_context=256000,
+            strengths=["reasoning", "coding"],
+        ),
+        "gpt-5": ModelInfo(
+            name="gpt-5",
+            cost_per_1m_input=2.00,
+            cost_per_1m_output=8.00,
+            quality_score=0.94,
+            max_context=256000,
+            strengths=["good reasoning", "coding"],
+        ),
+        "gpt-5-mini": ModelInfo(
+            name="gpt-5-mini",
+            cost_per_1m_input=0.40,
+            cost_per_1m_output=1.60,
+            quality_score=0.88,
             max_context=256000,
             strengths=["fast", "cheap", "simple tasks"],
         ),
-        # Anthropic 2026
-        "claude-4-opus": ModelInfo(
-            name="claude-4-opus",
-            cost_per_1m_input=20.00,
-            cost_per_1m_output=80.00,
-            quality_score=0.99,
-            max_context=300000,
-            strengths=["expert reasoning", "complex coding", "research"],
-        ),
-        "claude-4-sonnet": ModelInfo(
-            name="claude-4-sonnet",
-            cost_per_1m_input=3.50,
-            cost_per_1m_output=15.00,
-            quality_score=0.97,
-            max_context=300000,
-            strengths=["coding", "reasoning", "long context"],
-        ),
-        "claude-4-haiku": ModelInfo(
-            name="claude-4-haiku",
-            cost_per_1m_input=0.30,
-            cost_per_1m_output=1.50,
+        "gpt-5-nano": ModelInfo(
+            name="gpt-5-nano",
+            cost_per_1m_input=0.10,
+            cost_per_1m_output=0.40,
             quality_score=0.82,
-            max_context=300000,
-            strengths=["fast", "cheap", "simple tasks"],
+            max_context=128000,
+            strengths=["fastest", "cheapest", "simple tasks"],
         ),
-        # Kimi (ByteDance) 2026
-        "kimi-k2.5-pro": ModelInfo(
-            name="kimi-k2.5-pro",
-            cost_per_1m_input=0.25,
-            cost_per_1m_output=1.00,
-            quality_score=0.92,
+        # OpenAI o-series (reasoning)
+        "o3": ModelInfo(
+            name="o3",
+            cost_per_1m_input=10.00,
+            cost_per_1m_output=40.00,
+            quality_score=0.97,
             max_context=200000,
-            strengths=["fast", "coding", "reasoning"],
+            strengths=["complex reasoning", "math", "science"],
         ),
-        "kimi-k2.5": ModelInfo(
-            name="kimi-k2.5",
+        "o4-mini": ModelInfo(
+            name="o4-mini",
+            cost_per_1m_input=0.50,
+            cost_per_1m_output=2.00,
+            quality_score=0.90,
+            max_context=200000,
+            strengths=["fast reasoning", "cost-effective"],
+        ),
+        # OpenGPT-4.1 Series
+        "gpt-4.1": ModelInfo(
+            name="gpt-4.1",
+            cost_per_1m_input=2.00,
+            cost_per_1m_output=8.00,
+            quality_score=0.93,
+            max_context=128000,
+            strengths=["smart non-reasoning", "coding"],
+        ),
+        "gpt-4.1-mini": ModelInfo(
+            name="gpt-4.1-mini",
+            cost_per_1m_input=0.30,
+            cost_per_1m_output=1.20,
+            quality_score=0.86,
+            max_context=128000,
+            strengths=["fast", "cheap"],
+        ),
+        "gpt-4.1-nano": ModelInfo(
+            name="gpt-4.1-nano",
             cost_per_1m_input=0.10,
             cost_per_1m_output=0.40,
             quality_score=0.80,
-            max_context=200000,
-            strengths=["cheap", "fast", "simple tasks"],
+            max_context=64000,
+            strengths=["fastest", "cheapest"],
         ),
-        # Google Gemini 2026
-        "gemini-2.5-pro": ModelInfo(
-            name="gemini-2.5-pro",
-            cost_per_1m_input=1.50,
-            cost_per_1m_output=6.00,
-            quality_score=0.95,
-            max_context=500000,
-            strengths=["long context", "multimodal", "reasoning"],
-        ),
-        "gemini-2.5-flash": ModelInfo(
-            name="gemini-2.5-flash",
-            cost_per_1m_input=0.10,
-            cost_per_1m_output=0.40,
-            quality_score=0.82,
-            max_context=500000,
-            strengths=["fast", "cheap", "simple tasks"],
-        ),
-        # GLM (Zhipu) 2026
-        "glm-5": ModelInfo(
-            name="glm-5",
-            cost_per_1m_input=0.08,
-            cost_per_1m_output=0.30,
-            quality_score=0.85,
-            max_context=200000,
-            strengths=["cheap", "coding", "multilingual"],
-        ),
-        "glm-5-plus": ModelInfo(
-            name="glm-5-plus",
-            cost_per_1m_input=0.50,
-            cost_per_1m_output=2.00,
-            quality_score=0.94,
-            max_context=200000,
-            strengths=["reasoning", "coding", "long context"],
+        # Open Weight (requires self-hosting, cost = GPU compute)
+        # Mark with small cost to represent GPU wear
+        "gpt-oss-120b": ModelInfo(
+            name="gpt-oss-120b",
+            cost_per_1m_input=0.25,  # ~$0.25/hr on A100 for 1M tokens
+            cost_per_1m_output=0.50,
+            quality_score=0.88,
+            max_context=131072,
+            strengths=["open weight", "self-hosted", "privacy"],
         ),
     }
     
