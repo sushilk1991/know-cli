@@ -1304,200 +1304,7 @@ def status(ctx: click.Context) -> None:
 
 
 # ===================================================================
-# Week 4: Burn Rate & Model Router commands
-# ===================================================================
-
-@cli.command()
-@click.option("--days", "-d", type=int, default=30, help="Days to analyze")
-@click.option("--model", "-m", type=click.Choice(["claude", "gpt4"]), default="claude", help="Model for cost calc")
-@click.pass_context
-def burnrate(ctx: click.Context, days: int, model: str) -> None:
-    """Show API burn rate dashboard with cost projections.
-    
-    Displays token usage trends, daily/weekly/monthly costs,
-    and calculates savings from using know-cli optimization.
-    
-    Example: know burnrate --days 30
-    """
-    config = ctx.obj["config"]
-    
-    from know.stats import StatsTracker, TokenSavingsCalculator
-    from rich.table import Table
-    
-    tracker = StatsTracker(config)
-    burn = tracker.get_burn_rate(days=days)
-    
-    if ctx.obj.get("json"):
-        import json
-        click.echo(json.dumps(burn, indent=2))
-        return
-    
-    # Header
-    console.print(f"\n[bold]🔥 API Burn Rate Dashboard[/bold]")
-    console.print(f"[dim]Last {days} days • Pricing for {model.upper()}[/dim]")
-    console.print("─" * 50)
-    
-    # Summary stats
-    console.print(f"\n[bold cyan]📊 Usage Summary[/bold cyan]")
-    console.print(f"  Total queries:     {burn['total_queries']:,}")
-    console.print(f"  Total tokens:      {burn['total_tokens']:,}")
-    console.print(f"  Active days:       {burn['active_days']}")
-    console.print(f"  Avg tokens/day:    {burn['daily_avg_tokens']:,}")
-    
-    # Cost projections table
-    console.print(f"\n[bold cyan]💰 Cost Projections[/bold cyan]")
-    
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Period", style="cyan")
-    table.add_column("Tokens", justify="right")
-    table.add_column("Cost", justify="right", style="green")
-    
-    proj = burn["projections"]
-    table.add_row("Daily", f"{proj['daily_tokens']:,}", f"${proj['daily_cost']:.2f}")
-    table.add_row("Weekly", f"{proj['weekly_tokens']:,}", f"${proj['weekly_cost']:.2f}")
-    table.add_row("Monthly", f"{proj['monthly_tokens']:,}", f"${proj['monthly_cost']:.2f}")
-    console.print(table)
-    
-    # Savings
-    savings = burn["savings"]
-    if savings["tokens_saved"] > 0:
-        console.print(f"\n[bold green]💡 Token Savings from know-cli[/bold green]")
-        console.print(f"  Tokens saved:     {savings['tokens_saved']:,} ({savings['percent_saved']}%)")
-        console.print(f"  Dollar savings:   ${savings['dollar_savings']:.2f}")
-        console.print(f"  [dim](Compared to naive context dump ~{TokenSavingsCalculator.AVG_TOKENS_NAIVE:,} tokens/query)[/dim]")
-    
-    # Daily usage chart (last 7 days)
-    if burn["daily_data"]:
-        console.print(f"\n[bold cyan]📈 Daily Usage (Last 7 Days)[/bold cyan]")
-        chart_data = burn["daily_data"][:7][::-1]  # Oldest first
-        
-        max_tokens = max(d["tokens"] for d in chart_data) if chart_data else 1
-        for d in chart_data:
-            day = d["day"].split("T")[0] if "T" in d["day"] else d["day"]
-            tokens = d["tokens"]
-            queries = d["queries"]
-            bar_len = int((tokens / max_tokens) * 20) if max_tokens > 0 else 0
-            bar = "█" * bar_len + "░" * (20 - bar_len)
-            console.print(f"  {day} [{bar}] {tokens:,} ({queries}q)")
-    
-    # Project breakdown (for multi-project)
-    projects = tracker.get_project_breakdown()
-    if len(projects) > 1:
-        console.print(f"\n[bold cyan]📁 Project Breakdown[/bold cyan]")
-        for p in projects:
-            pct = (p["tokens"] / burn["total_tokens"] * 100) if burn["total_tokens"] > 0 else 0
-            console.print(f"  {p['project']}: {p['tokens']:,} tokens ({pct:.1f}%)")
-    
-    console.print()
-
-
-@cli.command()
-@click.argument("task", required=False, default="")
-@click.option("--threshold", "-t", type=float, default=0.8, help="Min quality score (0-1)")
-@click.option("--tokens", type=int, default=0, help="Estimated input tokens for cost calc")
-@click.option("--output-tokens", type=int, default=0, help="Estimated output tokens")
-@click.option("--list", "list_models", is_flag=True, help="List all available models")
-@click.pass_context
-def route(
-    ctx: click.Context, 
-    task: str, 
-    threshold: float,
-    tokens: int,
-    output_tokens: int,
-    list_models: bool
-) -> None:
-    """Smart model router - find cheapest model for the task.
-    
-    Analyzes task complexity and recommends the most cost-effective
-    model that meets quality requirements.
-    
-    Examples:
-      know route "summarize this document"
-      know route "design a new architecture" --threshold 0.9
-      know route --list
-    """
-    from know.model_router import SmartModelRouter
-    from rich.table import Table
-    
-    router = SmartModelRouter()
-    
-    # List models mode
-    if list_models:
-        models = router.list_models()
-        
-        if ctx.obj.get("json"):
-            import json
-            click.echo(json.dumps(models, indent=2))
-            return
-        
-        console.print(f"\n[bold]🤖 Available Models[/bold] (sorted by cost)")
-        console.print("─" * 70)
-        
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("Model", style="cyan")
-        table.add_column("Input $/1M", justify="right")
-        table.add_column("Output $/1M", justify="right")
-        table.add_column("Quality", justify="center")
-        table.add_column("Context", justify="right")
-        
-        for m in models:
-            quality_color = "green" if m["quality_score"] >= 0.9 else "yellow" if m["quality_score"] >= 0.8 else "white"
-            table.add_row(
-                m["name"],
-                f"${m['cost_per_1m_input']:.2f}",
-                f"${m['cost_per_1m_output']:.2f}",
-                f"[{quality_color}]{m['quality_score']:.2f}[/{quality_color}]",
-                f"{m['max_context']:,}",
-            )
-        
-        console.print(table)
-        console.print()
-        return
-    
-    # Route mode
-    if not task:
-        click.echo("Error: TASK is required (or use --list)", err=True)
-        sys.exit(1)
-    
-    if tokens > 0:
-        result = router.route_with_cost(task, tokens, output_tokens, threshold)
-    else:
-        recommended = router.route(task, threshold)
-        result = {"recommended": recommended, "task_complexity": router._detect_complexity(task)}
-    
-    if ctx.obj.get("json"):
-        import json
-        click.echo(json.dumps(result, indent=2))
-        return
-    
-    console.print(f"\n[bold]🎯 Model Recommendation[/bold]")
-    console.print("─" * 50)
-    
-    console.print(f"\n  Task: [cyan]{task[:50]}{'...' if len(task) > 50 else ''}[/cyan]")
-    console.print(f"  Complexity: [yellow]{result.get('task_complexity', 'moderate')}[/yellow]")
-    console.print(f"  Quality threshold: {threshold}")
-    
-    recommended = result["recommended"]
-    model_info = router.get_model(recommended)
-    
-    console.print(f"\n  [bold green]Recommended: {recommended}[/bold green]")
-    if model_info:
-        console.print(f"    Quality score: {model_info.quality_score:.2f}")
-        console.print(f"    Input cost: ${model_info.cost_per_1m_input:.2f}/1M tokens")
-        console.print(f"    Strengths: {', '.join(model_info.strengths)}")
-    
-    # Show all options if cost was calculated
-    if "all_options" in result:
-        console.print(f"\n  [bold]All viable options:[/bold]")
-        for opt in result["all_options"][:5]:  # Top 5
-            marker = "✓ " if opt["model"] == recommended else "  "
-            console.print(f"    {marker}{opt['model']}: ${opt['cost']:.4f} (q={opt['quality']:.2f})")
-    
-    console.print()
-
-
-# ===================================================================
-# Week 4: MCP Server commands
+# MCP Server commands
 # ===================================================================
 
 @cli.group()
@@ -1568,6 +1375,163 @@ def get_shell_config_path(shell: str) -> str:
     elif shell == "fish":
         return str(home / ".config" / "fish" / "config.fish")
     return str(home / ".profile")
+
+
+# =========================================================================
+# Phase 5: Agent-Optimized Commands
+# =========================================================================
+
+
+@cli.command("next-file")
+@click.argument("query")
+@click.option("--exclude", "-x", multiple=True, help="Files to exclude")
+@click.option("--budget", "-b", type=int, default=10000, help="Token budget")
+@click.pass_context
+def next_file(ctx: click.Context, query: str, exclude: tuple, budget: int) -> None:
+    """Return the single most relevant file path for a query."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run 'know init' or use in a git repo.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    results = db.search_chunks(query, limit=50)
+
+    # Filter excluded files and find best match
+    seen_files = set(exclude)
+    for chunk in results:
+        fp = chunk["file_path"]
+        if fp not in seen_files:
+            output = ctx.obj.get("output_format", "rich")
+            if output == "json":
+                console.print(_json.dumps({"file": fp, "relevance": chunk.get("rank", 0)}))
+            else:
+                console.print(fp)
+            db.close()
+            return
+
+    console.print("[dim]No more relevant files found.[/dim]")
+    db.close()
+
+
+@cli.command("signatures")
+@click.argument("file_path", required=False, default=None)
+@click.pass_context
+def signatures(ctx: click.Context, file_path: Optional[str]) -> None:
+    """Get function/class signatures for a file or entire project."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    sigs = db.get_signatures(file_path)
+    output = ctx.obj.get("output_format", "rich")
+
+    if output == "json":
+        console.print(_json.dumps(sigs))
+    else:
+        for s in sigs:
+            console.print(f"[cyan]{s['file_path']}[/cyan]:{s['start_line']} "
+                          f"[bold]{s['chunk_type']}[/bold] {s['signature']}")
+    db.close()
+
+
+@cli.command("related")
+@click.argument("file_path")
+@click.pass_context
+def related(ctx: click.Context, file_path: str) -> None:
+    """Show import dependencies and dependents for a file."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    # Convert file path to module name
+    module = file_path.replace("/", ".").replace(".py", "").replace(".ts", "")
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    imports = db.get_imports_of(module)
+    imported_by = db.get_imported_by(module)
+
+    output = ctx.obj.get("output_format", "rich")
+    if output == "json":
+        console.print(_json.dumps({"imports": imports, "imported_by": imported_by}))
+    else:
+        if imports:
+            console.print("[bold]Imports (dependencies):[/bold]")
+            for m in sorted(imports):
+                console.print(f"  → {m}")
+        else:
+            console.print("[dim]No imports found.[/dim]")
+
+        if imported_by:
+            console.print("[bold]Imported by (dependents):[/bold]")
+            for m in sorted(imported_by):
+                console.print(f"  ← {m}")
+        else:
+            console.print("[dim]No dependents found.[/dim]")
+    db.close()
+
+
+@cli.command("generate-context")
+@click.option("--budget", "-b", type=int, default=8000, help="Token budget for CONTEXT.md")
+@click.pass_context
+def generate_context(ctx: click.Context, budget: int) -> None:
+    """Generate .know/CONTEXT.md for AI agents to read on session start."""
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    from know.token_counter import count_tokens
+
+    db = DaemonDB(config.root)
+    stats = db.get_stats()
+
+    lines = [
+        f"# {config.root.name}",
+        "",
+        f"**Files:** {stats['files']} | **Functions/Classes:** {stats['chunks']} | "
+        f"**Total tokens:** {stats['total_tokens']:,}",
+        "",
+        "## Key Signatures",
+        "",
+    ]
+
+    # Add top signatures
+    sigs = db.get_signatures()
+    for s in sigs[:50]:
+        sig_line = f"- `{s['file_path']}:{s['start_line']}` — {s['signature']}"
+        lines.append(sig_line)
+        if count_tokens("\n".join(lines)) > budget * 0.8:
+            break
+
+    # Add memories
+    memories = db.recall_memories("project architecture patterns", limit=20)
+    if memories:
+        lines.append("")
+        lines.append("## Remembered Context")
+        lines.append("")
+        for m in memories:
+            lines.append(f"- {m['content'][:200]}")
+            if count_tokens("\n".join(lines)) > budget * 0.95:
+                break
+
+    content = "\n".join(lines) + "\n"
+    output_path = config.root / ".know" / "CONTEXT.md"
+    output_path.write_text(content)
+
+    tokens = count_tokens(content)
+    console.print(f"[green]Generated[/green] {output_path} ({tokens:,} tokens)")
+    db.close()
 
 
 # Global timing state — set by --time flag, read at exit

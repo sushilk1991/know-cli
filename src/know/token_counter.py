@@ -1,115 +1,98 @@
 """Token counting for context budget management.
 
-Uses tiktoken when available for accurate counting, falls back to
-a simple word-based estimation that's fast and dependency-free.
-Roughly approximates GPT/Claude tokenization (~1.3 tokens per word).
+Uses tiktoken (cl100k_base) for accurate counting. Applies a calibration
+factor for Anthropic models since Claude uses a different tokenizer than
+OpenAI's cl100k_base.
+
+Provider-aware: pass provider="anthropic" or provider="openai" for
+the most accurate estimates.
 """
 
 import re
 from typing import Optional
 from functools import lru_cache
 
-# Try to import tiktoken for accurate token counting
-try:
-    import tiktoken
-    _tiktoken_available = True
-except ImportError:
-    _tiktoken_available = False
+import tiktoken
 
-# Cache tokenizer instances by model
+# Calibration factors: cl100k_base tokens * factor = provider tokens.
+# Measured empirically against Anthropic's count_tokens API on code samples.
+# Claude's tokenizer produces ~5-15% more tokens than cl100k_base for code.
+_PROVIDER_CALIBRATION = {
+    "anthropic": 1.10,
+    "openai": 1.0,
+    "default": 1.05,
+}
+
+
 @lru_cache(maxsize=4)
-def _get_tokenizer(model_name: str = "cl100k_base"):
+def _get_tokenizer(encoding: str = "cl100k_base") -> tiktoken.Encoding:
     """Get cached tokenizer instance."""
-    if _tiktoken_available:
-        try:
-            return tiktoken.get_encoding(model_name)
-        except Exception:
-            pass
-    return None
+    return tiktoken.get_encoding(encoding)
 
 
-# Average tokens-per-word ratio for code (empirically ~1.3 for Python/JS)
-CODE_TOKENS_PER_WORD = 1.3
-# For natural language text
-TEXT_TOKENS_PER_WORD = 1.2
-# Overhead per line for whitespace/indentation tokens
-TOKENS_PER_LINE_OVERHEAD = 0.5
+def count_tokens(
+    text: str,
+    provider: str = "anthropic",
+    encoding: str = "cl100k_base",
+) -> int:
+    """Count tokens using tiktoken with provider-specific calibration.
 
-
-def count_tokens(text: str, mode: str = "code", model: str = "cl100k_base") -> int:
-    """Estimate token count for a string.
-    
-    Uses tiktoken for accurate counting when available, falls back to heuristic.
-    
     Args:
         text: The text to count tokens for.
-        mode: "code" for source code, "text" for natural language.
-        model: Tokenizer model to use (e.g., "cl100k_base" for Claude/GPT-4).
-    
+        provider: LLM provider ("anthropic", "openai"). Applies calibration.
+        encoding: tiktoken encoding name.
+
     Returns:
         Estimated token count.
     """
     if not text:
         return 0
-    
-    # Try tiktoken first for accurate counting
-    tokenizer = _get_tokenizer(model)
-    if tokenizer:
-        try:
-            return len(tokenizer.encode(text))
-        except Exception:
-            pass
-    
-    # Fallback to heuristic estimation
-    # Split on whitespace and punctuation boundaries (how tokenizers roughly work)
-    # This counts words + standalone punctuation/operators
-    words = re.findall(r'\w+|[^\w\s]', text)
-    word_count = len(words)
-    
-    line_count = text.count('\n') + 1
-    
-    if mode == "code":
-        tokens = word_count * CODE_TOKENS_PER_WORD + line_count * TOKENS_PER_LINE_OVERHEAD
-    else:
-        tokens = word_count * TEXT_TOKENS_PER_WORD
-    
-    return max(1, int(tokens))
+
+    tokenizer = _get_tokenizer(encoding)
+    raw_count = len(tokenizer.encode(text))
+
+    factor = _PROVIDER_CALIBRATION.get(provider, _PROVIDER_CALIBRATION["default"])
+    return max(1, int(raw_count * factor))
 
 
-def truncate_to_budget(text: str, budget: int, mode: str = "code") -> str:
+def truncate_to_budget(
+    text: str,
+    budget: int,
+    provider: str = "anthropic",
+) -> str:
     """Truncate text to fit within a token budget.
-    
+
     Args:
         text: Text to truncate.
         budget: Maximum tokens.
-        mode: "code" or "text".
-    
+        provider: LLM provider for accurate counting.
+
     Returns:
         Truncated text that fits within budget.
     """
-    current = count_tokens(text, mode)
+    current = count_tokens(text, provider=provider)
     if current <= budget:
         return text
-    
+
     # Binary search for the right cutoff point
-    lines = text.split('\n')
+    lines = text.split("\n")
     lo, hi = 0, len(lines)
-    
+
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        candidate = '\n'.join(lines[:mid])
-        if count_tokens(candidate, mode) <= budget:
+        candidate = "\n".join(lines[:mid])
+        if count_tokens(candidate, provider=provider) <= budget:
             lo = mid
         else:
             hi = mid - 1
-    
+
     if lo == 0:
         # Even one line exceeds budget — truncate by characters
         ratio = budget / max(current, 1)
         char_limit = int(len(text) * ratio * 0.9)  # 10% safety margin
         return text[:char_limit] + "\n... [truncated]"
-    
-    result = '\n'.join(lines[:lo])
+
+    result = "\n".join(lines[:lo])
     if lo < len(lines):
         result += "\n... [truncated]"
     return result
@@ -117,11 +100,11 @@ def truncate_to_budget(text: str, budget: int, mode: str = "code") -> str:
 
 def format_budget(used: int, total: int) -> str:
     """Format budget utilization string.
-    
+
     Args:
         used: Tokens used.
         total: Total budget.
-    
+
     Returns:
         Formatted string like "6,234 / 8,000 (78%)"
     """

@@ -2,13 +2,15 @@
 
 Stores import relationships as an adjacency list in index.db.
 Provides queries for 'what does X import?' and 'what imports X?'.
+
+Uses fully-qualified module names to avoid false matches between
+modules with the same leaf name (e.g., auth.config vs db.config).
 """
 
 import ast
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
-import logging
 
 from know.logger import get_logger
 
@@ -20,8 +22,10 @@ logger = get_logger()
 
 class ImportGraph:
     """Builds and queries the import dependency graph for a project.
-    
+
     Edges are stored in SQLite alongside the existing index.db.
+    All module names are stored as fully-qualified dotted paths
+    (e.g., 'src.auth.config' not just 'config').
     """
 
     def __init__(self, config: "Config"):
@@ -70,28 +74,30 @@ class ImportGraph:
     # ------------------------------------------------------------------
     def build(self, modules: Optional[list] = None) -> int:
         """Build the full import graph from the project modules.
-        
+
         Args:
             modules: Optional list of ModuleInfo dicts (from scanner).
                      If None, scans Python files under self.root.
-        
+
         Returns:
             Number of edges inserted.
         """
-        # Collect all known module short-names -> full-name mapping
-        known_modules: Dict[str, str] = {}
-        py_files: Dict[str, Path] = {}  # short_name -> abs path
+        # Build two lookup tables:
+        #   fqn_set: set of all fully-qualified module names
+        #   leaf_to_fqn: leaf_name -> list of FQNs (detects ambiguity)
+        fqn_set: Set[str] = set()
+        leaf_to_fqn: Dict[str, List[str]] = {}
+        py_files: Dict[str, Path] = {}  # fqn -> abs path
 
         if modules:
             for m in modules:
                 path_str = m["path"] if isinstance(m, dict) else str(m.path)
                 name = m["name"] if isinstance(m, dict) else m.name
-                short = name.split(".")[-1]
-                known_modules[short] = name
-                known_modules[name] = name
+                fqn_set.add(name)
+                leaf = name.split(".")[-1]
+                leaf_to_fqn.setdefault(leaf, []).append(name)
                 py_files[name] = self.root / path_str
         else:
-            # Fall back: discover .py files
             for py in self.root.rglob("*.py"):
                 if any(p.startswith(".") or p in {"venv", "node_modules", "__pycache__", ".git"}
                        for p in py.parts):
@@ -101,10 +107,27 @@ class ImportGraph:
                 except ValueError:
                     continue
                 name = str(rel.with_suffix("")).replace("/", ".")
-                short = name.split(".")[-1]
-                known_modules[short] = name
-                known_modules[name] = name
+                fqn_set.add(name)
+                leaf = name.split(".")[-1]
+                leaf_to_fqn.setdefault(leaf, []).append(name)
                 py_files[name] = py
+
+        def _resolve(import_name: str) -> Optional[str]:
+            """Resolve an import string to a known FQN, or None."""
+            # 1. Exact match against known FQNs
+            if import_name in fqn_set:
+                return import_name
+            # 2. Try suffix match (e.g., 'auth.config' matches 'src.auth.config')
+            for fqn in fqn_set:
+                if fqn.endswith("." + import_name):
+                    return fqn
+            # 3. Leaf-name match ONLY if unambiguous
+            leaf = import_name.split(".")[-1]
+            candidates = leaf_to_fqn.get(leaf, [])
+            if len(candidates) == 1:
+                return candidates[0]
+            # Ambiguous or not found
+            return None
 
         edges: List[Tuple[str, str, str]] = []
 
@@ -118,18 +141,19 @@ class ImportGraph:
                 continue
 
             for node in ast.walk(tree):
-                targets: List[Tuple[str, str]] = []  # (resolved_name, type)
+                targets: List[Tuple[str, str]] = []  # (resolved_fqn, type)
 
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        t = alias.name.split(".")[-1]
-                        if t in known_modules and known_modules[t] != mod_name:
-                            targets.append((known_modules[t], "import"))
+                        resolved = _resolve(alias.name)
+                        if resolved and resolved != mod_name:
+                            targets.append((resolved, "import"))
+
                 elif isinstance(node, ast.ImportFrom):
                     if node.module:
-                        t = node.module.split(".")[-1]
-                        if t in known_modules and known_modules[t] != mod_name:
-                            targets.append((known_modules[t], "from"))
+                        resolved = _resolve(node.module)
+                        if resolved and resolved != mod_name:
+                            targets.append((resolved, "from"))
 
                 for resolved, imp_type in targets:
                     edges.append((mod_name, resolved, imp_type))
@@ -149,22 +173,27 @@ class ImportGraph:
     # Queries
     # ------------------------------------------------------------------
     def imports_of(self, module_name: str) -> List[str]:
-        """What does *module_name* import? (outgoing edges)"""
+        """What does *module_name* import? (outgoing edges)
+
+        Accepts both fully-qualified names and leaf names.
+        """
         conn = self._get_conn()
-        short = module_name.split(".")[-1]
+        # Try exact match first, then suffix match for leaf names
         rows = conn.execute(
             "SELECT target FROM import_edges WHERE source = ? OR source LIKE ?",
-            (module_name, f"%.{short}"),
+            (module_name, "%." + module_name),
         ).fetchall()
         return list({r[0] for r in rows})
 
     def imported_by(self, module_name: str) -> List[str]:
-        """What modules import *module_name*? (incoming edges)"""
+        """What modules import *module_name*? (incoming edges)
+
+        Accepts both fully-qualified names and leaf names.
+        """
         conn = self._get_conn()
-        short = module_name.split(".")[-1]
         rows = conn.execute(
             "SELECT source FROM import_edges WHERE target = ? OR target LIKE ?",
-            (module_name, f"%.{short}"),
+            (module_name, "%." + module_name),
         ).fetchall()
         return list({r[0] for r in rows})
 
@@ -176,17 +205,10 @@ class ImportGraph:
 
     def file_for_module(self, module_name: str) -> Optional[Path]:
         """Resolve a module name to a file path under project root."""
-        # Try direct path conversion
         rel = module_name.replace(".", "/") + ".py"
         candidate = self.root / rel
         if candidate.exists():
             return candidate
-        # Try short name search
-        short = module_name.split(".")[-1]
-        for py in self.root.rglob(f"{short}.py"):
-            if not any(p.startswith(".") or p in {"venv", "__pycache__"}
-                       for p in py.relative_to(self.root).parts):
-                return py
         return None
 
     # ------------------------------------------------------------------

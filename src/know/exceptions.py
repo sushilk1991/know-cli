@@ -35,9 +35,6 @@ class IndexingError(KnowError):
     pass
 
 
-# Backward compatibility alias (deprecated — use IndexingError instead)
-IndexError = IndexingError
-
 
 class AIError(KnowError):
     """AI/API-related errors."""
