@@ -65,20 +65,6 @@ def embed_text(text: str, model_name: str = DEFAULT_MODEL, max_chars: int = 8000
         return None
 
 
-def embed_numpy(text: str, model_name: str = DEFAULT_MODEL, max_chars: int = 8000):
-    """Embed text and return numpy array, or None if unavailable."""
-    model = get_model(model_name)
-    if model is None:
-        return None
-
-    try:
-        import numpy as np
-
-        text = text[:max_chars]
-        return np.array(list(model.embed([text]))[0], dtype=np.float32)
-    except Exception:
-        return None
-
 
 def is_available(model_name: str = DEFAULT_MODEL) -> bool:
     """Check if embedding model is available."""

@@ -344,17 +344,6 @@ class DaemonDB:
             ).fetchall()
         except sqlite3.OperationalError:
             return []
-
-        # Batch update access counts
-        ids = [r["id"] for r in rows]
-        if ids:
-            placeholders = ",".join("?" * len(ids))
-            conn.execute(
-                f"UPDATE memories SET access_count = access_count + 1, "
-                f"last_accessed_at = ? WHERE id IN ({placeholders})",
-                [time.time(), *ids],
-            )
-            conn.commit()
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------

@@ -172,14 +172,6 @@ class ImportGraph:
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
-    def _resolve_query_name(self, module_name: str) -> str:
-        """Build SQL WHERE clause that matches exact or suffix FQN."""
-        # If name contains dots, it's likely already qualified — exact match
-        if "." in module_name:
-            return module_name
-        # Otherwise, return as-is and let callers use suffix matching
-        return module_name
-
     def imports_of(self, module_name: str) -> List[str]:
         """What does *module_name* import? (outgoing edges)
 
