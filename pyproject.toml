@@ -32,6 +32,15 @@ dependencies = [
     "pathspec>=0.11.0",
     "xxhash>=3.0.0",
     "tiktoken>=0.5.0",
+    "tree-sitter>=0.24.0",
+    "tree-sitter-python>=0.23.0",
+    "tree-sitter-javascript>=0.23.0",
+    "tree-sitter-typescript>=0.23.0",
+    "tree-sitter-go>=0.23.0",
+    "tree-sitter-rust>=0.23.0",
+    "tree-sitter-java>=0.23.0",
+    "tree-sitter-ruby>=0.23.0",
+    "tree-sitter-c>=0.23.0",
 ]
 
 [project.optional-dependencies]
@@ -44,10 +53,6 @@ ai = [
 ]
 mcp = [
     "mcp>=1.0.0",
-]
-parser = [
-    "tree-sitter>=0.20.0",
-    "tree-sitter-languages>=1.10.0",
 ]
 dev = [
     "pytest>=7.0.0",
