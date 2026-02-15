@@ -39,7 +39,8 @@ class EmbeddingCache:
         else:
             project_id = "global"
         # Validate table name is safe (only alphanumeric + underscore)
-        assert project_id.isalnum(), f"Invalid project_id: {project_id}"
+        if not project_id.isalnum():
+            raise ValueError(f"Invalid project_id: {project_id}")
         self._project_id = project_id
         self._table = f"embeddings_{self._project_id}"
         

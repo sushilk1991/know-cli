@@ -72,6 +72,7 @@ class KnowDaemon:
         self.root = project_root
         self.config = config
         self.db = DaemonDB(project_root)
+        self._started_at = time.time()
         self._last_activity = time.time()
         self._server: Optional[asyncio.AbstractServer] = None
 
@@ -92,6 +93,8 @@ class KnowDaemon:
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=str(sock)
         )
+        # Restrict socket access to owner only
+        os.chmod(str(sock), 0o600)
         logger.info(f"Daemon listening on {sock}")
 
         # Set up idle timeout check
@@ -117,7 +120,7 @@ class KnowDaemon:
         """Handle a single JSON-RPC connection."""
         self._last_activity = time.time()
         try:
-            data = await reader.read(1024 * 1024)  # 1MB max
+            data = await reader.read(10 * 1024 * 1024)  # 10MB max (matches client)
             if not data:
                 return
 
@@ -240,7 +243,7 @@ class KnowDaemon:
         return {
             "running": True,
             "project": str(self.root),
-            "uptime": time.time() - (self._last_activity - IDLE_TIMEOUT),
+            "uptime": time.time() - self._started_at,
             "stats": stats,
         }
 
@@ -248,7 +251,15 @@ class KnowDaemon:
     # Indexing
     # ------------------------------------------------------------------
     async def _full_index(self) -> int:
-        """Index all supported files in the project."""
+        """Index all supported files in the project.
+
+        Runs synchronous file I/O and parsing in a thread to avoid
+        blocking the async event loop.
+        """
+        return await asyncio.to_thread(self._full_index_sync)
+
+    def _full_index_sync(self) -> int:
+        """Synchronous indexing implementation (runs in thread pool)."""
         from know.scanner import CodebaseScanner
 
         scanner = CodebaseScanner(self.config)

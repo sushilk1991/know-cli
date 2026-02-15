@@ -9,6 +9,7 @@ Supported languages: Python, TypeScript/JavaScript, Go, Rust, Java, Ruby, C/C++
 
 import ast
 import re
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -103,43 +104,50 @@ _IMPORT_NODE_TYPES: Dict[str, set] = {
 # Tree-sitter parser cache
 # ---------------------------------------------------------------------------
 _parser_cache: Dict[str, Any] = {}
+_parser_cache_lock = threading.Lock()
 
 
 def _get_ts_parser(language: str):
     """Get or create a tree-sitter parser for the given language.
 
     Returns (parser, Language) or (None, None) if unavailable.
+    Thread-safe: uses a lock to protect the shared cache.
     """
     if language in _parser_cache:
         return _parser_cache[language]
 
-    try:
-        from tree_sitter import Language, Parser
-        import importlib
+    with _parser_cache_lock:
+        # Double-check after acquiring lock
+        if language in _parser_cache:
+            return _parser_cache[language]
 
-        pkg_name = _TS_GRAMMAR_PACKAGES.get(language)
-        if not pkg_name:
+        try:
+            from tree_sitter import Language, Parser
+            import importlib
+
+            pkg_name = _TS_GRAMMAR_PACKAGES.get(language)
+            if not pkg_name:
+                _parser_cache[language] = (None, None)
+                return None, None
+
+            mod = importlib.import_module(pkg_name)
+
+            # Handle TypeScript which has separate language functions
+            if language == "typescript":
+                lang = Language(mod.language_typescript())
+            elif language == "tsx":
+                lang = Language(mod.language_tsx())
+            else:
+                lang = Language(mod.language())
+
+            parser = Parser(lang)
+            _parser_cache[language] = (parser, lang)
+            return parser, lang
+
+        except (ImportError, AttributeError, Exception) as e:
+            logger.debug(f"Tree-sitter not available for {language}: {e}")
             _parser_cache[language] = (None, None)
             return None, None
-
-        mod = importlib.import_module(pkg_name)
-
-        # Handle TypeScript which has separate language functions
-        if language == "typescript":
-            lang = Language(mod.language_typescript())
-        elif language == "tsx":
-            lang = Language(mod.language_tsx())
-        else:
-            lang = Language(mod.language())
-
-        parser = Parser(lang)
-        _parser_cache[language] = (parser, lang)
-        return parser, lang
-
-    except (ImportError, AttributeError, Exception) as e:
-        logger.debug(f"Tree-sitter not available for {language}: {e}")
-        _parser_cache[language] = (None, None)
-        return None, None
 
 
 # ---------------------------------------------------------------------------

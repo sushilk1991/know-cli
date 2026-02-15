@@ -6,6 +6,7 @@ vector embeddings are optional via know-cli[search].
 """
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -125,15 +126,18 @@ class DaemonDB:
         self.root = project_root
         self.db_path = project_root / ".know" / "daemon.db"
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+            with self._lock:
+                if self._conn is None:
+                    self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+                    self._conn.row_factory = sqlite3.Row
+                    self._conn.execute("PRAGMA journal_mode=WAL")
+                    self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
     def _init_db(self):
@@ -145,6 +149,12 @@ class DaemonDB:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     # ------------------------------------------------------------------
     # Chunk operations
@@ -187,15 +197,20 @@ class DaemonDB:
     def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """BM25 full-text search over code chunks."""
         conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT c.*, rank
-               FROM chunks_fts
-               JOIN chunks c ON chunks_fts.rowid = c.id
-               WHERE chunks_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (query, limit),
-        ).fetchall()
+        # Escape FTS5 special characters by quoting the query
+        safe_query = '"' + query.replace('"', '""') + '"'
+        try:
+            rows = conn.execute(
+                """SELECT c.*, rank
+                   FROM chunks_fts
+                   JOIN chunks c ON chunks_fts.rowid = c.id
+                   WHERE chunks_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (safe_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
         return [dict(r) for r in rows]
 
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
@@ -315,24 +330,31 @@ class DaemonDB:
     def recall_memories(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search memories using FTS5 BM25."""
         conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT m.*, rank
-               FROM memories_fts
-               JOIN memories m ON memories_fts.rowid = m.rowid
-               WHERE memories_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (query, limit),
-        ).fetchall()
+        # Escape FTS5 special characters by quoting the query
+        safe_query = '"' + query.replace('"', '""') + '"'
+        try:
+            rows = conn.execute(
+                """SELECT m.*, rank
+                   FROM memories_fts
+                   JOIN memories m ON memories_fts.rowid = m.rowid
+                   WHERE memories_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (safe_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
 
-        # Update access counts
-        for r in rows:
+        # Batch update access counts
+        ids = [r["id"] for r in rows]
+        if ids:
+            placeholders = ",".join("?" * len(ids))
             conn.execute(
-                "UPDATE memories SET access_count = access_count + 1, "
-                "last_accessed_at = ? WHERE id = ?",
-                (time.time(), r["id"]),
+                f"UPDATE memories SET access_count = access_count + 1, "
+                f"last_accessed_at = ? WHERE id IN ({placeholders})",
+                [time.time(), *ids],
             )
-        conn.commit()
+            conn.commit()
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
