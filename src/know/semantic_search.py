@@ -33,11 +33,14 @@ class EmbeddingCache:
         
         # Project scoping: use hash of project root to isolate embeddings
         if project_root:
-            self._project_id = hashlib.sha256(
+            project_id = hashlib.sha256(
                 str(project_root.resolve()).encode()
             ).hexdigest()[:16]
         else:
-            self._project_id = "global"
+            project_id = "global"
+        # Validate table name is safe (only alphanumeric + underscore)
+        assert project_id.isalnum(), f"Invalid project_id: {project_id}"
+        self._project_id = project_id
         self._table = f"embeddings_{self._project_id}"
         
         self._init_db()
