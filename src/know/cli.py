@@ -1377,6 +1377,171 @@ def get_shell_config_path(shell: str) -> str:
     return str(home / ".profile")
 
 
+# =========================================================================
+# Phase 5: Agent-Optimized Commands
+# =========================================================================
+
+def _auto_init(project_root: Path) -> Config:
+    """Auto-initialize if .know/ doesn't exist. Zero-config."""
+    know_dir = project_root / ".know"
+    if not know_dir.exists():
+        config = Config.create_default(project_root)
+        config.save()
+    return Config.load(project_root) if know_dir.exists() else Config.create_default(project_root)
+
+
+@cli.command("next-file")
+@click.argument("query")
+@click.option("--exclude", "-x", multiple=True, help="Files to exclude")
+@click.option("--budget", "-b", type=int, default=10000, help="Token budget")
+@click.pass_context
+def next_file(ctx: click.Context, query: str, exclude: tuple, budget: int) -> None:
+    """Return the single most relevant file path for a query."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run 'know init' or use in a git repo.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    results = db.search_chunks(query, limit=50)
+
+    # Filter excluded files and find best match
+    seen_files = set(exclude)
+    for chunk in results:
+        fp = chunk["file_path"]
+        if fp not in seen_files:
+            output = ctx.obj.get("output_format", "rich")
+            if output == "json":
+                console.print(_json.dumps({"file": fp, "relevance": chunk.get("rank", 0)}))
+            else:
+                console.print(fp)
+            db.close()
+            return
+
+    console.print("[dim]No more relevant files found.[/dim]")
+    db.close()
+
+
+@cli.command("signatures")
+@click.argument("file_path", required=False, default=None)
+@click.pass_context
+def signatures(ctx: click.Context, file_path: Optional[str]) -> None:
+    """Get function/class signatures for a file or entire project."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    sigs = db.get_signatures(file_path)
+    output = ctx.obj.get("output_format", "rich")
+
+    if output == "json":
+        console.print(_json.dumps(sigs))
+    else:
+        for s in sigs:
+            console.print(f"[cyan]{s['file_path']}[/cyan]:{s['start_line']} "
+                          f"[bold]{s['chunk_type']}[/bold] {s['signature']}")
+    db.close()
+
+
+@cli.command("related")
+@click.argument("file_path")
+@click.pass_context
+def related(ctx: click.Context, file_path: str) -> None:
+    """Show import dependencies and dependents for a file."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    # Convert file path to module name
+    module = file_path.replace("/", ".").replace(".py", "").replace(".ts", "")
+
+    from know.daemon_db import DaemonDB
+    db = DaemonDB(config.root)
+    imports = db.get_imports_of(module)
+    imported_by = db.get_imported_by(module)
+
+    output = ctx.obj.get("output_format", "rich")
+    if output == "json":
+        console.print(_json.dumps({"imports": imports, "imported_by": imported_by}))
+    else:
+        if imports:
+            console.print("[bold]Imports (dependencies):[/bold]")
+            for m in sorted(imports):
+                console.print(f"  → {m}")
+        else:
+            console.print("[dim]No imports found.[/dim]")
+
+        if imported_by:
+            console.print("[bold]Imported by (dependents):[/bold]")
+            for m in sorted(imported_by):
+                console.print(f"  ← {m}")
+        else:
+            console.print("[dim]No dependents found.[/dim]")
+    db.close()
+
+
+@cli.command("generate-context")
+@click.option("--budget", "-b", type=int, default=8000, help="Token budget for CONTEXT.md")
+@click.pass_context
+def generate_context(ctx: click.Context, budget: int) -> None:
+    """Generate .know/CONTEXT.md for AI agents to read on session start."""
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    from know.daemon_db import DaemonDB
+    from know.token_counter import count_tokens
+
+    db = DaemonDB(config.root)
+    stats = db.get_stats()
+
+    lines = [
+        f"# {config.root.name}",
+        "",
+        f"**Files:** {stats['files']} | **Functions/Classes:** {stats['chunks']} | "
+        f"**Total tokens:** {stats['total_tokens']:,}",
+        "",
+        "## Key Signatures",
+        "",
+    ]
+
+    # Add top signatures
+    sigs = db.get_signatures()
+    for s in sigs[:50]:
+        sig_line = f"- `{s['file_path']}:{s['start_line']}` — {s['signature']}"
+        lines.append(sig_line)
+        if count_tokens("\n".join(lines)) > budget * 0.8:
+            break
+
+    # Add memories
+    memories = db.recall_memories("project architecture patterns", limit=20)
+    if memories:
+        lines.append("")
+        lines.append("## Remembered Context")
+        lines.append("")
+        for m in memories:
+            lines.append(f"- {m['content'][:200]}")
+            if count_tokens("\n".join(lines)) > budget * 0.95:
+                break
+
+    content = "\n".join(lines) + "\n"
+    output_path = config.root / ".know" / "CONTEXT.md"
+    output_path.write_text(content)
+
+    tokens = count_tokens(content)
+    console.print(f"[green]Generated[/green] {output_path} ({tokens:,} tokens)")
+    db.close()
+
+
 # Global timing state — set by --time flag, read at exit
 _timing_start: Optional[float] = None
 _timing_enabled: bool = False
