@@ -779,7 +779,7 @@ class ContextEngine:
                 break
 
         overview = "\n\n".join(overview_parts)
-        return truncate_to_budget(overview, budget, mode="text")
+        return truncate_to_budget(overview, budget)
 
     # ------------------------------------------------------------------
     # Formatting

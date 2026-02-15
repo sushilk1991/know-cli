@@ -176,16 +176,16 @@ class TestTokenCounter:
 
     def test_code_snippet(self):
         code = "def hello():\n    print('world')\n    return 42"
-        tokens = count_tokens(code, mode="code")
-        # Should be roughly 15-25 tokens
+        tokens = count_tokens(code)
+        # Should be roughly 15-25 tokens with tiktoken + calibration
         assert 10 <= tokens <= 40
 
-    def test_code_vs_text_mode(self):
+    def test_provider_calibration(self):
         text = "This is a simple sentence with some words."
-        code_t = count_tokens(text, mode="code")
-        text_t = count_tokens(text, mode="text")
-        # Code mode counts more (line overhead) than text mode
-        assert code_t >= text_t
+        anthropic_t = count_tokens(text, provider="anthropic")
+        openai_t = count_tokens(text, provider="openai")
+        # Anthropic calibration (1.10x) should be higher than OpenAI (1.0x)
+        assert anthropic_t >= openai_t
 
     def test_truncate_within_budget(self):
         text = "short text"
