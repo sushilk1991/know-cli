@@ -235,7 +235,7 @@ class KnowledgeBase:
         return [m for _, m in scored[:top_k]]
 
     def _recall_text(self, query: str, top_k: int) -> List[Memory]:
-        """Fallback: word-overlap scoring."""
+        """Fallback: word-overlap + prefix scoring."""
         memories = self.list_all()
         if not memories:
             return []
@@ -249,7 +249,16 @@ class KnowledgeBase:
             mem_words = set(re.findall(r"\w+", mem.text.lower()))
             if not mem_words:
                 continue
+            # Exact word overlap
             overlap = len(query_words & mem_words)
+            # Prefix matching: "authentication" matches "auth" and vice-versa
+            for qw in query_words:
+                if qw in (query_words & mem_words):
+                    continue  # already counted
+                for mw in mem_words:
+                    if qw.startswith(mw) or mw.startswith(qw):
+                        overlap += 0.5
+                        break
             score = overlap / len(query_words)
             scored.append((score, mem))
 
@@ -296,7 +305,7 @@ class KnowledgeBase:
                        VALUES (?, ?, ?, ?, ?)""",
                     values
                 )
-                count = conn.total_changes
+                count = len(values)
         except Exception:
             # Fallback to individual inserts on error
             for rec in records:
