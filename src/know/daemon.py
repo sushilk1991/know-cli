@@ -25,7 +25,6 @@ from know.config import Config
 from know.daemon_db import DaemonDB
 from know.logger import get_logger
 from know.parsers import ParserFactory, EXTENSION_TO_LANGUAGE
-from know.token_counter import count_tokens
 
 logger = get_logger()
 

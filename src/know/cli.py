@@ -1381,14 +1381,6 @@ def get_shell_config_path(shell: str) -> str:
 # Phase 5: Agent-Optimized Commands
 # =========================================================================
 
-def _auto_init(project_root: Path) -> Config:
-    """Auto-initialize if .know/ doesn't exist. Zero-config."""
-    know_dir = project_root / ".know"
-    if not know_dir.exists():
-        config = Config.create_default(project_root)
-        config.save()
-    return Config.load(project_root) if know_dir.exists() else Config.create_default(project_root)
-
 
 @cli.command("next-file")
 @click.argument("query")
