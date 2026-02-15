@@ -241,67 +241,26 @@ class SemanticSearcher:
     MODEL_DIM = 384
     MAX_FILE_SIZE = 1024 * 1024  # 1MB
     
-    # Class-level cache for embedding models (shared across instances)
-    _model_cache: "Dict[str, Any]" = {}
-    _model_lock: "Optional[Any]" = None  # Initialized in __init__
-    
+    # Embedding model managed by know.embeddings (centralized)
+
     def __init__(self, model_name: Optional[str] = None, project_root: Optional[Path] = None):
         self.model_name = model_name or self.DEFAULT_MODEL
         self.project_root = project_root
         self.cache = EmbeddingCache(project_root=project_root)
-        self._embedding_model = None
-        # Initialize lock if not already
-        import threading
-        if SemanticSearcher._model_lock is None:
-            SemanticSearcher._model_lock = threading.Lock()
-    
+
     def _get_embedding_model(self):
-        """Lazy load the embedding model with caching."""
-        if self._embedding_model is None:
-            cache_key = self.model_name
-            
-            # Thread-safe check
-            if SemanticSearcher._model_lock:
-                with SemanticSearcher._model_lock:
-                    if cache_key in SemanticSearcher._model_cache:
-                        self._embedding_model = SemanticSearcher._model_cache[cache_key]
-                        return self._embedding_model
-            elif cache_key in SemanticSearcher._model_cache:
-                return SemanticSearcher._model_cache[cache_key]
-            
-            try:
-                from fastembed import TextEmbedding
-                import time
-                
-                start_time = time.time()
-                model = TextEmbedding(model_name=self.model_name)
-                load_time = time.time() - start_time
-                
-                # Cache the model
-                if SemanticSearcher._model_lock:
-                    with SemanticSearcher._model_lock:
-                        SemanticSearcher._model_cache[cache_key] = model
-                else:
-                    SemanticSearcher._model_cache[cache_key] = model
-                
-                # Log slow model loads
-                if load_time > 1.0:
-                    import logging
-                    logging.getLogger("know").debug(
-                        f"Embedding model loaded in {load_time:.2f}s"
-                    )
-                
-                self._embedding_model = model
-                
-            except ImportError:
-                raise ImportError(
-                    "fastembed is required for semantic search. "
-                    "Install with: pip install fastembed"
-                )
-        return self._embedding_model
-    
+        """Get embedding model from centralized manager."""
+        from know.embeddings import get_model
+        model = get_model(self.model_name)
+        if model is None:
+            raise ImportError(
+                "fastembed is required for semantic search. "
+                "Install with: pip install fastembed"
+            )
+        return model
+
     def _get_embedding(self, text: str) -> np.ndarray:
-        """Get embedding for text using fastembed."""
+        """Get embedding for text using centralized embedding manager."""
         model = self._get_embedding_model()
         
         # Truncate if too long (model has max tokens)

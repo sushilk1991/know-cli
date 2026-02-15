@@ -24,7 +24,7 @@ import json
 import os
 import re
 import subprocess
-import threading
+
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,27 +40,9 @@ logger = get_logger()
 
 
 # ---------------------------------------------------------------------------
-# Embedding model caching - avoid reloading on every call
+# Embedding model — uses centralized manager
 # ---------------------------------------------------------------------------
-_EMBEDDING_MODEL_CACHE = None
-_EMBEDDING_MODEL_LOCK = threading.Lock()
-
-def _get_cached_embedding_model():
-    """Get or create cached embedding model for semantic search (thread-safe)."""
-    global _EMBEDDING_MODEL_CACHE
-    if _EMBEDDING_MODEL_CACHE is None:
-        with _EMBEDDING_MODEL_LOCK:
-            if _EMBEDDING_MODEL_CACHE is None:
-                try:
-                    from fastembed import TextEmbedding
-                    import time
-                    start = time.time()
-                    _EMBEDDING_MODEL_CACHE = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-                    logger.debug(f"Loaded embedding model in {time.time()-start:.2f}s")
-                except ImportError:
-                    logger.debug("fastembed not available for semantic scoring")
-                    return None
-    return _EMBEDDING_MODEL_CACHE
+from know.embeddings import get_model as _get_cached_embedding_model
 
 
 # ---------------------------------------------------------------------------
@@ -554,11 +536,10 @@ class ContextEngine:
         """
         import numpy as np
 
-        # Use cached model to avoid reloading on every call
+        # Use centralized embedding manager
         model = _get_cached_embedding_model()
         if model is None:
-            from fastembed import TextEmbedding
-            model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            return {}
 
         # Embed query
         query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)

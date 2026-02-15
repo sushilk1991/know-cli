@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import threading
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -52,10 +52,7 @@ class KnowledgeBase:
     Falls back to text-matching when fastembed is unavailable.
     """
     
-    # Class-level embedding model cache
-    _embedding_model_cache: Dict[str, Any] = {}
-    _embedding_lock: Optional[threading.Lock] = None
-    _cache_initialized: bool = False
+    # Embedding model managed by know.embeddings (centralized)
 
     def __init__(self, config: "Config"):
         self.config = config
@@ -342,54 +339,12 @@ class KnowledgeBase:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # Embedding helpers
+    # Embedding helpers — uses centralized manager
     # ------------------------------------------------------------------
-    _embedding_model_cache: Dict[str, Any] = {}
-    _cache_initialized = False
-    
-    def _get_embedding_model(self):
-        """Get cached embedding model (thread-safe)."""
-        model_name = "BAAI/bge-small-en-v1.5"
-        
-        # Lazy initialization of lock
-        if not KnowledgeBase._cache_initialized:
-            KnowledgeBase._embedding_lock = threading.Lock()
-            KnowledgeBase._cache_initialized = True
-        
-        # Check cache first
-        if model_name in KnowledgeBase._embedding_model_cache:
-            return KnowledgeBase._embedding_model_cache[model_name]
-        
-        # Load and cache
-        try:
-            from fastembed import TextEmbedding
-            
-            with KnowledgeBase._embedding_lock:
-                # Double-check after acquiring lock
-                if model_name in KnowledgeBase._embedding_model_cache:
-                    return KnowledgeBase._embedding_model_cache[model_name]
-                
-                model = TextEmbedding(model_name=model_name)
-                KnowledgeBase._embedding_model_cache[model_name] = model
-                return model
-        except Exception:
-            return None
-    
     def _embed_text(self, text: str) -> Optional[bytes]:
-        """Embed text using fastembed with model caching. Returns raw bytes or None."""
-        try:
-            import numpy as np
-            
-            model = self._get_embedding_model()
-            if model is None:
-                return None
-            
-            # Truncate to 8000 chars for efficiency
-            text = text[:8000]
-            emb = np.array(list(model.embed([text]))[0], dtype=np.float32)
-            return emb.tobytes()
-        except Exception:
-            return None
+        """Embed text using centralized embedding manager. Returns raw bytes or None."""
+        from know.embeddings import embed_text
+        return embed_text(text)
 
     # ------------------------------------------------------------------
     # Internal helpers
