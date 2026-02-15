@@ -235,7 +235,7 @@ class TestKnowledgeBaseCRUD:
         from know.knowledge_base import KnowledgeBase
         kb = KnowledgeBase(config)
         kb.remember("Test")
-        assert (root / ".know" / "knowledge.db").exists()
+        assert (root / ".know" / "daemon.db").exists()
 
     def test_memory_to_dict(self, tmp_project):
         root, config = tmp_project

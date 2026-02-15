@@ -1,15 +1,15 @@
 """Knowledge base: cross-session memory for AI agents.
 
-Persists codebase understanding in a project-local SQLite database.
-Supports semantic recall (fastembed) with text-match fallback.
-Each memory is project-scoped and stored in `.know/knowledge.db`.
+Thin wrapper around DaemonDB — the single source of truth for all
+project data. Translates between integer display IDs (used by CLI)
+and text UUIDs (used by DaemonDB).
 """
 
 from __future__ import annotations
 
 import json
 import re
-import sqlite3
+import uuid
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,61 +46,52 @@ class Memory:
 
 
 class KnowledgeBase:
-    """Project-local knowledge base backed by SQLite.
+    """Project-local knowledge base backed by DaemonDB.
 
-    Stores memories with optional embedding vectors for semantic recall.
-    Falls back to text-matching when fastembed is unavailable.
+    Maintains an in-memory int→text ID map so CLI users can reference
+    memories by short integer IDs (e.g., ``know forget 3``).
     """
-    
-    # Embedding model managed by know.embeddings (centralized)
 
     def __init__(self, config: "Config"):
         self.config = config
         self.root = config.root
-        self.db_path = self.root / ".know" / "knowledge.db"
-        self._conn: Optional[sqlite3.Connection] = None
-        self._ensure_db()
+        from know.daemon_db import DaemonDB
+        self._db = DaemonDB(config.root)
+        # Build int→text ID map from existing memories
+        self._id_map: Dict[int, str] = {}  # int display id → text UUID
+        self._reverse_map: Dict[str, int] = {}  # text UUID → int display id
+        self._next_id = 1
+        self._rebuild_id_map()
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-    def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+    def _rebuild_id_map(self):
+        """Build sequential integer IDs from all existing memories."""
+        self._id_map.clear()
+        self._reverse_map.clear()
+        memories = self._db.list_memories()
+        # Sort by created_at ascending so oldest gets lowest ID
+        memories.sort(key=lambda m: m.get("created_at", 0))
+        for i, mem in enumerate(memories, 1):
+            text_id = mem["id"]
+            self._id_map[i] = text_id
+            self._reverse_map[text_id] = i
+        self._next_id = len(memories) + 1
+
+    def _assign_id(self, text_id: str) -> int:
+        """Assign the next sequential integer ID to a text UUID."""
+        int_id = self._next_id
+        self._id_map[int_id] = text_id
+        self._reverse_map[text_id] = int_id
+        self._next_id += 1
+        return int_id
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        self._db.close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
-
-    # ------------------------------------------------------------------
-    # Schema
-    # ------------------------------------------------------------------
-    def _ensure_db(self):
-        conn = self._get_conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                source TEXT DEFAULT 'manual',
-                tags TEXT DEFAULT '',
-                embedding BLOB,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                project_root TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
-            CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_root);
-        """)
-        conn.commit()
 
     # ------------------------------------------------------------------
     # CRUD
@@ -111,72 +102,62 @@ class KnowledgeBase:
         source: str = "manual",
         tags: str = "",
     ) -> int:
-        """Store a new memory.  Returns the memory ID."""
-        conn = self._get_conn()
+        """Store a new memory. Returns the integer display ID."""
         embedding_blob = self._embed_text(text)
+        text_id = str(uuid.uuid4())[:8]
 
-        cursor = conn.execute(
-            """INSERT INTO memories (text, source, tags, embedding, project_root)
-               VALUES (?, ?, ?, ?, ?)""",
-            (text, source, tags, embedding_blob, str(self.root)),
+        # Map source names: DaemonDB uses source_type
+        stored = self._db.store_memory(
+            text_id, text, tags=tags, source_type=source,
+            embedding=embedding_blob,
         )
-        conn.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        if not stored:
+            # Duplicate content — find existing and return its display ID
+            for int_id, tid in self._id_map.items():
+                mem = self._db.get_memory_by_id(tid)
+                if mem and mem["content"] == text:
+                    return int_id
+            # Shouldn't reach here, but assign new ID as fallback
+            return self._assign_id(text_id)
+
+        return self._assign_id(text_id)
 
     def forget(self, memory_id: int) -> bool:
-        """Delete a memory by ID.  Returns True if deleted."""
-        conn = self._get_conn()
-        cursor = conn.execute(
-            "DELETE FROM memories WHERE id = ? AND project_root = ?",
-            (memory_id, str(self.root)),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
+        """Delete a memory by integer display ID. Returns True if deleted."""
+        text_id = self._id_map.get(memory_id)
+        if not text_id:
+            return False
+        deleted = self._db.delete_memory(text_id)
+        if deleted:
+            del self._id_map[memory_id]
+            del self._reverse_map[text_id]
+        return deleted
 
     def get(self, memory_id: int) -> Optional[Memory]:
-        """Get a single memory by ID."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT id, text, source, tags, created_at, project_root "
-            "FROM memories WHERE id = ? AND project_root = ?",
-            (memory_id, str(self.root)),
-        ).fetchone()
+        """Get a single memory by integer display ID."""
+        text_id = self._id_map.get(memory_id)
+        if not text_id:
+            return None
+        row = self._db.get_memory_by_id(text_id)
         if row is None:
             return None
-        return self._row_to_memory(row)
+        return self._dict_to_memory(row, memory_id)
 
     def list_all(self, source: Optional[str] = None) -> List[Memory]:
-        """List all memories for this project, optionally filtered by source."""
-        conn = self._get_conn()
-        if source:
-            rows = conn.execute(
-                "SELECT id, text, source, tags, created_at, project_root "
-                "FROM memories WHERE project_root = ? AND source = ? "
-                "ORDER BY created_at DESC",
-                (str(self.root), source),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, text, source, tags, created_at, project_root "
-                "FROM memories WHERE project_root = ? ORDER BY created_at DESC",
-                (str(self.root),),
-            ).fetchall()
-        return [self._row_to_memory(r) for r in rows]
+        """List all memories, optionally filtered by source."""
+        rows = self._db.list_memories(source=source)
+        result = []
+        for row in rows:
+            text_id = row["id"]
+            int_id = self._reverse_map.get(text_id)
+            if int_id is None:
+                int_id = self._assign_id(text_id)
+            result.append(self._dict_to_memory(row, int_id))
+        return result
 
     def count(self, source: Optional[str] = None) -> int:
-        """Count memories for this project."""
-        conn = self._get_conn()
-        if source:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE project_root = ? AND source = ?",
-                (str(self.root), source),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE project_root = ?",
-                (str(self.root),),
-            ).fetchone()
-        return row[0] if row else 0
+        """Count memories."""
+        return self._db.count_memories(source=source)
 
     # ------------------------------------------------------------------
     # Semantic recall
@@ -185,54 +166,31 @@ class KnowledgeBase:
         """Recall memories semantically similar to *query*.
 
         Tries embedding-based cosine similarity first; falls back to
-        text-based word-overlap scoring.
+        DaemonDB FTS5, then text-based word-overlap scoring.
         """
         try:
             return self._recall_semantic(query, top_k)
         except Exception as e:
-            logger.debug(f"Semantic recall unavailable ({e}), using text fallback")
-            return self._recall_text(query, top_k)
+            logger.debug(f"Semantic recall unavailable ({e}), using FTS fallback")
+            return self._recall_fts(query, top_k)
 
     def _recall_semantic(self, query: str, top_k: int) -> List[Memory]:
-        """Cosine-similarity search over embedding vectors."""
-        import numpy as np
-
+        """Cosine-similarity search over embedding vectors via DaemonDB."""
         query_vec = self._embed_text(query)
         if query_vec is None:
             raise RuntimeError("No embedding model available")
 
-        query_arr = np.frombuffer(query_vec, dtype=np.float32)
-        q_norm = np.linalg.norm(query_arr)
-        if q_norm == 0:
-            return []
-        query_arr = query_arr / q_norm
-
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT id, text, source, tags, created_at, project_root, embedding "
-            "FROM memories WHERE project_root = ? AND embedding IS NOT NULL",
-            (str(self.root),),
-        ).fetchall()
-
+        rows = self._db.recall_memories_semantic(query_vec, limit=top_k)
         if not rows:
-            return self._recall_text(query, top_k)
+            return self._recall_fts(query, top_k)
+        return self._rows_to_memories(rows)
 
-        scored: list[tuple[float, Memory]] = []
-        for row in rows:
-            emb_blob = row["embedding"]
-            if emb_blob is None:
-                continue
-            emb = np.frombuffer(emb_blob, dtype=np.float32)
-            e_norm = np.linalg.norm(emb)
-            if e_norm == 0:
-                continue
-            emb = emb / e_norm
-            sim = float(np.dot(query_arr, emb))
-            mem = self._row_to_memory(row)
-            scored.append((sim, mem))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [m for _, m in scored[:top_k]]
+    def _recall_fts(self, query: str, top_k: int) -> List[Memory]:
+        """FTS5 BM25 search via DaemonDB, with text fallback."""
+        rows = self._db.recall_memories(query, limit=top_k)
+        if rows:
+            return self._rows_to_memories(rows)
+        return self._recall_text(query, top_k)
 
     def _recall_text(self, query: str, top_k: int) -> List[Memory]:
         """Fallback: word-overlap + prefix scoring."""
@@ -249,12 +207,10 @@ class KnowledgeBase:
             mem_words = set(re.findall(r"\w+", mem.text.lower()))
             if not mem_words:
                 continue
-            # Exact word overlap
             overlap = len(query_words & mem_words)
-            # Prefix matching: "authentication" matches "auth" and vice-versa
             for qw in query_words:
                 if qw in (query_words & mem_words):
-                    continue  # already counted
+                    continue
                 for mw in mem_words:
                     if qw.startswith(mw) or mw.startswith(qw):
                         overlap += 0.5
@@ -274,51 +230,23 @@ class KnowledgeBase:
         return json.dumps([m.to_dict() for m in memories], indent=2)
 
     def import_json(self, data: str) -> int:
-        """Import memories from JSON string with batch transaction.  Returns count imported."""
+        """Import memories from JSON string. Returns count imported."""
         records = json.loads(data)
         if not records:
             return 0
-        
-        conn = self._get_conn()
+
         count = 0
-        
-        try:
-            with conn:
-                # Batch insert for performance
-                values = []
-                for rec in records:
-                    text = rec["text"]
-                    source = rec.get("source", "manual")
-                    tags = rec.get("tags", "")
-                    embedding_blob = self._embed_text(text)
-                    
-                    values.append((
-                        text,
-                        source,
-                        tags,
-                        embedding_blob,
-                        str(self.root)
-                    ))
-                
-                conn.executemany(
-                    """INSERT INTO memories (text, source, tags, embedding, project_root)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    values
+        for rec in records:
+            try:
+                self.remember(
+                    text=rec["text"],
+                    source=rec.get("source", "manual"),
+                    tags=rec.get("tags", ""),
                 )
-                count = len(values)
-        except Exception:
-            # Fallback to individual inserts on error
-            for rec in records:
-                try:
-                    self.remember(
-                        text=rec["text"],
-                        source=rec.get("source", "manual"),
-                        tags=rec.get("tags", ""),
-                    )
-                    count += 1
-                except Exception:
-                    pass
-        
+                count += 1
+            except Exception:
+                pass
+
         return count
 
     # ------------------------------------------------------------------
@@ -358,13 +286,28 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _row_to_memory(row) -> Memory:
+    def _dict_to_memory(self, row: Dict[str, Any], int_id: int) -> Memory:
+        """Convert a DaemonDB dict to a Memory dataclass."""
+        created = row.get("created_at", "")
+        # DaemonDB stores created_at as float epoch; convert to string
+        if isinstance(created, (int, float)):
+            created = datetime.fromtimestamp(created).isoformat()
         return Memory(
-            id=row["id"],
-            text=row["text"],
-            source=row["source"] or "manual",
-            tags=row["tags"] or "",
-            created_at=row["created_at"] or "",
-            project_root=row["project_root"] or "",
+            id=int_id,
+            text=row.get("content", ""),
+            source=row.get("source_type", "manual"),
+            tags=row.get("tags", ""),
+            created_at=str(created),
+            project_root=str(self.root),
         )
+
+    def _rows_to_memories(self, rows: List[Dict[str, Any]]) -> List[Memory]:
+        """Convert a list of DaemonDB dicts to Memory objects."""
+        result = []
+        for row in rows:
+            text_id = row["id"]
+            int_id = self._reverse_map.get(text_id)
+            if int_id is None:
+                int_id = self._assign_id(text_id)
+            result.append(self._dict_to_memory(row, int_id))
+        return result

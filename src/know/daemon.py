@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import signal
+import struct
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,33 @@ logger = get_logger()
 IDLE_TIMEOUT = 1800  # 30 minutes
 SOCKET_DIR = Path.home() / ".know" / "sockets"
 PID_DIR = Path.home() / ".know" / "pids"
+MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+async def write_framed_message(writer: asyncio.StreamWriter, data: bytes) -> None:
+    """Write a length-prefixed message (4-byte big-endian header)."""
+    length = len(data)
+    if length > MAX_MESSAGE_SIZE:
+        raise ValueError(f"Message too large: {length} bytes (max {MAX_MESSAGE_SIZE})")
+    writer.write(struct.pack(">I", length))
+    writer.write(data)
+    await writer.drain()
+
+
+async def read_framed_message(reader: asyncio.StreamReader) -> Optional[bytes]:
+    """Read a length-prefixed message. Returns None on clean disconnect."""
+    try:
+        header = await reader.readexactly(4)
+    except asyncio.IncompleteReadError:
+        return None
+    length = struct.unpack(">I", header)[0]
+    if length > MAX_MESSAGE_SIZE:
+        raise ValueError(f"Message too large: {length} bytes (max {MAX_MESSAGE_SIZE})")
+    try:
+        data = await reader.readexactly(length)
+    except asyncio.IncompleteReadError:
+        return None
+    return data
 
 
 def _project_hash(root: Path) -> str:
@@ -116,11 +144,11 @@ class KnowDaemon:
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
-        """Handle a single JSON-RPC connection."""
+        """Handle a single JSON-RPC connection with length-prefixed framing."""
         self._last_activity = time.time()
         try:
-            data = await reader.read(10 * 1024 * 1024)  # 10MB max (matches client)
-            if not data:
+            data = await read_framed_message(reader)
+            if data is None:
                 return
 
             request = json.loads(data.decode())
@@ -138,8 +166,7 @@ class KnowDaemon:
                     "id": req_id,
                 }
 
-            writer.write(json.dumps(response).encode())
-            await writer.drain()
+            await write_framed_message(writer, json.dumps(response).encode())
         except Exception as e:
             logger.error(f"Connection error: {e}")
         finally:
@@ -346,7 +373,7 @@ class DaemonClient:
         self.sock_path = socket_path(project_root)
 
     async def call(self, method: str, params: Optional[dict] = None) -> dict:
-        """Send a JSON-RPC request to the daemon."""
+        """Send a JSON-RPC request to the daemon with length-prefixed framing."""
         request = {
             "jsonrpc": "2.0",
             "method": method,
@@ -356,9 +383,10 @@ class DaemonClient:
 
         reader, writer = await asyncio.open_unix_connection(str(self.sock_path))
         try:
-            writer.write(json.dumps(request).encode())
-            await writer.drain()
-            data = await reader.read(10 * 1024 * 1024)  # 10MB max response
+            await write_framed_message(writer, json.dumps(request).encode())
+            data = await read_framed_message(reader)
+            if data is None:
+                raise RuntimeError("Daemon closed connection unexpectedly")
             response = json.loads(data.decode())
             if "error" in response:
                 raise RuntimeError(response["error"]["message"])

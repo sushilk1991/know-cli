@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS memories (
     access_count INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     last_accessed_at REAL,
-    content_hash TEXT NOT NULL
+    content_hash TEXT NOT NULL,
+    embedding BLOB DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
@@ -144,6 +145,16 @@ class DaemonDB:
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
         conn.commit()
+        self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection):
+        """Run schema migrations for backwards compatibility."""
+        # Add embedding column if missing (pre-v2 databases)
+        cursor = conn.execute("PRAGMA table_info(memories)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "embedding" not in columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB DEFAULT NULL")
+            conn.commit()
 
     def close(self):
         if self._conn:
@@ -302,11 +313,18 @@ class DaemonDB:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def get_all_edges(self) -> List[Tuple[str, str]]:
+        """Return all (source, target) import edges."""
+        conn = self._get_conn()
+        rows = conn.execute("SELECT source_module, target_module FROM imports").fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     # ------------------------------------------------------------------
     # Memories
     # ------------------------------------------------------------------
     def store_memory(self, memory_id: str, content: str,
-                     tags: str = "[]", source_type: str = "manual") -> bool:
+                     tags: str = "[]", source_type: str = "manual",
+                     embedding: Optional[bytes] = None) -> bool:
         """Store a memory. Returns False if duplicate content exists."""
         content_hash = xxhash.xxh64(content.encode()).hexdigest()
 
@@ -320,12 +338,79 @@ class DaemonDB:
 
         conn.execute(
             """INSERT INTO memories (id, content, tags, source_type,
-                                     created_at, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (memory_id, content, tags, source_type, time.time(), content_hash),
+                                     created_at, content_hash, embedding)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (memory_id, content, tags, source_type, time.time(), content_hash, embedding),
         )
         conn.commit()
         return True
+
+    def get_memory_by_id(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single memory by its ID."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_memory(self, memory_id: str) -> bool:
+        """Delete a memory by ID. Returns True if deleted."""
+        conn = self._get_conn()
+        cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+    def list_memories(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List all memories, optionally filtered by source_type."""
+        conn = self._get_conn()
+        if source:
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE source_type = ? ORDER BY created_at DESC",
+                (source,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM memories ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_memories(self, source: Optional[str] = None) -> int:
+        """Count memories, optionally filtered by source_type."""
+        conn = self._get_conn()
+        if source:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE source_type = ?", (source,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM memories").fetchone()
+        return row[0] if row else 0
+
+    def recall_memories_semantic(self, query_embedding: bytes, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search memories by cosine similarity against stored embeddings."""
+        import numpy as np
+
+        query_arr = np.frombuffer(query_embedding, dtype=np.float32)
+        q_norm = np.linalg.norm(query_arr)
+        if q_norm == 0:
+            return []
+        query_arr = query_arr / q_norm
+
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE embedding IS NOT NULL"
+        ).fetchall()
+
+        scored = []
+        for row in rows:
+            emb = np.frombuffer(row["embedding"], dtype=np.float32)
+            e_norm = np.linalg.norm(emb)
+            if e_norm == 0:
+                continue
+            sim = float(np.dot(query_arr, emb / e_norm))
+            scored.append((sim, dict(row)))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [d for _, d in scored[:limit]]
 
     def recall_memories(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search memories using FTS5 BM25."""

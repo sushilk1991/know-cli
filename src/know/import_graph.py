@@ -1,6 +1,6 @@
 """Import graph: tracks dependencies between project modules.
 
-Stores import relationships as an adjacency list in index.db.
+Delegates storage to DaemonDB (the single source of truth).
 Provides queries for 'what does X import?' and 'what imports X?'.
 
 Uses fully-qualified module names to avoid false matches between
@@ -8,7 +8,6 @@ modules with the same leaf name (e.g., auth.config vs db.config).
 """
 
 import ast
-import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -23,7 +22,7 @@ logger = get_logger()
 class ImportGraph:
     """Builds and queries the import dependency graph for a project.
 
-    Edges are stored in SQLite alongside the existing index.db.
+    Edges are stored in DaemonDB's imports table.
     All module names are stored as fully-qualified dotted paths
     (e.g., 'src.auth.config' not just 'config').
     """
@@ -31,43 +30,17 @@ class ImportGraph:
     def __init__(self, config: "Config"):
         self.config = config
         self.root = config.root
-        self.db_path = config.root / ".know" / "cache" / "index.db"
-        self._conn: Optional[sqlite3.Connection] = None
-        self._ensure_table()
-
-    def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        return self._conn
+        from know.daemon_db import DaemonDB
+        self._db = DaemonDB(config.root)
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        self._db.close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
-
-    # ------------------------------------------------------------------
-    # Schema
-    # ------------------------------------------------------------------
-    def _ensure_table(self):
-        conn = self._get_conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS import_edges (
-                source TEXT NOT NULL,
-                target TEXT NOT NULL,
-                import_type TEXT NOT NULL DEFAULT 'import',
-                PRIMARY KEY (source, target)
-            );
-            CREATE INDEX IF NOT EXISTS idx_import_source ON import_edges(source);
-            CREATE INDEX IF NOT EXISTS idx_import_target ON import_edges(target);
-        """)
-        conn.commit()
 
     # ------------------------------------------------------------------
     # Build graph from codebase
@@ -129,7 +102,8 @@ class ImportGraph:
             # Ambiguous or not found
             return None
 
-        edges: List[Tuple[str, str, str]] = []
+        # Collect edges per source module
+        edges_by_source: Dict[str, List[Tuple[str, str]]] = {}
 
         for mod_name, abs_path in py_files.items():
             if not abs_path.exists() or not str(abs_path).endswith(".py"):
@@ -139,6 +113,8 @@ class ImportGraph:
                 tree = ast.parse(source)
             except (SyntaxError, UnicodeDecodeError):
                 continue
+
+            mod_edges: List[Tuple[str, str]] = []
 
             for node in ast.walk(tree):
                 targets: List[Tuple[str, str]] = []  # (resolved_fqn, type)
@@ -156,18 +132,18 @@ class ImportGraph:
                             targets.append((resolved, "from"))
 
                 for resolved, imp_type in targets:
-                    edges.append((mod_name, resolved, imp_type))
+                    mod_edges.append((resolved, imp_type))
 
-        # Persist
-        conn = self._get_conn()
-        conn.execute("DELETE FROM import_edges")
-        if edges:
-            conn.executemany(
-                "INSERT OR REPLACE INTO import_edges (source, target, import_type) VALUES (?, ?, ?)",
-                edges,
-            )
-        conn.commit()
-        return len(edges)
+            if mod_edges:
+                edges_by_source[mod_name] = mod_edges
+
+        # Persist via DaemonDB
+        total_edges = 0
+        for source_mod, targets in edges_by_source.items():
+            self._db.set_imports(source_mod, targets)
+            total_edges += len(targets)
+
+        return total_edges
 
     # ------------------------------------------------------------------
     # Queries
@@ -177,31 +153,27 @@ class ImportGraph:
 
         Accepts both fully-qualified names and leaf names.
         """
-        conn = self._get_conn()
-        # Try exact match first, then suffix match for leaf names
-        rows = conn.execute(
-            "SELECT target FROM import_edges WHERE source = ? OR source LIKE ?",
-            (module_name, "%." + module_name),
-        ).fetchall()
-        return list({r[0] for r in rows})
+        results = self._db.get_imports_of(module_name)
+        if not results:
+            # Try suffix match via get_all_edges
+            edges = self._db.get_all_edges()
+            results = list({t for s, t in edges if s == module_name or s.endswith("." + module_name)})
+        return results
 
     def imported_by(self, module_name: str) -> List[str]:
         """What modules import *module_name*? (incoming edges)
 
         Accepts both fully-qualified names and leaf names.
         """
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT source FROM import_edges WHERE target = ? OR target LIKE ?",
-            (module_name, "%." + module_name),
-        ).fetchall()
-        return list({r[0] for r in rows})
+        results = self._db.get_imported_by(module_name)
+        if not results:
+            edges = self._db.get_all_edges()
+            results = list({s for s, t in edges if t == module_name or t.endswith("." + module_name)})
+        return results
 
     def get_all_edges(self) -> List[Tuple[str, str]]:
         """Return all (source, target) edges."""
-        conn = self._get_conn()
-        rows = conn.execute("SELECT source, target FROM import_edges").fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return self._db.get_all_edges()
 
     def file_for_module(self, module_name: str) -> Optional[Path]:
         """Resolve a module name to a file path under project root."""
