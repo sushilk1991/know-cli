@@ -22,6 +22,8 @@ AI coding agents dump entire files into context. Every `@file` reference, every 
 - 📊 Import graph knows what depends on what
 - 🧠 Cross-session memory means agents never re-discover the same things
 - 💰 Token budgeting keeps costs predictable
+- ⚡ Background daemon for sub-100ms query latency
+- 🤖 Agent-native commands (`next-file`, `signatures`, `related`) for autonomous workflows
 
 **60-80% fewer tokens. Same (or better) results.**
 
@@ -37,6 +39,8 @@ know context "help me fix the auth bug" --budget 4000
 ```
 
 That's it. You just got the most relevant code for your task, packed into exactly 4000 tokens.
+
+The background daemon starts automatically on first use — subsequent queries return in under 100ms.
 
 ---
 
@@ -128,6 +132,39 @@ know mcp config                   # Print Claude Desktop config
 **MCP Tools:** `get_context`, `search_code`, `remember`, `recall`, `explain_component`, `show_graph`
 
 **MCP Resources:** `codebase://digest`, `codebase://structure`, `codebase://memories`
+
+### 🤖 Agent Commands
+
+Purpose-built for autonomous AI agent workflows.
+
+```bash
+know next-file "authentication" --exclude src/auth/old.py
+know signatures src/auth/middleware.py
+know related src/auth/middleware.py
+know generate-context --budget 8000
+know diff --since "3 days ago"
+```
+
+| Command | Description |
+|---------|-------------|
+| `know next-file "query"` | Return the single most relevant file for a query |
+| `know signatures [file]` | Get function/class signatures for a file or project |
+| `know related <file>` | Show import dependencies and dependents |
+| `know generate-context` | Generate `.know/CONTEXT.md` for agents to read on session start |
+| `know diff --since "1 week ago"` | Show architectural changes over time |
+
+### ⚡ Background Daemon
+
+A Unix socket daemon keeps indexes in memory for instant responses.
+
+```bash
+know status   # Shows daemon status, index age, cache size
+```
+
+- Starts automatically on first CLI call
+- Serves search, signatures, related, and memory queries over IPC
+- Falls back to direct SQLite access if daemon is unavailable
+- Disable with `KNOW_NO_DAEMON=1` for CI/CD environments
 
 ### 📈 Usage Stats — `know stats`
 
@@ -222,6 +259,7 @@ know status --json
 | `know remember "text"` | Store a memory |
 | `know recall "query"` | Recall memories |
 | `know forget <id>` | Delete a memory |
+| `know memories list` | List all memories |
 | `know graph <file>` | Show import dependencies |
 | `know explain -c <name>` | AI-explain a component |
 | `know stats` | Usage statistics |
@@ -231,6 +269,13 @@ know status --json
 | `know mcp config` | Print MCP client config |
 | `know digest` | Generate codebase summary |
 | `know watch` | Auto-update on file changes |
+| `know next-file "query"` | Best file for a query (agent use) |
+| `know signatures [file]` | Function/class signatures |
+| `know related <file>` | Import deps and dependents |
+| `know generate-context` | Generate `.know/CONTEXT.md` |
+| `know diff --since "1w"` | Architectural changes over time |
+| `know hooks install` | Install git hooks for auto-update |
+| `know hooks uninstall` | Remove git hooks |
 
 ### Global Flags
 
@@ -284,6 +329,8 @@ Your Query → know context
 
 All processing is **local**. Embeddings run on your machine. No data leaves your laptop (except `know explain` which calls Claude API).
 
+Semantic search via [fastembed](https://github.com/qdrant/fastembed) is optional — install with `pip install know-cli[search]`. Without it, know uses fast BM25 full-text search as the default.
+
 ---
 
 ## Configuration
@@ -326,10 +373,22 @@ exclude_paths:
 
 ---
 
+## Architecture
+
+```
+.know/
+  config.yaml     # Project configuration
+  daemon.db       # Unified SQLite database (chunks, memories, imports)
+  cache/
+    index.db      # Scanner cache
+```
+
+**Single database:** All data (code chunks, memories, import graph) lives in one SQLite database with WAL mode for concurrent access. The background daemon keeps it in memory; CLI commands fall back to direct access when the daemon is unavailable.
+
 ## Contributing
 
 ```bash
-git clone https://github.com/vic/know-cli
+git clone https://github.com/sushilk1991/know-cli
 cd know-cli
 pip install -e ".[dev,search,mcp]"
 python -m pytest tests/ -v
