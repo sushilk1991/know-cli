@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS file_index (
 
 -- Schema version tracking for migrations
 CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL,
+    version INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL
 );
 
@@ -252,7 +252,7 @@ class DaemonDB:
             current = row[0] if row else 0
             if current < 2:
                 conn.execute(
-                    "INSERT OR REPLACE INTO schema_version (version, migrated_at) VALUES (?, ?)",
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
                     (2, time.time()),
                 )
                 conn.commit()

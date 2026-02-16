@@ -24,12 +24,11 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import re
 import subprocess
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -810,6 +809,9 @@ class ContextEngine:
             "code_chunks": code_chunks, "dependency_chunks": dep_chunks,
             "test_chunks": test_chunks, "summary_chunks": summary_chunks,
             "overview": overview, "warnings": warnings,
+            "indexing_status": "legacy",
+            "confidence": round(total_used / budget, 2) if budget > 0 else 0,
+            "index_stats": {},
         }
 
     # ------------------------------------------------------------------
