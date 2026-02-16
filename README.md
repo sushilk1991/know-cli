@@ -25,15 +25,31 @@ AI coding agents dump entire files into context. Every `@file` reference, every 
 - ⚡ Background daemon for sub-100ms query latency
 - 🤖 Agent-native commands (`next-file`, `signatures`, `related`) for autonomous workflows
 
-**8-15x fewer tokens. Same (or better) results.**
+**8-18x fewer tokens per query. One tool call instead of seven.**
 
 ---
 
 ## Benchmarks
 
-We compared `know context` against the traditional agent workflow (Grep to find files → Read full files) on two real projects. Clean run — indexes deleted before each benchmark.
+### Head-to-head: Two AI agents, same task
 
-### know-cli (35 files, 159 chunks)
+We gave two Claude agents the **same research task** — "explain how the search ranking pipeline works and write a README section" — on the know-cli codebase (35 files). One agent used only `know` commands, the other used only Grep+Read. Both ran in parallel.
+
+| Metric | Agent with `know` | Agent with Grep+Read |
+|---|---|---|
+| Total API tokens | 70,542 | 75,602 |
+| Tool calls | 13 | 12 |
+| Wall clock time | 114s | 89s |
+| Context tokens consumed | ~18,355 (from know) | ~14,176 (raw file reads) |
+| Quality | Accurate, found RRF fusion, git recency details | Accurate, found exact BM25F weights, SQL details |
+
+**Takeaway:** On a small codebase where you can guess the right files, Grep+Read is competitive. `know` shines when you **don't know where to look** — it found relevant code across 7+ files in a single call, while Grep+Read required the agent to already know which files mattered.
+
+### Token efficiency: know context vs Grep+Read (per-query)
+
+Each `know context` call returns a ranked, token-budgeted bundle. Here's how the **content delivered** compares to reading full files after grep.
+
+**know-cli** (35 files, 159 chunks):
 
 | Scenario | Grep+Read | know context | Reduction |
 |---|---|---|---|
@@ -44,7 +60,7 @@ We compared `know context` against the traditional agent workflow (Grep to find 
 | Import graph logic | 28,274 tokens | 1,531 tokens | **18.5x** |
 | **Total** | **115,228 tokens** | **7,621 tokens** | **15.1x** |
 
-### farfield (762 files, 2,228 chunks — production TypeScript+Python app)
+**farfield** (762 files, 2,228 chunks — production TypeScript+Python app):
 
 | Scenario | Grep+Read | know context | Reduction |
 |---|---|---|---|
@@ -55,17 +71,15 @@ We compared `know context` against the traditional agent workflow (Grep to find 
 | Database and storage | 5,357 tokens | 1,773 tokens | **3.0x** |
 | **Total** | **74,392 tokens** | **8,655 tokens** | **8.6x** |
 
-### Summary
+### When to use know vs Grep
 
-| Metric | Grep+Read | know context |
+| Situation | Best tool | Why |
 |---|---|---|
-| Avg token reduction | — | **8-15x fewer** |
-| Tool calls per query | 7-9 (grep + read) | **1** |
-| Cold start (first use) | N/A | 0.5s (small) / 13s (large) |
-| Warm query latency | N/A (multi-step) | **170ms** (small) / **1.8s** (large) |
-| Budget utilization | — | **77-80%** |
-| Signal-to-noise ratio | ~5-10% signal | **~100% signal** |
-| Returns actual source code | Full files (mostly irrelevant) | Ranked functions/classes |
+| You know the exact file | Grep+Read | Direct is faster |
+| Exploring unfamiliar code | **know context** | Finds relevant code across the whole codebase in 1 call |
+| Repeated queries in a session | **know context** | Index is cached, sub-200ms responses |
+| Large codebase (500+ files) | **know context** | Grep returns too many matches to read |
+| Budget-constrained agent | **know context** | Token budgeting prevents waste |
 
 ---
 
