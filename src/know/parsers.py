@@ -262,6 +262,10 @@ class TreeSitterParser(BaseParser):
             if cls:
                 module.classes.append(cls)
 
+        # Module-level UPPER_CASE constant assignments
+        elif ntype in ("expression_statement", "assignment") and not is_method:
+            self._try_extract_constant(node, content, module)
+
         for child in node.children:
             self._walk(child, content, module, func_types, class_types, import_types, is_method)
 
@@ -289,6 +293,7 @@ class TreeSitterParser(BaseParser):
         return FunctionInfo(
             name=name,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
             docstring=docstring,
             signature=sig,
             is_async="async" in content[node.start_byte:node.start_byte + 20].decode("utf-8", errors="replace"),
@@ -309,6 +314,7 @@ class TreeSitterParser(BaseParser):
         return ClassInfo(
             name=name,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
             docstring=self._extract_docstring(node, content),
             methods=[],
             bases=[],
@@ -328,11 +334,41 @@ class TreeSitterParser(BaseParser):
                     return ClassInfo(
                         name=name,
                         line_number=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
                         docstring=None,
                         methods=[],
                         bases=[],
                     )
         return None
+
+    def _try_extract_constant(self, node, content: bytes, module: ModuleInfo):
+        """Extract UPPER_CASE constant assignments at module level."""
+        # Find the assignment node (may be the node itself or a child)
+        assign = node if node.type == "assignment" else None
+        if assign is None:
+            for child in node.children:
+                if child.type == "assignment":
+                    assign = child
+                    break
+        if assign is None:
+            return
+
+        # Get the left-hand side identifier
+        for child in assign.children:
+            if child.type in ("identifier", "name"):
+                name = content[child.start_byte:child.end_byte].decode("utf-8")
+                if name.isupper() and len(name) >= 2:
+                    module.functions.append(FunctionInfo(
+                        name=name,
+                        line_number=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        docstring=None,
+                        signature=name,
+                        is_async=False,
+                        is_method=False,
+                        decorators=["constant"],
+                    ))
+                break  # Only check first identifier (LHS)
 
     def _extract_docstring(self, node, content: bytes) -> Optional[str]:
         """Try to extract a docstring from a node."""
@@ -392,6 +428,20 @@ class PythonParser(BaseParser):
                 module.functions.append(self._parse_function(node, is_async=True))
             elif isinstance(node, ast.ClassDef):
                 module.classes.append(self._parse_class(node))
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        end = getattr(node, 'end_lineno', node.lineno)
+                        module.functions.append(FunctionInfo(
+                            name=target.id,
+                            line_number=node.lineno,
+                            end_line=end,
+                            docstring=None,
+                            signature=target.id,
+                            is_async=False,
+                            is_method=False,
+                            decorators=["constant"],
+                        ))
 
         return module
 
@@ -418,6 +468,7 @@ class PythonParser(BaseParser):
         return FunctionInfo(
             name=node.name,
             line_number=node.lineno,
+            end_line=getattr(node, 'end_lineno', node.lineno),
             docstring=ast.get_docstring(node),
             signature=signature,
             is_async=is_async or isinstance(node, ast.AsyncFunctionDef),
@@ -443,6 +494,7 @@ class PythonParser(BaseParser):
         return ClassInfo(
             name=node.name,
             line_number=node.lineno,
+            end_line=getattr(node, 'end_lineno', node.lineno),
             docstring=ast.get_docstring(node),
             methods=methods,
             bases=bases,
@@ -483,7 +535,8 @@ class RegexParser(BaseParser):
                 if match:
                     name = match.group(1)
                     module.functions.append(FunctionInfo(
-                        name=name, line_number=i, docstring=None,
+                        name=name, line_number=i, end_line=0,
+                        docstring=None,
                         signature=stripped.rstrip("{:").strip(),
                         is_async="async" in stripped,
                         is_method=False,
@@ -494,7 +547,8 @@ class RegexParser(BaseParser):
                 if match:
                     name = match.group(1)
                     module.classes.append(ClassInfo(
-                        name=name, line_number=i, docstring=None,
+                        name=name, line_number=i, end_line=0,
+                        docstring=None,
                         methods=[], bases=[],
                     ))
 

@@ -42,28 +42,32 @@ CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_path);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(body_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_path_name ON chunks(file_path, chunk_name, start_line);
 
--- FTS5 index on chunk content (BM25 search)
+-- FTS5 index on chunk content (BM25F search with field weighting)
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    chunk_name, signature, body,
-    content='chunks', content_rowid='id'
+    chunk_name, file_path, signature, body,
+    content='chunks', content_rowid='id',
+    prefix='2,3'
 );
+
+-- FTS5 vocabulary table for zero-result diagnostics
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row);
 
 -- Triggers to keep FTS in sync
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts(rowid, chunk_name, signature, body)
-    VALUES (new.id, new.chunk_name, new.signature, new.body);
+    INSERT INTO chunks_fts(rowid, chunk_name, file_path, signature, body)
+    VALUES (new.id, new.chunk_name, new.file_path, new.signature, new.body);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_name, signature, body)
-    VALUES('delete', old.id, old.chunk_name, old.signature, old.body);
+    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_name, file_path, signature, body)
+    VALUES('delete', old.id, old.chunk_name, old.file_path, old.signature, old.body);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_name, signature, body)
-    VALUES('delete', old.id, old.chunk_name, old.signature, old.body);
-    INSERT INTO chunks_fts(rowid, chunk_name, signature, body)
-    VALUES (new.id, new.chunk_name, new.signature, new.body);
+    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_name, file_path, signature, body)
+    VALUES('delete', old.id, old.chunk_name, old.file_path, old.signature, old.body);
+    INSERT INTO chunks_fts(rowid, chunk_name, file_path, signature, body)
+    VALUES (new.id, new.chunk_name, new.file_path, new.signature, new.body);
 END;
 
 -- Import graph (fully-qualified edges)
@@ -117,6 +121,20 @@ CREATE TABLE IF NOT EXISTS file_index (
     chunk_count INTEGER DEFAULT 0,
     indexed_at REAL NOT NULL
 );
+
+-- Schema version tracking for migrations
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
+
+-- Module importance scores (in-degree / PageRank)
+CREATE TABLE IF NOT EXISTS module_importance (
+    module_name TEXT PRIMARY KEY,
+    in_degree INTEGER NOT NULL DEFAULT 0,
+    score REAL NOT NULL DEFAULT 0.0,
+    computed_at REAL NOT NULL
+);
 """
 
 
@@ -161,9 +179,52 @@ class DaemonDB:
 
     def _init_db(self):
         conn = self._get_conn()
+        # Migrate FTS5 schema BEFORE running _SCHEMA (which has CREATE IF NOT EXISTS)
+        self._migrate_fts_schema(conn)
         conn.executescript(_SCHEMA)
         conn.commit()
         self._migrate(conn)
+        # Cache FTS column count (schema doesn't change after init)
+        self._fts_cols = self._fts_column_count(conn)
+
+    def _needs_fts_migration(self, conn: sqlite3.Connection) -> bool:
+        """Check if FTS5 table needs migration to add file_path column.
+
+        CRITICAL: PRAGMA table_info FAILS on FTS5 virtual tables (returns empty).
+        Use sqlite_master to inspect the CREATE statement instead.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+        ).fetchone()
+        if row is None:
+            return False  # Table doesn't exist yet; _SCHEMA will create it
+        return 'file_path' not in row[0]
+
+    def _migrate_fts_schema(self, conn: sqlite3.Connection):
+        """Migrate FTS5 from 3 columns to 4 columns (add file_path).
+
+        CRITICAL: Triggers MUST be dropped FIRST — they reference old column
+        positions. Without this, file_path values go into signature column
+        and signature into body (silent data corruption).
+        """
+        if not self._needs_fts_migration(conn):
+            return
+
+        logger.info("Migrating FTS5 schema: adding file_path column")
+
+        # Drop triggers FIRST (they reference old column positions)
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+
+        # Drop old FTS5 virtual table and vocab table
+        conn.execute("DROP TABLE IF EXISTS chunks_fts_vocab")
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        conn.commit()
+
+        # NOTE: Do NOT use executescript() — it implicitly COMMITs,
+        # breaking transaction control. _SCHEMA's CREATE IF NOT EXISTS
+        # will create the new table with 4 columns + new triggers.
 
     def _migrate(self, conn: sqlite3.Connection):
         """Run schema migrations for backwards compatibility."""
@@ -173,6 +234,37 @@ class DaemonDB:
         if "embedding" not in columns:
             conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB DEFAULT NULL")
             conn.commit()
+
+        # Rebuild FTS5 index if it was just migrated (has 0 rows but chunks exist)
+        try:
+            fts_count = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+            chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            if fts_count == 0 and chunk_count > 0:
+                logger.info(f"Rebuilding FTS5 index ({chunk_count} chunks)")
+                conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass  # FTS table may not exist yet on first run
+
+        # Track schema version
+        try:
+            row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
+            current = row[0] if row else 0
+            if current < 3:
+                # v3: full source bodies stored — force reindex by clearing all indexed data
+                try:
+                    conn.execute("DELETE FROM file_index")
+                    conn.execute("DELETE FROM chunks")
+                    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+                except sqlite3.OperationalError:
+                    pass
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (3, time.time()),
+                )
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Table may not exist yet
 
     def close(self):
         conn = getattr(self._local, 'conn', None)
@@ -224,22 +316,54 @@ class DaemonDB:
             )
         conn.commit()
 
+    def _fts_column_count(self, conn: sqlite3.Connection) -> int:
+        """Detect number of columns in FTS5 table for weight vector selection."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+        ).fetchone()
+        if row is None:
+            return 0
+        # Count columns in CREATE VIRTUAL TABLE statement
+        sql = row[0]
+        # Columns are between the first '(' and the first keyword like 'content='
+        if 'file_path' in sql:
+            return 4  # chunk_name, file_path, signature, body
+        return 3  # chunk_name, signature, body (old schema)
+
     def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """BM25 full-text search over code chunks."""
+        """BM25F full-text search over code chunks with field weighting.
+
+        Weights: chunk_name=5.0, file_path=5.0, signature=3.0, body=1.0
+        Falls back to equal weights on old 3-column schema.
+        """
         conn = self._get_conn()
         safe_query = self._build_fts_query(query)
         if not safe_query:
             return []
         try:
-            rows = conn.execute(
-                """SELECT c.*, rank
-                   FROM chunks_fts
-                   JOIN chunks c ON chunks_fts.rowid = c.id
-                   WHERE chunks_fts MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (safe_query, limit),
-            ).fetchall()
+            col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
+            if col_count == 4:
+                # New schema: BM25F with field weights
+                rows = conn.execute(
+                    """SELECT c.*, -bm25(chunks_fts, 5.0, 5.0, 3.0, 1.0) AS score
+                       FROM chunks_fts
+                       JOIN chunks c ON chunks_fts.rowid = c.id
+                       WHERE chunks_fts MATCH ?
+                       ORDER BY score DESC
+                       LIMIT ?""",
+                    (safe_query, limit),
+                ).fetchall()
+            else:
+                # Old schema: default BM25 ranking
+                rows = conn.execute(
+                    """SELECT c.*, rank AS score
+                       FROM chunks_fts
+                       JOIN chunks c ON chunks_fts.rowid = c.id
+                       WHERE chunks_fts MATCH ?
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (safe_query, limit),
+                ).fetchall()
         except sqlite3.OperationalError:
             return []
         return [dict(r) for r in rows]
@@ -338,6 +462,36 @@ class DaemonDB:
         conn = self._get_conn()
         rows = conn.execute("SELECT source_module, target_module FROM imports").fetchall()
         return [(r[0], r[1]) for r in rows]
+
+    def get_imports_batch(self, modules: List[str]) -> Dict[str, List[str]]:
+        """Get imports for multiple modules in one query."""
+        if not modules:
+            return {}
+        conn = self._get_conn()
+        placeholders = ','.join('?' * len(modules))
+        rows = conn.execute(
+            f"SELECT source_module, target_module FROM imports WHERE source_module IN ({placeholders})",
+            modules,
+        ).fetchall()
+        result: Dict[str, List[str]] = {}
+        for s, t in rows:
+            result.setdefault(s, []).append(t)
+        return result
+
+    def get_imported_by_batch(self, modules: List[str]) -> Dict[str, List[str]]:
+        """Get reverse imports for multiple modules in one query."""
+        if not modules:
+            return {}
+        conn = self._get_conn()
+        placeholders = ','.join('?' * len(modules))
+        rows = conn.execute(
+            f"SELECT target_module, source_module FROM imports WHERE target_module IN ({placeholders})",
+            modules,
+        ).fetchall()
+        result: Dict[str, List[str]] = {}
+        for t, s in rows:
+            result.setdefault(t, []).append(s)
+        return result
 
     # ------------------------------------------------------------------
     # Memories
@@ -451,6 +605,97 @@ class DaemonDB:
         except sqlite3.OperationalError:
             return []
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Module importance (in-degree scoring)
+    # ------------------------------------------------------------------
+    def compute_importance(self) -> Dict[str, float]:
+        """Compute in-degree importance scores for all modules.
+
+        In-degree = number of modules that import this module.
+        Normalized to 0-1 range. Stored in module_importance table.
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT target_module, COUNT(*) as in_degree "
+            "FROM imports GROUP BY target_module"
+        ).fetchall()
+        if not rows:
+            return {}
+        max_deg = max(r[1] for r in rows)
+        if max_deg == 0:
+            return {}
+        raw_degrees = {r[0]: r[1] for r in rows}
+        scores = {name: deg / max_deg for name, deg in raw_degrees.items()}
+        now = time.time()
+        # Store in DB
+        conn.execute("DELETE FROM module_importance")
+        conn.executemany(
+            "INSERT INTO module_importance (module_name, in_degree, score, computed_at) "
+            "VALUES (?, ?, ?, ?)",
+            [(name, raw_degrees[name], score, now) for name, score in scores.items()],
+        )
+        conn.commit()
+        return scores
+
+    def get_importance(self, module_name: str) -> float:
+        """Get cached importance score for a module (0-1)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT score FROM module_importance WHERE module_name = ?",
+            (module_name,),
+        ).fetchone()
+        return row[0] if row else 0.0
+
+    def get_importance_batch(self, modules: List[str]) -> Dict[str, float]:
+        """Get importance scores for multiple modules."""
+        if not modules:
+            return {}
+        conn = self._get_conn()
+        placeholders = ','.join('?' * len(modules))
+        rows = conn.execute(
+            f"SELECT module_name, score FROM module_importance WHERE module_name IN ({placeholders})",
+            modules,
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------------------------
+    # Zero-result intelligence
+    # ------------------------------------------------------------------
+    def get_nearest_terms(self, query: str, limit: int = 5) -> List[str]:
+        """Find terms in the FTS index closest to query terms via fts5vocab prefix matching."""
+        conn = self._get_conn()
+        terms = query.strip().split()[:5]
+        results = []
+        for term in terms:
+            prefix = term[:3].lower()
+            if len(prefix) < 2:
+                continue
+            try:
+                rows = conn.execute(
+                    "SELECT term, doc FROM chunks_fts_vocab "
+                    "WHERE term >= ? AND term < ? ORDER BY doc DESC LIMIT ?",
+                    (prefix, prefix + '\uffff', limit),
+                ).fetchall()
+                results.extend(r[0] for r in rows)
+            except sqlite3.OperationalError:
+                pass  # fts5vocab table may not exist yet
+        # Deduplicate preserving order
+        return list(dict.fromkeys(results))[:limit]
+
+    def get_matching_file_names(self, query: str, limit: int = 5) -> List[str]:
+        """Find file paths that contain query terms."""
+        conn = self._get_conn()
+        terms = query.strip().split()[:5]
+        if not terms:
+            return []
+        conditions = " OR ".join(["file_path LIKE ?"] * len(terms))
+        like_params = [f"%{t}%" for t in terms]
+        rows = conn.execute(
+            f"SELECT DISTINCT file_path FROM chunks WHERE {conditions} LIMIT ?",
+            (*like_params, limit),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
     # Stats
