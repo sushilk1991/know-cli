@@ -25,7 +25,7 @@ import xxhash
 from know.config import Config
 from know.daemon_db import DaemonDB
 from know.logger import get_logger
-from know.parsers import ParserFactory, EXTENSION_TO_LANGUAGE
+from know.parsers import EXTENSION_TO_LANGUAGE
 
 logger = get_logger()
 
@@ -60,6 +60,97 @@ def _extract_body(
                 body = body[:MAX_CHUNK_BODY_CHARS] + "\n# ... truncated"
         return lines, body
     return lines, fallback
+
+
+def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
+    """Populate the daemon DB with code chunks (standalone, no daemon needed).
+
+    Called by the context engine on first use when the DB is empty.
+    Also used by KnowDaemon._full_index_sync().
+
+    Uses scanner.modules (ModuleInfo objects) directly to avoid re-parsing
+    every file.  The scanner already parsed each file during scan(); we only
+    need to read the raw content for body extraction and content hashing.
+
+    Returns (file_count, modules_list) so callers can build import graphs.
+    """
+    from know.scanner import CodebaseScanner
+
+    scanner = CodebaseScanner(config)
+    scanner.scan()
+    modules = scanner.modules  # List[ModuleInfo] — already parsed
+    count = 0
+
+    with db.batch():
+        for mod_info in modules:
+            path_str = str(mod_info.path)
+            abs_path = root / path_str
+
+            if not abs_path.exists():
+                continue
+
+            lang = EXTENSION_TO_LANGUAGE.get(abs_path.suffix.lower(), "")
+            if not lang:
+                continue
+
+            content = abs_path.read_text(encoding="utf-8", errors="replace")
+            content_hash = xxhash.xxh64(content.encode()).hexdigest()
+            stored_hash = db.get_file_hash(path_str)
+
+            if stored_hash == content_hash:
+                continue
+
+            chunks = []
+            lines = None
+
+            for func in mod_info.functions:
+                start = func.line_number
+                end = func.end_line if func.end_line >= start else start
+                chunk_type = "constant" if "constant" in func.decorators else (
+                    "method" if func.is_method else "function"
+                )
+                fallback = f"{func.signature}\n{func.docstring or ''}"
+                lines, body = _extract_body(lines, content, start, end, fallback)
+
+                chunks.append({
+                    "name": func.name,
+                    "type": chunk_type,
+                    "start_line": start,
+                    "end_line": end,
+                    "signature": func.signature,
+                    "body": body,
+                })
+
+            for cls in mod_info.classes:
+                start = cls.line_number
+                end = cls.end_line if cls.end_line >= start else start
+                fallback = f"class {cls.name}\n{cls.docstring or ''}"
+                lines, body = _extract_body(lines, content, start, end, fallback)
+
+                chunks.append({
+                    "name": cls.name,
+                    "type": "class",
+                    "start_line": start,
+                    "end_line": end,
+                    "signature": cls.name,
+                    "body": body,
+                })
+
+            if not chunks:
+                chunks.append({
+                    "name": mod_info.name,
+                    "type": "module",
+                    "start_line": 1,
+                    "end_line": content.count("\n") + 1,
+                    "signature": mod_info.name,
+                    "body": content[:MAX_CHUNK_BODY_CHARS],
+                })
+
+            db.upsert_chunks(path_str, lang, chunks)
+            db.update_file_index(path_str, content_hash, lang, len(chunks))
+            count += 1
+
+    return count, modules
 
 
 async def write_framed_message(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -313,99 +404,13 @@ class KnowDaemon:
 
     def _full_index_sync(self) -> int:
         """Synchronous indexing implementation (runs in thread pool)."""
-        from know.scanner import CodebaseScanner
-
-        scanner = CodebaseScanner(self.config)
-        structure = scanner.get_structure()
-        count = 0
-
-        for module in structure.get("modules", []):
-            path_str = module["path"] if isinstance(module, dict) else str(module.path)
-            abs_path = self.root / path_str
-
-            if not abs_path.exists():
-                continue
-
-            # Check if file changed
-            content = abs_path.read_text(encoding="utf-8", errors="replace")
-            content_hash = xxhash.xxh64(content.encode()).hexdigest()
-            stored_hash = self.db.get_file_hash(path_str)
-
-            if stored_hash == content_hash:
-                continue  # File unchanged
-
-            # Detect language and parse
-            lang = EXTENSION_TO_LANGUAGE.get(abs_path.suffix.lower(), "")
-            if not lang:
-                continue
-
-            parser = ParserFactory.get_parser_for_file(abs_path)
-            if not parser:
-                continue
-
-            try:
-                mod_info = parser.parse(abs_path, self.root)
-            except Exception as e:
-                logger.debug(f"Parse error for {path_str}: {e}")
-                continue
-
-            # Convert to chunk dicts — store actual source code
-            chunks = []
-            lines = None  # Lazy — only split when needed
-
-            for func in mod_info.functions:
-                start = func.line_number
-                end = func.end_line if func.end_line >= start else start
-                chunk_type = "constant" if "constant" in func.decorators else (
-                    "method" if func.is_method else "function"
-                )
-                fallback = f"{func.signature}\n{func.docstring or ''}"
-                lines, body = _extract_body(lines, content, start, end, fallback)
-
-                chunks.append({
-                    "name": func.name,
-                    "type": chunk_type,
-                    "start_line": start,
-                    "end_line": end,
-                    "signature": func.signature,
-                    "body": body,
-                })
-
-            for cls in mod_info.classes:
-                start = cls.line_number
-                end = cls.end_line if cls.end_line >= start else start
-                fallback = f"class {cls.name}\n{cls.docstring or ''}"
-                lines, body = _extract_body(lines, content, start, end, fallback)
-
-                chunks.append({
-                    "name": cls.name,
-                    "type": "class",
-                    "start_line": start,
-                    "end_line": end,
-                    "signature": cls.name,
-                    "body": body,
-                })
-
-            if not chunks:
-                # Store whole file as a module chunk
-                chunks.append({
-                    "name": mod_info.name,
-                    "type": "module",
-                    "start_line": 1,
-                    "end_line": content.count("\n") + 1,
-                    "signature": mod_info.name,
-                    "body": content[:MAX_CHUNK_BODY_CHARS],
-                })
-
-            self.db.upsert_chunks(path_str, lang, chunks)
-            self.db.update_file_index(path_str, content_hash, lang, len(chunks))
-            count += 1
+        count, modules = populate_index(self.root, self.config, self.db)
 
         # Build import graph so 'related' queries work
         try:
             from know.import_graph import ImportGraph
             ig = ImportGraph(self.config)
-            ig.build(structure.get("modules", []))
+            ig.build(modules)
         except Exception as e:
             logger.debug(f"Import graph build failed: {e}")
 

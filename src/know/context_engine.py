@@ -464,14 +464,26 @@ class ContextEngine:
         indexing_status = "complete" if stats["files"] > 0 else "indexing"
 
         if stats["files"] == 0:
-            # No index yet — fall back to legacy filesystem scan
-            logger.debug("DaemonDB empty, falling back to legacy filesystem scan")
-            result = self._build_context_legacy(
-                query, budget, include_tests, include_imports,
-            )
-            result["indexing_status"] = indexing_status
-            result["index_stats"] = stats
-            return result
+            # No index yet — populate DB inline (first-use indexing)
+            logger.debug("DaemonDB empty, running inline index population")
+            try:
+                from know.daemon import populate_index
+                indexed, _ = populate_index(self.config.root, self.config, db)
+                logger.debug(f"Inline indexing complete: {indexed} files")
+                stats = db.get_stats()
+                indexing_status = "complete" if stats["files"] > 0 else "indexing"
+            except Exception as e:
+                logger.warning(f"Inline indexing failed, falling back to legacy: {e}")
+
+            if stats["files"] == 0:
+                # Still empty after indexing attempt — fall back to legacy
+                logger.debug("DaemonDB still empty, falling back to legacy")
+                result = self._build_context_legacy(
+                    query, budget, include_tests, include_imports,
+                )
+                result["indexing_status"] = indexing_status
+                result["index_stats"] = stats
+                return result
 
         # Step 1: FTS5 search with BM25F weights
         raw_results = db.search_chunks(query, limit=100)
