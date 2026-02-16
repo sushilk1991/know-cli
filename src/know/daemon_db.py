@@ -120,26 +120,44 @@ CREATE TABLE IF NOT EXISTS file_index (
 """
 
 
+MAX_SEARCH_TERMS = 12
+
+
 class DaemonDB:
     """Unified project database with FTS5 search."""
 
     def __init__(self, project_root: Path):
         self.root = project_root
         self.db_path = project_root / ".know" / "daemon.db"
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
         self._lock = threading.Lock()
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
+        """Get a thread-local database connection."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
             with self._lock:
-                if self._conn is None:
-                    self.db_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-                    self._conn.row_factory = sqlite3.Row
-                    self._conn.execute("PRAGMA journal_mode=WAL")
-                    self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+        return conn
+
+    @staticmethod
+    def _build_fts_query(query: str) -> str:
+        """Build OR-based FTS5 query from natural language string.
+
+        Each term is double-quoted to disable FTS5 operator interpretation.
+        BM25 ranking naturally boosts chunks matching more terms.
+        """
+        terms = query.strip().split()[:MAX_SEARCH_TERMS]
+        if not terms:
+            return ""
+        return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
     def _init_db(self):
         conn = self._get_conn()
@@ -157,9 +175,10 @@ class DaemonDB:
             conn.commit()
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def __enter__(self):
         return self
@@ -208,8 +227,9 @@ class DaemonDB:
     def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """BM25 full-text search over code chunks."""
         conn = self._get_conn()
-        # Escape FTS5 special characters by quoting the query
-        safe_query = '"' + query.replace('"', '""') + '"'
+        safe_query = self._build_fts_query(query)
+        if not safe_query:
+            return []
         try:
             rows = conn.execute(
                 """SELECT c.*, rank
@@ -415,8 +435,9 @@ class DaemonDB:
     def recall_memories(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search memories using FTS5 BM25."""
         conn = self._get_conn()
-        # Escape FTS5 special characters by quoting the query
-        safe_query = '"' + query.replace('"', '""') + '"'
+        safe_query = self._build_fts_query(query)
+        if not safe_query:
+            return []
         try:
             rows = conn.execute(
                 """SELECT m.*, rank

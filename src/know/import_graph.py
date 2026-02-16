@@ -134,8 +134,7 @@ class ImportGraph:
                 for resolved, imp_type in targets:
                     mod_edges.append((resolved, imp_type))
 
-            if mod_edges:
-                edges_by_source[mod_name] = mod_edges
+            edges_by_source[mod_name] = mod_edges
 
         # Persist via DaemonDB
         total_edges = 0

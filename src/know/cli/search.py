@@ -32,13 +32,22 @@ from know.scanner import CodebaseScanner
 )
 @click.pass_context
 def search(ctx: click.Context, query: str, top_k: int, index: bool, chunk: bool) -> None:
-    """Search code semantically using embeddings."""
+    """Search code semantically using embeddings.
+
+    Falls back to BM25 keyword search if fastembed/numpy not installed.
+    """
     config = ctx.obj["config"]
 
-    from know.semantic_search import SemanticSearcher
+    try:
+        from know.semantic_search import SemanticSearcher
+        searcher = SemanticSearcher(project_root=config.root)
+        _search_semantic(ctx, config, searcher, query, top_k, index, chunk)
+    except ImportError:
+        _search_bm25_fallback(ctx, config, query, top_k)
 
-    searcher = SemanticSearcher(project_root=config.root)
 
+def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
+    """Semantic search using fastembed embeddings."""
     if index:
         if not ctx.obj.get("quiet"):
             console.print(f"[dim]Indexing {config.root}...[/dim]")
@@ -91,6 +100,60 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool, chunk: bool)
                 preview = r['preview'][:200].replace('\n', ' ')
                 console.print(f"   [dim]{preview}...[/dim]")
             console.print()
+
+
+def _search_bm25_fallback(ctx, config, query, top_k):
+    """BM25 keyword search fallback when fastembed/numpy not installed."""
+    from know.cli.agent import _get_daemon_client, _get_db_fallback
+
+    if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+        console.print("[dim]Using BM25 keyword search (fastembed not installed)[/dim]")
+
+    import time as _time
+    t0 = _time.monotonic()
+
+    client = _get_daemon_client(config)
+    if client:
+        try:
+            result = client.call_sync("search", {"query": query, "limit": top_k})
+            results = result.get("results", [])
+        except Exception:
+            client = None
+
+    if not client:
+        db = _get_db_fallback(config)
+        results = db.search_chunks(query, top_k)
+
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+
+    # Track stats
+    try:
+        from know.stats import StatsTracker
+        StatsTracker(config).record_search(query, len(results), duration_ms)
+    except Exception as e:
+        logger.debug(f"Stats tracking (search) failed: {e}")
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"results": results}))
+    elif ctx.obj.get("quiet"):
+        for r in results:
+            click.echo(f"{r.get('file_path', '')}:{r.get('chunk_name', '')}")
+    else:
+        if not results:
+            console.print("[yellow]No results found[/yellow]")
+            console.print("[dim]Tip: pip install know-cli[search] for semantic search[/dim]")
+            sys.exit(2)
+
+        console.print(f"\n[bold]Top {len(results)} results (BM25):[/bold]\n")
+        for i, r in enumerate(results, 1):
+            label = f"{r.get('file_path', '')}:{r.get('chunk_name', '')}"
+            console.print(f"{i}. {label}")
+            if r.get('signature'):
+                console.print(f"   [dim]{r['signature'][:200]}[/dim]")
+            console.print()
+
+        console.print("[dim]Tip: pip install know-cli[search] for semantic search[/dim]")
 
 
 @click.command()

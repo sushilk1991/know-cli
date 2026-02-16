@@ -114,15 +114,15 @@ class KnowDaemon:
         pf.parent.mkdir(parents=True, exist_ok=True)
         pf.write_text(str(os.getpid()))
 
-        # Initial indexing
-        await self._full_index()
-
+        # Start server FIRST — accept connections immediately
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=str(sock)
         )
-        # Restrict socket access to owner only
         os.chmod(str(sock), 0o600)
         logger.info(f"Daemon listening on {sock}")
+
+        # Index in background — queries use stale/cached data until done
+        self._index_task = asyncio.create_task(self._full_index())
 
         # Set up idle timeout check
         try:
