@@ -468,8 +468,23 @@ class ContextEngine:
             logger.debug("DaemonDB empty, running inline index population")
             try:
                 from know.daemon import populate_index
-                indexed, _ = populate_index(self.config.root, self.config, db)
+                indexed, modules = populate_index(self.config.root, self.config, db)
                 logger.debug(f"Inline indexing complete: {indexed} files")
+
+                # Build import graph so dependency budget gets filled
+                try:
+                    from know.import_graph import ImportGraph
+                    ig = ImportGraph(self.config)
+                    ig.build(modules)
+                except Exception as e:
+                    logger.debug(f"Inline import graph build failed: {e}")
+
+                # Compute importance scores (in-degree from import graph)
+                try:
+                    db.compute_importance()
+                except Exception as e:
+                    logger.debug(f"Inline importance computation failed: {e}")
+
                 stats = db.get_stats()
                 indexing_status = "complete" if stats["files"] > 0 else "indexing"
             except Exception as e:
