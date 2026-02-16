@@ -43,25 +43,8 @@ logger = get_logger()
 
 
 # ---------------------------------------------------------------------------
-# Shared daemon-first / fallback utility
+# Shared utility
 # ---------------------------------------------------------------------------
-
-def get_daemon_db(config: "Config"):
-    """Get a DaemonDB instance — daemon-first with direct DB fallback.
-
-    Use this instead of duplicating the pattern in each module.
-    """
-    if not os.environ.get("KNOW_NO_DAEMON"):
-        try:
-            from know.daemon import ensure_daemon
-            client = ensure_daemon(config.root, config)
-            return client
-        except Exception as e:
-            logger.debug(f"Daemon unavailable, using direct DB: {e}")
-
-    from know.daemon_db import DaemonDB
-    return DaemonDB(config.root)
-
 
 def get_direct_db(config: "Config"):
     """Get a direct DaemonDB connection (no daemon socket)."""
@@ -456,11 +439,24 @@ class ContextEngine:
         chunk_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """v3 context building via DaemonDB."""
-        from know.file_categories import apply_category_demotion
-        from know.ranking import apply_relevance_floor
-
         # Get DaemonDB (direct connection, no daemon socket needed)
         db = get_direct_db(self.config)
+        try:
+            return self._build_context_v3_inner(
+                db, query, budget, include_tests, include_imports,
+                include_patterns, exclude_patterns, chunk_types,
+            )
+        finally:
+            db.close()
+
+    def _build_context_v3_inner(
+        self, db, query: str, budget: int,
+        include_tests: bool, include_imports: bool,
+        include_patterns, exclude_patterns, chunk_types,
+    ) -> Dict[str, Any]:
+        """Inner v3 pipeline (db connection managed by caller)."""
+        from know.file_categories import apply_category_demotion
+        from know.ranking import apply_relevance_floor
 
         warnings: List[str] = []
 
@@ -659,11 +655,14 @@ class ContextEngine:
         self, db, seen_files: set, budget: int,
     ) -> Tuple[List[Dict], int]:
         """Get dependency signatures from DaemonDB."""
+        seen_modules = [
+            fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
+            for fp in seen_files
+        ]
+        imports_map = db.get_imports_batch(seen_modules)
         modules = set()
-        for fp in seen_files:
-            mod = fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
-            for imp in db.get_imports_of(mod):
-                modules.add(imp)
+        for targets in imports_map.values():
+            modules.update(targets)
 
         dep_chunks: List[Dict] = []
         used = 0
@@ -727,7 +726,7 @@ class ContextEngine:
     @staticmethod
     def _dict_to_chunk(d: Dict) -> CodeChunk:
         """Convert a DB dict to a CodeChunk for backward compatibility."""
-        return CodeChunk(
+        chunk = CodeChunk(
             file_path=d.get("file_path", ""),
             name=d.get("chunk_name", ""),
             chunk_type=d.get("chunk_type", "module"),
@@ -738,6 +737,14 @@ class ContextEngine:
             score=d.get("score", 0.0),
             tokens=d.get("token_count", 0),
         )
+        # Carry structural metadata from v3 pipeline
+        meta = {}
+        for key in ("imports", "imported_by", "test_file"):
+            if key in d:
+                meta[key] = d[key]
+        if meta:
+            chunk._metadata = meta
+        return chunk
 
     # ------------------------------------------------------------------
     # Legacy filesystem-based context building
@@ -850,7 +857,7 @@ class ContextEngine:
         import numpy as np
         model = _get_cached_embedding_model()
         if model is None:
-            return {}
+            return self._score_text(query, chunks)
 
         query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
         texts = [f"{c.name} {c.signature} {c.docstring} {c.body[:300]}" for c in chunks]
@@ -1152,4 +1159,7 @@ class ContextEngine:
             "summary_chunks": [],
             "overview": "",
             "warnings": warnings,
+            "indexing_status": "unknown",
+            "confidence": 0,
+            "index_stats": {},
         }

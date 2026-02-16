@@ -184,6 +184,8 @@ class DaemonDB:
         conn.executescript(_SCHEMA)
         conn.commit()
         self._migrate(conn)
+        # Cache FTS column count (schema doesn't change after init)
+        self._fts_cols = self._fts_column_count(conn)
 
     def _needs_fts_migration(self, conn: sqlite3.Connection) -> bool:
         """Check if FTS5 table needs migration to add file_path column.
@@ -243,6 +245,19 @@ class DaemonDB:
                 conn.commit()
         except sqlite3.OperationalError:
             pass  # FTS table may not exist yet on first run
+
+        # Track schema version
+        try:
+            row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
+            current = row[0] if row else 0
+            if current < 2:
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, migrated_at) VALUES (?, ?)",
+                    (2, time.time()),
+                )
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Table may not exist yet
 
     def close(self):
         conn = getattr(self._local, 'conn', None)
@@ -319,7 +334,7 @@ class DaemonDB:
         if not safe_query:
             return []
         try:
-            col_count = self._fts_column_count(conn)
+            col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
             if col_count == 4:
                 # New schema: BM25F with field weights
                 rows = conn.execute(
@@ -603,14 +618,15 @@ class DaemonDB:
         max_deg = max(r[1] for r in rows)
         if max_deg == 0:
             return {}
-        scores = {r[0]: r[1] / max_deg for r in rows}
+        raw_degrees = {r[0]: r[1] for r in rows}
+        scores = {name: deg / max_deg for name, deg in raw_degrees.items()}
         now = time.time()
         # Store in DB
         conn.execute("DELETE FROM module_importance")
         conn.executemany(
             "INSERT INTO module_importance (module_name, in_degree, score, computed_at) "
             "VALUES (?, ?, ?, ?)",
-            [(name, int(score * max_deg), score, now) for name, score in scores.items()],
+            [(name, raw_degrees[name], score, now) for name, score in scores.items()],
         )
         conn.commit()
         return scores
@@ -667,11 +683,10 @@ class DaemonDB:
         if not terms:
             return []
         conditions = " OR ".join(["file_path LIKE ?"] * len(terms))
-        params = [f"%{t}%" for t in terms]
-        params.append(limit)
+        like_params = [f"%{t}%" for t in terms]
         rows = conn.execute(
             f"SELECT DISTINCT file_path FROM chunks WHERE {conditions} LIMIT ?",
-            params,
+            (*like_params, limit),
         ).fetchall()
         return [r[0] for r in rows]
 
