@@ -33,6 +33,33 @@ IDLE_TIMEOUT = 1800  # 30 minutes
 SOCKET_DIR = Path.home() / ".know" / "sockets"
 PID_DIR = Path.home() / ".know" / "pids"
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_CHUNK_BODY_CHARS = 5000
+
+
+def _extract_body(
+    lines: list | None,
+    content: str,
+    start: int,
+    end: int,
+    fallback: str,
+) -> tuple:
+    """Extract source body from line range, with lazy line splitting.
+
+    Returns (lines_list, body_text). The lines_list is passed back so the
+    caller can reuse it across multiple calls without re-splitting.
+    """
+    if end > 0 and end >= start:
+        if lines is None:
+            lines = content.split("\n")
+        body = "\n".join(lines[start - 1 : end])
+        if len(body) > MAX_CHUNK_BODY_CHARS:
+            cut = body.rfind("\n", 0, MAX_CHUNK_BODY_CHARS)
+            if cut > 0:
+                body = body[:cut] + "\n# ... truncated"
+            else:
+                body = body[:MAX_CHUNK_BODY_CHARS] + "\n# ... truncated"
+        return lines, body
+    return lines, fallback
 
 
 async def write_framed_message(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -324,23 +351,16 @@ class KnowDaemon:
 
             # Convert to chunk dicts — store actual source code
             chunks = []
-            lines = content.split("\n")
+            lines = None  # Lazy — only split when needed
 
             for func in mod_info.functions:
                 start = func.line_number
-                end = func.end_line if func.end_line > start else start
+                end = func.end_line if func.end_line >= start else start
                 chunk_type = "constant" if "constant" in func.decorators else (
                     "method" if func.is_method else "function"
                 )
-
-                if end > start:
-                    # Have end_line — extract actual source
-                    body = "\n".join(lines[start - 1 : end])
-                    if len(body) > 5000:
-                        body = body[:5000] + "\n# ... truncated"
-                else:
-                    # Regex parser fallback — no end_line
-                    body = f"{func.signature}\n{func.docstring or ''}"
+                fallback = f"{func.signature}\n{func.docstring or ''}"
+                lines, body = _extract_body(lines, content, start, end, fallback)
 
                 chunks.append({
                     "name": func.name,
@@ -353,14 +373,9 @@ class KnowDaemon:
 
             for cls in mod_info.classes:
                 start = cls.line_number
-                end = cls.end_line if cls.end_line > start else start
-
-                if end > start:
-                    body = "\n".join(lines[start - 1 : end])
-                    if len(body) > 5000:
-                        body = body[:5000] + "\n# ... truncated"
-                else:
-                    body = f"class {cls.name}\n{cls.docstring or ''}"
+                end = cls.end_line if cls.end_line >= start else start
+                fallback = f"class {cls.name}\n{cls.docstring or ''}"
+                lines, body = _extract_body(lines, content, start, end, fallback)
 
                 chunks.append({
                     "name": cls.name,
@@ -379,7 +394,7 @@ class KnowDaemon:
                     "start_line": 1,
                     "end_line": content.count("\n") + 1,
                     "signature": mod_info.name,
-                    "body": content[:5000],  # Cap at 5000 chars
+                    "body": content[:MAX_CHUNK_BODY_CHARS],
                 })
 
             self.db.upsert_chunks(path_str, lang, chunks)

@@ -428,10 +428,7 @@ class PythonParser(BaseParser):
                 module.functions.append(self._parse_function(node, is_async=True))
             elif isinstance(node, ast.ClassDef):
                 module.classes.append(self._parse_class(node))
-
-        # Extract module-level UPPER_CASE constants
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
+            elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id.isupper():
                         end = getattr(node, 'end_lineno', node.lineno)

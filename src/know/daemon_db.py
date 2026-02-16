@@ -251,9 +251,11 @@ class DaemonDB:
             row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
             current = row[0] if row else 0
             if current < 3:
-                # v3: full source bodies stored — force reindex by clearing file_index
+                # v3: full source bodies stored — force reindex by clearing all indexed data
                 try:
                     conn.execute("DELETE FROM file_index")
+                    conn.execute("DELETE FROM chunks")
+                    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
                 except sqlite3.OperationalError:
                     pass
                 conn.execute(
