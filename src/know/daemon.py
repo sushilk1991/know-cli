@@ -157,8 +157,8 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
                     call_refs = parser.extract_call_refs(content, mod_info)
                     if call_refs:
                         db.upsert_symbol_refs(path_str, call_refs)
-            except Exception:
-                pass  # Don't fail indexing if call extraction fails
+            except Exception as e:
+                logger.debug(f"Call extraction failed for {path_str}: {e}")
 
             count += 1
 

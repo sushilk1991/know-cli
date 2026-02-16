@@ -320,17 +320,19 @@ class DaemonDB:
         try:
             row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
             current = row[0] if row else 0
-            if current < 3:
-                # v3: full source bodies stored — force reindex by clearing all indexed data
+            if current < 4:
+                # v3: full source bodies stored
+                # v4: symbol_refs table for call graph — force reindex
                 try:
                     conn.execute("DELETE FROM file_index")
                     conn.execute("DELETE FROM chunks")
+                    conn.execute("DELETE FROM symbol_refs")
                     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
                 except sqlite3.OperationalError:
                     pass
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
-                    (3, time.time()),
+                    (4, time.time()),
                 )
                 conn.commit()
         except sqlite3.OperationalError:
@@ -585,6 +587,7 @@ class DaemonDB:
         conn = self._get_conn()
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
         conn.execute("DELETE FROM file_index WHERE file_path = ?", (file_path,))
+        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
         self._commit(conn)
 
     # ------------------------------------------------------------------

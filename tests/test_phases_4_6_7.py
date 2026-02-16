@@ -19,7 +19,8 @@ from know.models import FunctionInfo, ClassInfo, ModuleInfo
 def db(tmp_path):
     """Create a DaemonDB with test data."""
     db = DaemonDB(tmp_path)
-    return db
+    yield db
+    db.close()
 
 
 @pytest.fixture

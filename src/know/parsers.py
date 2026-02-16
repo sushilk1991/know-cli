@@ -393,7 +393,7 @@ class TreeSitterParser(BaseParser):
 
     def _walk_calls(self, node, content: bytes, chunk_ranges, refs):
         """Recursively walk AST to find call expressions."""
-        if node.type == "call" or node.type == "call_expression":
+        if node.type in ("call", "call_expression", "method_invocation"):
             # Extract the function name being called
             func_node = node.children[0] if node.children else None
             if func_node:
@@ -728,6 +728,11 @@ class TypeScriptParser(TypeScriptRegexParser):
             return self._delegate.parse(path, root)
         return TypeScriptRegexParser.parse(self, path, root)
 
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        if self._delegate:
+            return self._delegate.extract_call_refs(content, module)
+        return []
+
 
 class GoParser(GoRegexParser):
     """Go parser — delegates to tree-sitter or regex."""
@@ -743,6 +748,11 @@ class GoParser(GoRegexParser):
         if self._delegate:
             return self._delegate.parse(path, root)
         return GoRegexParser.parse(self, path, root)
+
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        if self._delegate:
+            return self._delegate.extract_call_refs(content, module)
+        return []
 
 
 # ---------------------------------------------------------------------------
