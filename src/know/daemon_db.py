@@ -142,22 +142,30 @@ MAX_SEARCH_TERMS = 12
 
 
 class _BatchContext:
-    """Defers commits until the batch exits, then commits once."""
+    """Defers commits until the outermost batch exits, then commits once.
+
+    Supports nesting: inner batches are no-ops.  Thread-safe: batch depth
+    is tracked per-thread via ``threading.local()``.
+    """
 
     def __init__(self, db: "DaemonDB"):
         self._db = db
 
     def __enter__(self):
-        self._db._in_batch = True
+        local = self._db._local
+        depth = getattr(local, "batch_depth", 0)
+        local.batch_depth = depth + 1
         return self._db
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._db._in_batch = False
-        conn = self._db._get_conn()
-        if exc_type is None:
-            conn.commit()
-        else:
-            conn.rollback()
+        local = self._db._local
+        local.batch_depth -= 1
+        if local.batch_depth == 0:
+            conn = self._db._get_conn()
+            if exc_type is None:
+                conn.commit()
+            else:
+                conn.rollback()
         return False  # don't suppress exceptions
 
 
@@ -169,7 +177,6 @@ class DaemonDB:
         self.db_path = project_root / ".know" / "daemon.db"
         self._local = threading.local()
         self._lock = threading.Lock()
-        self._in_batch = False
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -187,8 +194,8 @@ class DaemonDB:
         return conn
 
     def _commit(self, conn: sqlite3.Connection) -> None:
-        """Commit unless inside a batch() context."""
-        if not self._in_batch:
+        """Commit unless inside a batch() context (thread-safe)."""
+        if getattr(self._local, "batch_depth", 0) == 0:
             conn.commit()
 
     def batch(self):
