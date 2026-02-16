@@ -28,6 +28,7 @@ graph TB
     daemon --> logger
     daemon --> parsers
     daemon --> scanner
+    daemon --> import_graph
     ai --> config
     diff --> config
     diff --> scanner
@@ -113,6 +114,8 @@ graph TB
     agent --> daemon_db
     agent --> token_counter
     agent --> daemon
+    agent --> import_graph
+    agent --> scanner
     mcp --> mcp_server
 ```
 
