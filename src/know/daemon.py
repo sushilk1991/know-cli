@@ -422,12 +422,10 @@ class KnowDaemon:
         session_id = params.get("session_id")
 
         from know.context_engine import ContextEngine
-        engine = ContextEngine.__new__(ContextEngine)
-        engine.db = self.db
-        engine.root = self.root
+        engine = ContextEngine(self.config)
         result = engine.build_deep_context(
             name, budget=budget, include_tests=include_tests,
-            session_id=session_id,
+            session_id=session_id, db=self.db,
         )
         return result
 

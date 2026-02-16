@@ -1346,13 +1346,16 @@ class ContextEngine:
         budget: int = 3000,
         include_tests: bool = False,
         session_id: Optional[str] = None,
+        db=None,
     ) -> Dict[str, Any]:
         """Build deep context for a function: body + callers + callees.
 
         Returns a dict with target, callees, callers, overflow_signatures,
         budget_used, budget, and optional session_id.
+
+        Args:
+            db: Optional pre-existing DaemonDB instance (avoids creating a new one).
         """
-        db = getattr(self, "db", None)
         needs_close = False
         if db is None:
             db = get_direct_db(self.config)
@@ -1497,8 +1500,8 @@ class ContextEngine:
                 token_list.append(c.get("tokens", 0))
             try:
                 db.mark_session_seen(session_id, chunk_keys, token_list)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Session mark_seen failed in deep context: {e}")
             result["session_id"] = session_id
 
         return result
@@ -1529,9 +1532,6 @@ class ContextEngine:
                 c for c in all_matches
                 if class_hint in c.get("chunk_name", "") or class_hint in c.get("file_path", "")
             ]
-            if not candidates:
-                # Try searching for "Class.method" as chunk_name directly
-                candidates = db.get_chunks_by_name(name)
 
         if not candidates:
             return []

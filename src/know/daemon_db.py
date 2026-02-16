@@ -164,7 +164,8 @@ CREATE TABLE IF NOT EXISTS session_seen (
     PRIMARY KEY (session_id, chunk_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_session_seen_sid ON session_seen(session_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(chunk_name);
+-- Note: idx_session_seen_sid not needed — PK (session_id, chunk_key) already covers session_id lookups
 """
 
 
@@ -566,7 +567,8 @@ class DaemonDB:
         Returns: file_path, chunk_name, chunk_type, signature, start_line, end_line, score,
                  plus first line of body as docstring hint.
         """
-        results = self.search_chunks(query, limit=limit)
+        fetch_limit = limit * 3 if chunk_type else limit
+        results = self.search_chunks(query, limit=fetch_limit)
         sigs = []
         for r in results:
             if chunk_type and r.get("chunk_type") != chunk_type:
@@ -950,7 +952,7 @@ class DaemonDB:
         conn = self._get_conn()
         now = time.time()
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
+            "INSERT OR IGNORE INTO sessions (session_id, created_at, last_used_at) "
             "VALUES (?, ?, ?)",
             (session_id, now, now),
         )
