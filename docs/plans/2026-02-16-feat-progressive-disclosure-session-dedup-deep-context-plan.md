@@ -90,11 +90,11 @@ def map_cmd(ctx, query, limit, chunk_type):
 ```
 
 **Key decisions:**
-- [ ] Reuses existing `search_chunks()` pipeline but projects only signature fields
-- [ ] Includes first line of docstring (capped at 120 chars) for decision-making context
-- [ ] Default limit=20, max=100
-- [ ] Does NOT add to session seen-set (no bodies returned)
-- [ ] Uses `click.echo` for JSON (not `console.print`) to avoid Rich ANSI contamination
+- [x] Reuses existing `search_chunks()` pipeline but projects only signature fields
+- [x] Includes first line of docstring (capped at 120 chars) for decision-making context
+- [x] Default limit=20, max=100
+- [x] Does NOT add to session seen-set (no bodies returned)
+- [x] Uses `click.echo` for JSON (not `console.print`) to avoid Rich ANSI contamination
 
 **Files to modify:**
 - `src/know/cli/agent.py` — add `map_cmd` command
@@ -176,11 +176,11 @@ def build_context(self, query, budget=8000, session_id=None, ...):
 ```
 
 **Key decisions:**
-- [ ] Budget is re-filled after dedup (lower-ranked new results promoted to fill freed space)
-- [ ] Chunk key format: `"file_path:chunk_name:start_line"` (matches existing `seen_chunk_keys` pattern)
-- [ ] `know deep` also participates: returned function + callers/callees are marked seen
-- [ ] `know map` does NOT mark anything seen (no bodies returned)
-- [ ] `--session` is a CLI flag on `context` and `deep` commands
+- [x] Budget is re-filled after dedup (lower-ranked new results promoted to fill freed space)
+- [x] Chunk key format: `"file_path:chunk_name:start_line"` (matches existing `seen_chunk_keys` pattern)
+- [x] `know deep` also participates: returned function + callers/callees are marked seen
+- [x] `know map` does NOT mark anything seen (no bodies returned)
+- [x] `--session` is a CLI flag on `context` and `deep` commands
 
 **DaemonDB methods to add:**
 - `create_session(session_id) -> str`
@@ -302,13 +302,13 @@ Within callee/caller budgets, prioritize by:
 ```
 
 **Edge cases:**
-- [ ] Function not found → exit code 2, JSON `{"error": "not_found", "nearest": [...]}`
-- [ ] Ambiguous name → exit code 1, JSON `{"error": "ambiguous", "candidates": [...]}`
-- [ ] No call graph (regex-parsed files) → return body only, `"call_graph_available": false`, warning in stderr
-- [ ] 50+ callees → budget overflow: include as many full bodies as fit, rest as signatures in `overflow_signatures`
-- [ ] Self-referential/mutual recursion → deduplicate by chunk_key, never include target in its own callers/callees
-- [ ] External calls (stdlib/third-party) → listed in `overflow_signatures` as "external: json.dumps" (no body)
-- [ ] Body exceeds 50% budget → truncate body at budget * 0.50, add "# ... truncated" marker
+- [x] Function not found → exit code 2, JSON `{"error": "not_found", "nearest": [...]}`
+- [x] Ambiguous name → exit code 1, JSON `{"error": "ambiguous", "candidates": [...]}`
+- [x] No call graph (regex-parsed files) → return body only, `"call_graph_available": false`, warning in stderr
+- [x] 50+ callees → budget overflow: include as many full bodies as fit, rest as signatures in `overflow_signatures`
+- [x] Self-referential/mutual recursion → deduplicate by chunk_key, never include target in its own callers/callees
+- [x] External calls (stdlib/third-party) → listed in `overflow_signatures` as "external: json.dumps" (no body)
+- [x] Body exceeds 50% budget → truncate body at budget * 0.50, add "# ... truncated" marker
 
 **Files to modify:**
 - `src/know/context_engine.py` — add `build_deep_context()` method
@@ -402,81 +402,81 @@ know remember "key finding" --tags "billing"
 ## Implementation Phases
 
 ### Phase 1: `know map` command
-- [ ] Add `search_signatures()` to `daemon_db.py` — search_chunks but returns only sig fields + first-line docstring
-- [ ] Add `_handle_map` to `daemon.py` handler dispatch
-- [ ] Add `map_cmd` to `cli/agent.py` with `--limit`, `--type` options
-- [ ] Register in `cli/__init__.py`
-- [ ] Add tests: zero results, limit, type filter, JSON output, Rich output
-- [ ] **Verify**: `know --json map "billing" --limit 10` returns signatures only, ~50 tokens/result
+- [x] Add `search_signatures()` to `daemon_db.py` — search_chunks but returns only sig fields + first-line docstring
+- [x] Add `_handle_map` to `daemon.py` handler dispatch
+- [x] Add `map_cmd` to `cli/agent.py` with `--limit`, `--type` options
+- [x] Register in `cli/__init__.py`
+- [x] Add tests: zero results, limit, type filter, JSON output, Rich output
+- [x] **Verify**: `know --json map "billing" --limit 10` returns signatures only, ~50 tokens/result
 
 ### Phase 2: Session-aware dedup
-- [ ] Add `sessions` and `session_seen` tables to `daemon_db.py` schema
-- [ ] Bump `SCHEMA_VERSION` to 5 (force reindex not needed — additive tables only)
-- [ ] Add session CRUD methods to `DaemonDB`
-- [ ] Add `--session` flag to `context` command in `cli/search.py`
-- [ ] Modify `build_context()` / `_build_context_v3_inner()` in `context_engine.py` to filter seen chunks and re-fill budget
-- [ ] Add `session_id` to JSON response
-- [ ] Add session param to `_handle_context` in `daemon.py`
-- [ ] Add lazy cleanup in daemon startup: `cleanup_expired_sessions()`
-- [ ] Add tests: first call creates session, second call deduplicates, expired session creates new, budget re-fills after dedup, no session = backward compatible
-- [ ] **Verify**: Two sequential `know context` calls with same session return zero overlap
+- [x] Add `sessions` and `session_seen` tables to `daemon_db.py` schema
+- [x] Bump `SCHEMA_VERSION` to 5 (force reindex not needed — additive tables only)
+- [x] Add session CRUD methods to `DaemonDB`
+- [x] Add `--session` flag to `context` command in `cli/search.py`
+- [x] Modify `build_context()` / `_build_context_v3_inner()` in `context_engine.py` to filter seen chunks and re-fill budget
+- [x] Add `session_id` to JSON response
+- [x] Add session param to `_handle_context` in `daemon.py`
+- [x] Add lazy cleanup in daemon startup: `cleanup_expired_sessions()`
+- [x] Add tests: first call creates session, second call deduplicates, expired session creates new, budget re-fills after dedup, no session = backward compatible
+- [x] **Verify**: Two sequential `know context` calls with same session return zero overlap
 
 ### Phase 3: `know deep` command
-- [ ] Add `get_chunks_by_name()` to `daemon_db.py`
-- [ ] Add `resolve_function()` to `context_engine.py` — name resolution with disambiguation
-- [ ] Add `build_deep_context()` to `context_engine.py` — budget allocation + call graph assembly
-- [ ] Add `_handle_deep` to `daemon.py`
-- [ ] Add `deep` command to `cli/agent.py` with `--budget`, `--session`, `--include-tests` options
-- [ ] Register in `cli/__init__.py`
-- [ ] Handle edge cases: not found, ambiguous, no call graph, budget overflow, self-referential
-- [ ] Add `--session` support (mark returned chunks as seen)
-- [ ] Add tests: single match, ambiguous name, file:name resolution, callees included, callers included, budget overflow → signatures, no symbol_refs → body only with warning, session integration
-- [ ] **Verify**: `know --json deep "check_cloud_access" --budget 3000` returns target + callees + callers
+- [x] Add `get_chunks_by_name()` to `daemon_db.py`
+- [x] Add `resolve_function()` to `context_engine.py` — name resolution with disambiguation
+- [x] Add `build_deep_context()` to `context_engine.py` — budget allocation + call graph assembly
+- [x] Add `_handle_deep` to `daemon.py`
+- [x] Add `deep` command to `cli/agent.py` with `--budget`, `--session`, `--include-tests` options
+- [x] Register in `cli/__init__.py`
+- [x] Handle edge cases: not found, ambiguous, no call graph, budget overflow, self-referential
+- [x] Add `--session` support (mark returned chunks as seen)
+- [x] Add tests: single match, ambiguous name, file:name resolution, callees included, callers included, budget overflow → signatures, no symbol_refs → body only with warning, session integration
+- [x] **Verify**: `know --json deep "check_cloud_access" --budget 3000` returns target + callees + callers
 
 ### Phase 4: README rewrite
-- [ ] Rewrite `README.md` with new 3-tier structure
-- [ ] Update benchmark table with farfield results (762 files, 14 vs 36 tool calls)
-- [ ] Add `know map` and `know deep` examples
-- [ ] Add session workflow example
-- [ ] Update command reference table
-- [ ] Keep installation section, update feature list
+- [x] Rewrite `README.md` with new 3-tier structure
+- [x] Update benchmark table with farfield results (762 files, 14 vs 36 tool calls)
+- [x] Add `know map` and `know deep` examples
+- [x] Add session workflow example
+- [x] Update command reference table
+- [x] Keep installation section, update feature list
 
 ### Phase 5: Agent skill update
-- [ ] Rewrite `~/.claude/skills/know-cli/SKILL.md` with Map → Context → Deep workflow
-- [ ] Update description in frontmatter for better skill discovery
-- [ ] Add "When to Use What" decision guide
-- [ ] Add session usage guidelines
-- [ ] Keep backward-compatible advice (remember/recall, signatures, related still work)
+- [x] Rewrite `~/.claude/skills/know-cli/SKILL.md` with Map → Context → Deep workflow
+- [x] Update description in frontmatter for better skill discovery
+- [x] Add "When to Use What" decision guide
+- [x] Add session usage guidelines
+- [x] Keep backward-compatible advice (remember/recall, signatures, related still work)
 
 ### Phase 6: Bump version and publish
-- [ ] Bump version to 0.7.0 in `pyproject.toml`
-- [ ] Run full test suite: `pytest tests/ -q --ignore=tests/test_week4.py`
-- [ ] Build and publish to PyPI
-- [ ] Install via pipx: `pipx install know-cli==0.7.0 --force`
-- [ ] Test on farfield project: `know map "billing"`, `know context "billing" --session auto`, `know deep "check_cloud_access"`
+- [x] Bump version to 0.7.0 in `pyproject.toml`
+- [x] Run full test suite: `pytest tests/ -q --ignore=tests/test_week4.py`
+- [x] Build and publish to PyPI
+- [x] Install via pipx: `pipx install know-cli==0.7.0 --force`
+- [x] Test on farfield project: `know map "billing"`, `know context "billing" --session auto`, `know deep "check_cloud_access"`
 
 ## Acceptance Criteria
 
 ### Functional Requirements
 
-- [ ] `know map "query"` returns signatures + first-line docstrings, no bodies
-- [ ] `know map` JSON output averages <60 tokens per result
-- [ ] `know context --session auto` returns a session_id and deduplicates on follow-up calls
-- [ ] Second `context` call with same session returns zero overlapping chunks
-- [ ] Session dedup re-fills budget with lower-ranked new results (not short-changed budget)
-- [ ] `know deep "fn"` returns target body + callers + callees within budget
-- [ ] `know deep` handles ambiguous names with candidate list error
-- [ ] `know deep` with no call graph returns body only + `call_graph_available: false`
-- [ ] All new commands support `--json` flag correctly (no Rich ANSI contamination)
-- [ ] All new commands work via daemon AND direct DB fallback
-- [ ] Backward compatibility: existing commands unchanged when `--session` is not used
+- [x] `know map "query"` returns signatures + first-line docstrings, no bodies
+- [x] `know map` JSON output averages <60 tokens per result
+- [x] `know context --session auto` returns a session_id and deduplicates on follow-up calls
+- [x] Second `context` call with same session returns zero overlapping chunks
+- [x] Session dedup re-fills budget with lower-ranked new results (not short-changed budget)
+- [x] `know deep "fn"` returns target body + callers + callees within budget
+- [x] `know deep` handles ambiguous names with candidate list error
+- [x] `know deep` with no call graph returns body only + `call_graph_available: false`
+- [x] All new commands support `--json` flag correctly (no Rich ANSI contamination)
+- [x] All new commands work via daemon AND direct DB fallback
+- [x] Backward compatibility: existing commands unchanged when `--session` is not used
 
 ### Quality Gates
 
-- [ ] All existing tests pass (169 core + 27 v2)
-- [ ] 20+ new tests covering map, session dedup, deep, edge cases
-- [ ] README includes real benchmark numbers
-- [ ] Skill file teaches 3-tier workflow with clear decision criteria
+- [x] All existing tests pass (169 core + 27 v2)
+- [x] 20+ new tests covering map, session dedup, deep, edge cases
+- [x] README includes real benchmark numbers
+- [x] Skill file teaches 3-tier workflow with clear decision criteria
 
 ## Success Metrics
 
