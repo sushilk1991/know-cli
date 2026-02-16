@@ -517,25 +517,86 @@ class ContextEngine:
         # Step 2: Apply file category demotion
         raw_results = apply_category_demotion(raw_results, query)
 
+        # Step 2.5: Importance boost — boost high-in-degree modules
+        try:
+            file_paths = list({r["file_path"] for r in raw_results})
+            modules = [
+                fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
+                for fp in file_paths
+            ]
+            importance_scores = db.get_importance_batch(modules)
+            fp_to_importance = {}
+            for fp, mod in zip(file_paths, modules):
+                fp_to_importance[fp] = importance_scores.get(mod, 0.0)
+            for r in raw_results:
+                imp = fp_to_importance.get(r["file_path"], 0.0)
+                # Boost by up to 50% based on module importance
+                r["score"] = r.get("score", 0) * (1.0 + 0.5 * imp)
+        except Exception:
+            pass
+
+        # Step 2.6: Git recency boost — boost recently changed files
+        try:
+            file_paths = list({r["file_path"] for r in raw_results})
+            recency_scores = _get_batch_file_recency(self.root, file_paths)
+            for r in raw_results:
+                recency = recency_scores.get(r["file_path"], 0.0)
+                # Boost by up to 20% based on recency
+                r["score"] = r.get("score", 0) * (1.0 + 0.2 * recency)
+        except Exception:
+            pass
+
+        # Step 2.7: File-path exact match boost
+        try:
+            from know.query import analyze_query
+            plan = analyze_query(query)
+            path_terms = set(t.lower() for t in plan.identifiers + plan.terms)
+            for r in raw_results:
+                fp_lower = r["file_path"].lower()
+                # Check if any search term appears in the file path
+                for term in path_terms:
+                    if term in fp_lower:
+                        r["score"] = r.get("score", 0) * 2.0
+                        break
+        except Exception:
+            pass
+
         # Step 3: Apply file path filtering
         if include_patterns or exclude_patterns or chunk_types:
             raw_results = self._apply_filters(
                 raw_results, include_patterns, exclude_patterns, chunk_types,
             )
 
-        # Step 4: Re-sort by demoted scores
+        # Step 4: Re-sort by boosted scores
         raw_results.sort(key=lambda c: c.get("score", 0), reverse=True)
 
         # Step 5: Apply relevance floor (return under budget, not noise)
         raw_results = apply_relevance_floor(raw_results)
 
-        # Step 6: compute sub-budgets
-        budget_code = int(budget * self.ALLOC_CODE)
-        budget_imports = int(budget * self.ALLOC_IMPORTS) if include_imports else 0
-        budget_summaries = int(budget * self.ALLOC_SUMMARIES)
-        budget_overview = int(budget * self.ALLOC_OVERVIEW)
+        # Step 6: compute sub-budgets (adaptive by query type)
+        try:
+            from know.query import analyze_query
+            plan = analyze_query(query)
+            qtype = plan.query_type
+        except Exception:
+            qtype = "concept"
+
+        if qtype == "identifier":
+            # Identifier queries: maximize code, minimize fluff
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.80, 0.15, 0.05, 0.00
+        elif qtype == "error":
+            # Error queries: lots of code, skip overview
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.70, 0.15, 0.15, 0.00
+        else:
+            # Concept queries: balanced
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.60, 0.15, 0.15, 0.10
+
+        budget_code = int(budget * alloc_code)
+        budget_imports = int(budget * alloc_imports) if include_imports else 0
+        budget_summaries = int(budget * alloc_summaries)
+        budget_overview = int(budget * alloc_overview)
         if not include_imports:
-            budget_code += int(budget * self.ALLOC_IMPORTS)
+            budget_code += int(budget * alloc_imports)
 
         # Step 7: greedily fill code budget using pre-computed token_count
         code_chunks: List[Dict] = []

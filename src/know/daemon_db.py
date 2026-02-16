@@ -219,13 +219,20 @@ class DaemonDB:
     def _build_fts_query(query: str) -> str:
         """Build OR-based FTS5 query from natural language string.
 
-        Each term is double-quoted to disable FTS5 operator interpretation.
-        BM25 ranking naturally boosts chunks matching more terms.
+        Uses query understanding to strip stop words, detect identifiers,
+        and build a smarter FTS5 query.  Falls back to raw split if the
+        query module is unavailable.
         """
-        terms = query.strip().split()[:MAX_SEARCH_TERMS]
-        if not terms:
-            return ""
-        return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            from know.query import analyze_query, build_fts_or_query
+            plan = analyze_query(query)
+            return build_fts_or_query(plan.all_search_terms)
+        except Exception:
+            # Fallback: raw whitespace split (pre-v3 behavior)
+            terms = query.strip().split()[:MAX_SEARCH_TERMS]
+            if not terms:
+                return ""
+            return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
     def _init_db(self):
         conn = self._get_conn()
@@ -381,19 +388,113 @@ class DaemonDB:
         return 3  # chunk_name, signature, body (old schema)
 
     def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """BM25F full-text search over code chunks with field weighting.
+        """Dual-lane search: OR + AND + exact-name match, fused via RRF.
 
-        Weights: chunk_name=5.0, file_path=5.0, signature=3.0, body=1.0
-        Falls back to equal weights on old 3-column schema.
+        Lane 1: FTS5 BM25F with OR query (broad recall)
+        Lane 2: FTS5 BM25F with AND query (high precision — all terms must match)
+        Lane 3: LIKE match on chunk_name for detected identifiers (exact match)
+
+        Results fused via Reciprocal Rank Fusion with lane-specific weights:
+        AND results get 2x weight, exact name matches get 3x.
         """
+        from know.query import analyze_query, build_fts_or_query, build_fts_and_query
+        from know.ranking import fuse_rankings
+
+        plan = analyze_query(query)
         conn = self._get_conn()
-        safe_query = self._build_fts_query(query)
-        if not safe_query:
+        col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
+
+        lanes: List[List[Dict[str, Any]]] = []
+
+        # Lane 1: OR query (broad recall)
+        or_query = build_fts_or_query(plan.all_search_terms)
+        if or_query:
+            lane1 = self._fts_search(conn, or_query, col_count, limit * 3)
+            if lane1:
+                lanes.append(lane1)
+
+        # Lane 2: AND query (high precision)
+        and_query = build_fts_and_query(plan.all_search_terms)
+        if and_query:
+            lane2 = self._fts_search(conn, and_query, col_count, limit * 2)
+            if lane2:
+                lanes.append(lane2)
+
+        # Lane 3: Exact name match for identifiers
+        lane3: List[Dict[str, Any]] = []
+        for ident in plan.identifiers:
+            try:
+                rows = conn.execute(
+                    """SELECT c.*, 100.0 AS score FROM chunks c
+                       WHERE c.chunk_name LIKE ? LIMIT ?""",
+                    (f"%{ident}%", limit),
+                ).fetchall()
+                lane3.extend(dict(r) for r in rows)
+            except sqlite3.OperationalError:
+                pass
+
+        # Also match file_path components for identifiers
+        for ident in plan.identifiers:
+            try:
+                rows = conn.execute(
+                    """SELECT c.*, 80.0 AS score FROM chunks c
+                       WHERE c.file_path LIKE ? LIMIT ?""",
+                    (f"%{ident}%", limit),
+                ).fetchall()
+                lane3.extend(dict(r) for r in rows)
+            except sqlite3.OperationalError:
+                pass
+
+        if lane3:
+            lanes.append(lane3)
+
+        if not lanes:
             return []
+
+        # If only one lane returned results, skip fusion
+        if len(lanes) == 1:
+            return lanes[0][:limit]
+
+        # RRF fusion with lane-specific weights
+        # Convert to (chunk_key, score) format for fuse_rankings
+        ranked_lists = []
+        for i, lane in enumerate(lanes):
+            # Lane weights: lane1 (OR)=1x, lane2 (AND)=2x, lane3 (exact)=3x
+            weight = [1, 2, 3][min(i, 2)]
+            keyed = []
+            for chunk in lane:
+                key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
+                keyed.append((key, chunk.get("score", 0)))
+            # Repeat the lane to give it more weight in RRF
+            for _ in range(weight):
+                ranked_lists.append(keyed)
+
+        fused = fuse_rankings(ranked_lists)
+
+        # Map back to full chunk dicts
+        chunk_map: Dict[str, Dict] = {}
+        for lane in lanes:
+            for chunk in lane:
+                key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
+                if key not in chunk_map:
+                    chunk_map[key] = chunk
+
+        results = []
+        for key, fused_score in fused[:limit]:
+            if key in chunk_map:
+                chunk = chunk_map[key]
+                chunk["score"] = fused_score
+                results.append(chunk)
+
+        return results
+
+    def _fts_search(
+        self, conn: sqlite3.Connection, fts_query: str,
+        col_count: int, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Execute a single FTS5 search query and return results."""
         try:
-            col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
             if col_count == 4:
-                # New schema: BM25F with field weights
                 rows = conn.execute(
                     """SELECT c.*, -bm25(chunks_fts, 5.0, 5.0, 3.0, 1.0) AS score
                        FROM chunks_fts
@@ -401,10 +502,9 @@ class DaemonDB:
                        WHERE chunks_fts MATCH ?
                        ORDER BY score DESC
                        LIMIT ?""",
-                    (safe_query, limit),
+                    (fts_query, limit),
                 ).fetchall()
             else:
-                # Old schema: default BM25 ranking
                 rows = conn.execute(
                     """SELECT c.*, rank AS score
                        FROM chunks_fts
@@ -412,11 +512,11 @@ class DaemonDB:
                        WHERE chunks_fts MATCH ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (safe_query, limit),
+                    (fts_query, limit),
                 ).fetchall()
+            return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
-        return [dict(r) for r in rows]
 
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Get all chunks for a file."""
