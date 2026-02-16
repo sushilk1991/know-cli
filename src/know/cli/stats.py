@@ -158,7 +158,15 @@ def status(ctx: click.Context) -> None:
 
     console.print(f"\n[green]✓[/green] [bold]know-cli v{__version__}[/bold]")
     console.print(f"  Project: {config.root}")
-    console.print(f"  Files: {n_files} Python")
+    # Build language breakdown
+    lang_counts = {}
+    try:
+        for _, lang in scanner._discover_files():
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+    except Exception:
+        lang_counts = {"files": n_files}
+    lang_str = ", ".join(f"{c} {l.title()}" for l, c in sorted(lang_counts.items(), key=lambda x: -x[1]))
+    console.print(f"  Files: {lang_str or n_files}")
     console.print(f"  Functions: {n_functions}")
     console.print(f"  Indexed: {index_age}")
     console.print(f"  Memories: {mem_count}")
