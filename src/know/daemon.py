@@ -367,6 +367,13 @@ class KnowDaemon:
         except Exception as e:
             logger.debug(f"Import graph build failed: {e}")
 
+        # Compute module importance scores (in-degree)
+        try:
+            scores = self.db.compute_importance()
+            logger.info(f"Computed importance for {len(scores)} modules")
+        except Exception as e:
+            logger.debug(f"Importance computation failed: {e}")
+
         return count
 
 

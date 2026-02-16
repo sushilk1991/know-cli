@@ -182,6 +182,29 @@ def _search_bm25_fallback(ctx, config, query, top_k):
     is_flag=True,
     help="Skip import expansion",
 )
+@click.option(
+    "--include",
+    "include_patterns",
+    multiple=True,
+    help="Include only files matching glob pattern (e.g., 'src/**')",
+)
+@click.option(
+    "--exclude",
+    "exclude_patterns",
+    multiple=True,
+    help="Exclude files matching glob pattern (e.g., 'tests/**')",
+)
+@click.option(
+    "--chunk-types",
+    type=str,
+    default=None,
+    help="Comma-separated chunk types to include (function,class,method,module)",
+)
+@click.option(
+    "--legacy",
+    is_flag=True,
+    help="Use legacy filesystem scan instead of DaemonDB (debugging only)",
+)
 @click.pass_context
 def context(
     ctx: click.Context,
@@ -190,12 +213,20 @@ def context(
     output_format: str,
     no_tests: bool,
     no_imports: bool,
+    include_patterns: tuple,
+    exclude_patterns: tuple,
+    chunk_types: Optional[str],
+    legacy: bool,
 ) -> None:
     """Build LLM-optimized context for a query.
 
     Supports STDIN: echo "query" | know context --budget 4000
 
     Example: know context "help me fix the auth bug" --budget 8000
+
+    Filtering:
+      --include "src/**" --exclude "tests/**"
+      --chunk-types function,class
     """
     config = ctx.obj["config"]
 
@@ -215,12 +246,21 @@ def context(
 
     from know.context_engine import ContextEngine
 
+    # Parse chunk types
+    parsed_chunk_types = None
+    if chunk_types:
+        parsed_chunk_types = [t.strip() for t in chunk_types.split(",")]
+
     engine = ContextEngine(config)
     result = engine.build_context(
         query,
         budget=budget,
         include_tests=not no_tests,
         include_imports=not no_imports,
+        legacy=legacy,
+        include_patterns=list(include_patterns) if include_patterns else None,
+        exclude_patterns=list(exclude_patterns) if exclude_patterns else None,
+        chunk_types=parsed_chunk_types,
     )
 
     # Inject relevant memories into context
