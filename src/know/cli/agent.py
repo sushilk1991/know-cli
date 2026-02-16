@@ -130,10 +130,15 @@ def related(ctx: click.Context, file_path: str) -> None:
             client = None
 
     if not client:
-        db = _get_db_fallback(config)
-        imports = db.get_imports_of(module)
-        imported_by = db.get_imported_by(module)
-        db.close()
+        # Build import graph if not already populated
+        from know.import_graph import ImportGraph
+        ig = ImportGraph(config)
+        from know.scanner import CodebaseScanner
+        scanner = CodebaseScanner(config)
+        structure = scanner.get_structure()
+        ig.build(structure.get("modules", []))
+        imports = ig.imports_of(module)
+        imported_by = ig.imported_by(module)
 
     output = ctx.obj.get("output_format", "rich")
     if output == "json":

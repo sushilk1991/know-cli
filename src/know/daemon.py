@@ -359,6 +359,14 @@ class KnowDaemon:
             self.db.update_file_index(path_str, content_hash, lang, len(chunks))
             count += 1
 
+        # Build import graph so 'related' queries work
+        try:
+            from know.import_graph import ImportGraph
+            ig = ImportGraph(self.config)
+            ig.build(structure.get("modules", []))
+        except Exception as e:
+            logger.debug(f"Import graph build failed: {e}")
+
         return count
 
 
