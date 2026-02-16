@@ -370,6 +370,71 @@ class TreeSitterParser(BaseParser):
                     ))
                 break  # Only check first identifier (LHS)
 
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        """Extract function call references from parsed tree-sitter AST.
+
+        Returns list of dicts with: ref_name, ref_type, line_number, containing_chunk.
+        """
+        content_bytes = content.encode("utf-8")
+        parser, _ = _get_ts_parser(self.language)
+        if not parser:
+            return []
+        tree = parser.parse(content_bytes)
+        # Build a map of line ranges to chunk names
+        chunk_ranges = []
+        for func in module.functions:
+            chunk_ranges.append((func.line_number, func.end_line, func.name))
+        for cls in module.classes:
+            chunk_ranges.append((cls.line_number, cls.end_line, cls.name))
+
+        refs = []
+        self._walk_calls(tree.root_node, content_bytes, chunk_ranges, refs)
+        return refs
+
+    def _walk_calls(self, node, content: bytes, chunk_ranges, refs):
+        """Recursively walk AST to find call expressions."""
+        if node.type in ("call", "call_expression", "method_invocation"):
+            # Extract the function name being called
+            func_node = node.children[0] if node.children else None
+            if func_node:
+                name = self._extract_call_name(func_node, content)
+                if name and len(name) >= 2 and not name.startswith("__"):
+                    line = node.start_point[0] + 1
+                    chunk = self._find_containing_chunk(line, chunk_ranges)
+                    refs.append({
+                        "ref_name": name,
+                        "ref_type": "call",
+                        "line_number": line,
+                        "containing_chunk": chunk or "<module>",
+                    })
+
+        for child in node.children:
+            self._walk_calls(child, content, chunk_ranges, refs)
+
+    def _extract_call_name(self, node, content: bytes) -> Optional[str]:
+        """Extract the function name from a call target node."""
+        if node.type in ("identifier", "name"):
+            return content[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        elif node.type in ("attribute", "member_expression"):
+            # e.g. obj.method — extract just the method name
+            for child in reversed(node.children):
+                if child.type in ("identifier", "property_identifier", "name", "field_identifier"):
+                    return content[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        return None
+
+    @staticmethod
+    def _find_containing_chunk(line: int, chunk_ranges) -> Optional[str]:
+        """Find which chunk contains the given line number."""
+        best = None
+        best_size = float("inf")
+        for start, end, name in chunk_ranges:
+            if start <= line <= max(end, start):
+                size = max(end, start) - start
+                if size < best_size:
+                    best = name
+                    best_size = size
+        return best
+
     def _extract_docstring(self, node, content: bytes) -> Optional[str]:
         """Try to extract a docstring from a node."""
         # Python: first child of body is expression_statement > string
@@ -475,6 +540,43 @@ class PythonParser(BaseParser):
             is_method=is_method,
             decorators=decorators,
         )
+
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        """Extract function call references using Python AST.
+
+        Returns list of dicts with: ref_name, ref_type, line_number, containing_chunk.
+        """
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []
+
+        # Build chunk ranges
+        chunk_ranges = []
+        for func in module.functions:
+            chunk_ranges.append((func.line_number, func.end_line, func.name))
+        for cls in module.classes:
+            chunk_ranges.append((cls.line_number, cls.end_line, cls.name))
+
+        refs = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = None
+                if isinstance(node.func, ast.Name):
+                    name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    name = node.func.attr
+
+                if name and len(name) >= 2 and not name.startswith("__"):
+                    line = getattr(node, "lineno", 0)
+                    chunk = TreeSitterParser._find_containing_chunk(line, chunk_ranges)
+                    refs.append({
+                        "ref_name": name,
+                        "ref_type": "call",
+                        "line_number": line,
+                        "containing_chunk": chunk or "<module>",
+                    })
+        return refs
 
     def _parse_class(self, node) -> ClassInfo:
         methods = []
@@ -626,6 +728,11 @@ class TypeScriptParser(TypeScriptRegexParser):
             return self._delegate.parse(path, root)
         return TypeScriptRegexParser.parse(self, path, root)
 
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        if self._delegate:
+            return self._delegate.extract_call_refs(content, module)
+        return []
+
 
 class GoParser(GoRegexParser):
     """Go parser — delegates to tree-sitter or regex."""
@@ -641,6 +748,11 @@ class GoParser(GoRegexParser):
         if self._delegate:
             return self._delegate.parse(path, root)
         return GoRegexParser.parse(self, path, root)
+
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        if self._delegate:
+            return self._delegate.extract_call_refs(content, module)
+        return []
 
 
 # ---------------------------------------------------------------------------

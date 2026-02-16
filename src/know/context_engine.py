@@ -406,6 +406,7 @@ class ContextEngine:
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
         chunk_types: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build context bundle for *query* within *budget* tokens.
 
@@ -413,11 +414,15 @@ class ContextEngine:
         Falls back to direct DaemonDB if daemon socket unavailable.
         Set legacy=True to force old filesystem scan (debugging only).
 
+        Pass session_id to enable cross-query dedup: chunks returned in
+        previous calls with the same session are skipped and budget is
+        re-filled with new results.
+
         Returns a dict with keys:
             query, budget, used_tokens,
             code_chunks, dependency_chunks, test_chunks,
             summary_chunks, overview, warnings, indexing_status,
-            index_stats, confidence
+            index_stats, confidence, session_id (if provided)
         """
         if legacy:
             return self._build_context_legacy(query, budget, include_tests, include_imports)
@@ -425,6 +430,7 @@ class ContextEngine:
         return self._build_context_v3(
             query, budget, include_tests, include_imports,
             include_patterns, exclude_patterns, chunk_types,
+            session_id,
         )
 
     def _build_context_v3(
@@ -436,6 +442,7 @@ class ContextEngine:
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
         chunk_types: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """v3 context building via DaemonDB."""
         # Get DaemonDB (direct connection, no daemon socket needed)
@@ -444,6 +451,7 @@ class ContextEngine:
             return self._build_context_v3_inner(
                 db, query, budget, include_tests, include_imports,
                 include_patterns, exclude_patterns, chunk_types,
+                session_id,
             )
         finally:
             db.close()
@@ -452,6 +460,7 @@ class ContextEngine:
         self, db, query: str, budget: int,
         include_tests: bool, include_imports: bool,
         include_patterns, exclude_patterns, chunk_types,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Inner v3 pipeline (db connection managed by caller)."""
         from know.file_categories import apply_category_demotion
@@ -517,30 +526,107 @@ class ContextEngine:
         # Step 2: Apply file category demotion
         raw_results = apply_category_demotion(raw_results, query)
 
+        # Step 2.5: Importance boost — boost high-in-degree modules
+        try:
+            file_paths = list({r["file_path"] for r in raw_results})
+            modules = [
+                fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
+                for fp in file_paths
+            ]
+            importance_scores = db.get_importance_batch(modules)
+            fp_to_importance = {}
+            for fp, mod in zip(file_paths, modules):
+                fp_to_importance[fp] = importance_scores.get(mod, 0.0)
+            for r in raw_results:
+                imp = fp_to_importance.get(r["file_path"], 0.0)
+                # Boost by up to 50% based on module importance
+                r["score"] = r.get("score", 0) * (1.0 + 0.5 * imp)
+        except Exception:
+            pass
+
+        # Step 2.6: Git recency boost — boost recently changed files
+        try:
+            file_paths = list({r["file_path"] for r in raw_results})
+            recency_scores = _get_batch_file_recency(self.root, file_paths)
+            for r in raw_results:
+                recency = recency_scores.get(r["file_path"], 0.0)
+                # Boost by up to 20% based on recency
+                r["score"] = r.get("score", 0) * (1.0 + 0.2 * recency)
+        except Exception:
+            pass
+
+        # Step 2.7: File-path exact match boost
+        try:
+            from know.query import analyze_query
+            plan = analyze_query(query)
+            path_terms = set(t.lower() for t in plan.identifiers + plan.terms)
+            for r in raw_results:
+                fp_lower = r["file_path"].lower()
+                # Check if any search term appears in the file path
+                for term in path_terms:
+                    if term in fp_lower:
+                        r["score"] = r.get("score", 0) * 2.0
+                        break
+        except Exception:
+            pass
+
         # Step 3: Apply file path filtering
         if include_patterns or exclude_patterns or chunk_types:
             raw_results = self._apply_filters(
                 raw_results, include_patterns, exclude_patterns, chunk_types,
             )
 
-        # Step 4: Re-sort by demoted scores
+        # Step 4: Re-sort by boosted scores
         raw_results.sort(key=lambda c: c.get("score", 0), reverse=True)
 
         # Step 5: Apply relevance floor (return under budget, not noise)
         raw_results = apply_relevance_floor(raw_results)
 
-        # Step 6: compute sub-budgets
-        budget_code = int(budget * self.ALLOC_CODE)
-        budget_imports = int(budget * self.ALLOC_IMPORTS) if include_imports else 0
-        budget_summaries = int(budget * self.ALLOC_SUMMARIES)
-        budget_overview = int(budget * self.ALLOC_OVERVIEW)
+        # Step 5.5: Session dedup — filter out already-seen chunks
+        session_seen_keys: set = set()
+        if session_id:
+            try:
+                db.create_session(session_id)
+                session_seen_keys = db.get_session_seen(session_id)
+                if session_seen_keys:
+                    raw_results = [
+                        r for r in raw_results
+                        if f"{r['file_path']}:{r.get('chunk_name', '')}:{r.get('start_line', 0)}"
+                        not in session_seen_keys
+                    ]
+            except Exception as e:
+                logger.debug(f"Session dedup failed: {e}")
+
+        # Step 6: compute sub-budgets (adaptive by query type)
+        try:
+            from know.query import analyze_query
+            plan = analyze_query(query)
+            qtype = plan.query_type
+        except Exception:
+            qtype = "concept"
+
+        if qtype == "identifier":
+            # Identifier queries: maximize code, minimize fluff
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.80, 0.15, 0.05, 0.00
+        elif qtype == "error":
+            # Error queries: lots of code, skip overview
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.70, 0.15, 0.15, 0.00
+        else:
+            # Concept queries: balanced
+            alloc_code, alloc_imports, alloc_summaries, alloc_overview = 0.60, 0.15, 0.15, 0.10
+
+        budget_code = int(budget * alloc_code)
+        budget_imports = int(budget * alloc_imports) if include_imports else 0
+        budget_summaries = int(budget * alloc_summaries)
+        budget_overview = int(budget * alloc_overview)
         if not include_imports:
-            budget_code += int(budget * self.ALLOC_IMPORTS)
+            budget_code += int(budget * alloc_imports)
 
         # Step 7: greedily fill code budget using pre-computed token_count
         code_chunks: List[Dict] = []
         code_used = 0
         seen_files: set = set()
+        seen_chunk_keys: set = set()
         for chunk in raw_results:
             tokens = chunk.get("token_count", 0)
             if tokens == 0:
@@ -550,8 +636,20 @@ class ContextEngine:
             code_chunks.append(chunk)
             code_used += tokens
             seen_files.add(chunk["file_path"])
+            seen_chunk_keys.add(
+                f"{chunk['file_path']}:{chunk.get('chunk_name', '')}:{chunk.get('start_line', 0)}"
+            )
+
+        # Step 7.5: Context expansion — add neighborhoods
+        code_chunks, code_used = self._expand_context(
+            db, code_chunks, code_used, budget_code, seen_chunk_keys,
+        )
+
+        # Step 7.6: Chunk deduplication — remove overlapping class/method chunks
+        code_chunks, code_used = self._deduplicate_chunks(code_chunks)
 
         # Step 8: Bundle structural metadata (batch import lookups)
+        seen_files = {c["file_path"] for c in code_chunks}
         if seen_files:
             self._bundle_metadata(db, code_chunks, seen_files)
 
@@ -584,7 +682,20 @@ class ContextEngine:
 
         confidence = round(total_used / budget, 2) if budget > 0 else 0
 
-        return {
+        # Step 13: Mark selected chunks as seen in session
+        if session_id and code_chunks:
+            try:
+                new_keys = []
+                new_tokens = []
+                for c in code_chunks:
+                    key = f"{c['file_path']}:{c.get('chunk_name', '')}:{c.get('start_line', 0)}"
+                    new_keys.append(key)
+                    new_tokens.append(c.get("token_count", 0))
+                db.mark_session_seen(session_id, new_keys, new_tokens)
+            except Exception as e:
+                logger.debug(f"Session mark_seen failed: {e}")
+
+        result = {
             "query": query,
             "budget": budget,
             "used_tokens": total_used,
@@ -599,6 +710,165 @@ class ContextEngine:
             "index_stats": stats,
             "confidence": confidence,
         }
+
+        if session_id:
+            result["session_id"] = session_id
+
+        return result
+
+    def _expand_context(
+        self,
+        db,
+        code_chunks: List[Dict],
+        code_used: int,
+        budget_code: int,
+        seen_chunk_keys: set,
+    ) -> Tuple[List[Dict], int]:
+        """Expand selected chunks with neighborhoods for better context.
+
+        For each selected chunk:
+        - Include module-level chunk (imports + docstring) from same file
+        - If method, include parent class signature
+        - Include adjacent chunks (within 10 lines) if budget allows
+        """
+        if not code_chunks:
+            return code_chunks, code_used
+
+        # Collect all file paths that need expansion
+        files_to_expand = {c["file_path"] for c in code_chunks}
+
+        # Pre-fetch all chunks for these files (batch)
+        file_chunks_map: Dict[str, List[Dict]] = {}
+        for fp in files_to_expand:
+            file_chunks_map[fp] = db.get_chunks_for_file(fp)
+
+        extra_chunks: List[Dict] = []
+
+        for chunk in list(code_chunks):
+            fp = chunk["file_path"]
+            all_file_chunks = file_chunks_map.get(fp, [])
+            chunk_start = chunk.get("start_line", 0)
+            chunk_end = chunk.get("end_line", 0)
+            chunk_type = chunk.get("chunk_type", "")
+
+            # 1. Include module-level chunk (imports + docstring) from same file
+            for fc in all_file_chunks:
+                if fc.get("chunk_type") == "module":
+                    key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                    if key not in seen_chunk_keys:
+                        tokens = fc.get("token_count", 0)
+                        if code_used + tokens <= budget_code:
+                            extra_chunks.append(fc)
+                            code_used += tokens
+                            seen_chunk_keys.add(key)
+                    break  # Only one module chunk per file
+
+            # 2. If method, include parent class signature
+            if chunk_type == "method":
+                for fc in all_file_chunks:
+                    if fc.get("chunk_type") == "class":
+                        fc_start = fc.get("start_line", 0)
+                        fc_end = fc.get("end_line", 0)
+                        # Class encloses this method
+                        if fc_start <= chunk_start and fc_end >= chunk_end:
+                            key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                            if key not in seen_chunk_keys:
+                                # Add just class signature (first few lines)
+                                sig_body = fc.get("signature", fc.get("chunk_name", ""))
+                                doc = ""
+                                body = fc.get("body", "")
+                                # Extract first ~5 lines as class header
+                                body_lines = body.split("\n")[:5]
+                                sig_text = "\n".join(body_lines)
+                                tokens = count_tokens(sig_text)
+                                if code_used + tokens <= budget_code:
+                                    sig_chunk = dict(fc)
+                                    sig_chunk["body"] = sig_text
+                                    sig_chunk["token_count"] = tokens
+                                    sig_chunk["chunk_name"] = f"{fc.get('chunk_name', '')} (class header)"
+                                    extra_chunks.append(sig_chunk)
+                                    code_used += tokens
+                                    seen_chunk_keys.add(key)
+                            break
+
+            # 3. Include adjacent chunks (within 10 lines) if budget allows
+            for fc in all_file_chunks:
+                fc_start = fc.get("start_line", 0)
+                fc_end = fc.get("end_line", 0)
+                key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                if key in seen_chunk_keys:
+                    continue
+                # Check adjacency: within 10 lines of the selected chunk
+                if (abs(fc_start - chunk_end) <= 10 or abs(chunk_start - fc_end) <= 10):
+                    tokens = fc.get("token_count", 0)
+                    if code_used + tokens <= budget_code:
+                        extra_chunks.append(fc)
+                        code_used += tokens
+                        seen_chunk_keys.add(key)
+
+        code_chunks.extend(extra_chunks)
+        return code_chunks, code_used
+
+    def _deduplicate_chunks(
+        self, code_chunks: List[Dict],
+    ) -> Tuple[List[Dict], int]:
+        """Remove overlapping class/method chunks.
+
+        If a class chunk AND its method chunks are both selected:
+        - If 3+ methods selected from same class → drop the full class body
+        - Otherwise keep the class chunk and drop methods already inside it
+        """
+        if not code_chunks:
+            return code_chunks, 0
+
+        # Group by file
+        by_file: Dict[str, List[Dict]] = {}
+        for c in code_chunks:
+            by_file.setdefault(c["file_path"], []).append(c)
+
+        keep: List[Dict] = []
+        total_tokens = 0
+
+        for fp, chunks in by_file.items():
+            classes = [c for c in chunks if c.get("chunk_type") == "class"]
+            methods = [c for c in chunks if c.get("chunk_type") == "method"]
+            others = [c for c in chunks if c.get("chunk_type") not in ("class", "method")]
+
+            # Always keep non-class/method chunks
+            for c in others:
+                keep.append(c)
+                total_tokens += c.get("token_count", 0)
+
+            for cls in classes:
+                cls_start = cls.get("start_line", 0)
+                cls_end = cls.get("end_line", 0)
+
+                # Find methods that are inside this class
+                enclosed = [
+                    m for m in methods
+                    if m.get("start_line", 0) >= cls_start
+                    and m.get("end_line", 0) <= cls_end
+                ]
+
+                if len(enclosed) >= 3:
+                    # Many methods selected → skip the full class body, keep methods
+                    for m in enclosed:
+                        keep.append(m)
+                        total_tokens += m.get("token_count", 0)
+                        methods = [x for x in methods if x is not m]
+                else:
+                    # Few methods → keep class body, skip enclosed methods
+                    keep.append(cls)
+                    total_tokens += cls.get("token_count", 0)
+                    for m in enclosed:
+                        methods = [x for x in methods if x is not m]
+
+            # Keep methods not enclosed in any class
+            for m in methods:
+                keep.append(m)
+                total_tokens += m.get("token_count", 0)
+
+        return keep, total_tokens
 
     def _apply_filters(
         self,
@@ -1067,6 +1337,300 @@ class ContextEngine:
         return truncate_to_budget(overview, budget)
 
     # ------------------------------------------------------------------
+    # Deep context (know deep)
+    # ------------------------------------------------------------------
+
+    def build_deep_context(
+        self,
+        name: str,
+        budget: int = 3000,
+        include_tests: bool = False,
+        session_id: Optional[str] = None,
+        db=None,
+    ) -> Dict[str, Any]:
+        """Build deep context for a function: body + callers + callees.
+
+        Returns a dict with target, callees, callers, overflow_signatures,
+        budget_used, budget, and optional session_id.
+
+        Args:
+            db: Optional pre-existing DaemonDB instance (avoids creating a new one).
+        """
+        needs_close = False
+        if db is None:
+            db = get_direct_db(self.config)
+            needs_close = True
+
+        try:
+            return self._build_deep_context_inner(
+                db, name, budget, include_tests, session_id,
+            )
+        finally:
+            if needs_close:
+                db.close()
+
+    def _build_deep_context_inner(
+        self,
+        db,
+        name: str,
+        budget: int,
+        include_tests: bool,
+        session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Inner deep context pipeline."""
+        from know.file_categories import categorize_file
+
+        # Step 1: Resolve function name to chunk(s)
+        candidates = self._resolve_function(db, name, include_tests)
+
+        if not candidates:
+            # Try fuzzy: search for chunks containing the name
+            nearest = []
+            try:
+                search_results = db.search_chunks(name, limit=5)
+                nearest = [
+                    r.get("chunk_name", "") for r in search_results
+                    if r.get("chunk_name")
+                ]
+            except Exception:
+                pass
+            return {"error": "not_found", "nearest": nearest}
+
+        if len(candidates) > 1:
+            return {
+                "error": "ambiguous",
+                "candidates": [
+                    {
+                        "file_path": c["file_path"],
+                        "chunk_name": c["chunk_name"],
+                        "chunk_type": c.get("chunk_type", "function"),
+                        "start_line": c.get("start_line", 0),
+                    }
+                    for c in candidates
+                ],
+            }
+
+        target_chunk = candidates[0]
+        target_name = target_chunk["chunk_name"]
+        target_body = target_chunk.get("body", "")
+        target_tokens = target_chunk.get("token_count", 0) or count_tokens(target_body)
+
+        # Cap target at 50% of budget
+        max_target = int(budget * 0.50)
+        if target_tokens > max_target:
+            target_body = truncate_to_budget(target_body, max_target)
+            target_tokens = count_tokens(target_body)
+
+        remaining = budget - target_tokens
+
+        # Step 2: Get callees (what the function calls)
+        callees_budget = int(remaining * 0.50)
+        raw_callees = db.get_callees(target_name, limit=30)
+
+        # Deduplicate: exclude target itself and external refs
+        callees_data = []
+        seen_names = {target_name}
+        for ref in raw_callees:
+            ref_name = ref.get("ref_name", "")
+            if ref_name in seen_names:
+                continue
+            seen_names.add(ref_name)
+            callees_data.append(ref)
+
+        # Step 3: Get callers (what calls the function)
+        callers_budget = remaining - callees_budget
+        raw_callers = db.get_callers(target_name, limit=30)
+
+        callers_data = []
+        seen_caller_names = {target_name}
+        for ref in raw_callers:
+            caller_name = ref.get("containing_chunk", "")
+            if caller_name in seen_caller_names:
+                continue
+            seen_caller_names.add(caller_name)
+            callers_data.append(ref)
+
+        # Step 4: Fetch full bodies for callees, sorted by locality then size
+        callees_result, callees_used, overflow = self._fill_related_chunks(
+            db, callees_data, callees_budget, target_chunk["file_path"],
+            key_field="ref_name", line_field="line_number",
+        )
+
+        # Step 5: Fetch full bodies for callers
+        callers_result, callers_used, overflow_callers = self._fill_related_chunks(
+            db, callers_data, callers_budget, target_chunk["file_path"],
+            key_field="containing_chunk", line_field="line_number",
+        )
+        overflow.extend(overflow_callers)
+
+        total_used = target_tokens + callees_used + callers_used
+
+        # Step 6: Check call graph availability
+        call_graph_available = bool(raw_callees or raw_callers)
+
+        result = {
+            "target": {
+                "file": target_chunk["file_path"],
+                "name": target_name,
+                "signature": target_chunk.get("signature", ""),
+                "body": target_body,
+                "line_start": target_chunk.get("start_line", 0),
+                "line_end": target_chunk.get("end_line", 0),
+                "tokens": target_tokens,
+            },
+            "callees": callees_result,
+            "callers": callers_result,
+            "overflow_signatures": overflow,
+            "call_graph_available": call_graph_available,
+            "budget_used": total_used,
+            "budget": budget,
+        }
+
+        # Step 7: Session integration — mark all returned chunks as seen
+        if session_id:
+            chunk_keys = [
+                f"{target_chunk['file_path']}:{target_name}:{target_chunk.get('start_line', 0)}"
+            ]
+            token_list = [target_tokens]
+            for c in callees_result:
+                chunk_keys.append(f"{c['file']}:{c['name']}:{c.get('line_start', 0)}")
+                token_list.append(c.get("tokens", 0))
+            for c in callers_result:
+                chunk_keys.append(f"{c['file']}:{c['name']}:{c.get('line_start', 0)}")
+                token_list.append(c.get("tokens", 0))
+            try:
+                db.mark_session_seen(session_id, chunk_keys, token_list)
+            except Exception as e:
+                logger.debug(f"Session mark_seen failed in deep context: {e}")
+            result["session_id"] = session_id
+
+        return result
+
+    def _resolve_function(
+        self, db, name: str, include_tests: bool,
+    ) -> List[Dict]:
+        """Resolve function name to chunk(s) with disambiguation."""
+        from know.file_categories import categorize_file
+
+        # 1. Try exact chunk_name match
+        candidates = db.get_chunks_by_name(name)
+
+        # 2. Try file:name format
+        if not candidates and ":" in name:
+            file_part, name_part = name.rsplit(":", 1)
+            all_matches = db.get_chunks_by_name(name_part)
+            candidates = [c for c in all_matches if file_part in c["file_path"]]
+
+        # 3. Try Class.method format
+        if not candidates and "." in name:
+            parts = name.split(".")
+            method_name = parts[-1]
+            class_hint = parts[0]
+            all_matches = db.get_chunks_by_name(method_name)
+            # Match by class name in chunk_name (e.g., "ClassName.method")
+            candidates = [
+                c for c in all_matches
+                if class_hint in c.get("chunk_name", "") or class_hint in c.get("file_path", "")
+            ]
+
+        if not candidates:
+            return []
+
+        # 4. Filter test files by default
+        if not include_tests:
+            source_only = [
+                c for c in candidates
+                if categorize_file(c["file_path"]) == "source"
+            ]
+            if source_only:
+                candidates = source_only
+
+        # 5. If still ambiguous (>1), return all for disambiguation
+        return candidates
+
+    def _fill_related_chunks(
+        self,
+        db,
+        refs: List[Dict],
+        budget: int,
+        target_file: str,
+        key_field: str,
+        line_field: str,
+    ) -> Tuple[List[Dict], int, List[str]]:
+        """Fill budget with related chunk bodies, sorted by locality then size.
+
+        Returns (filled_chunks, tokens_used, overflow_signatures).
+        """
+        if not refs:
+            return [], 0, []
+
+        # Fetch chunk bodies for all refs
+        enriched = []
+        for ref in refs:
+            name = ref.get(key_field, "")
+            if not name:
+                continue
+            chunks = db.get_chunks_by_name(name)
+            if chunks:
+                chunk = chunks[0]
+                # Prefer same-file chunk
+                same_file = [c for c in chunks if c["file_path"] == target_file]
+                if same_file:
+                    chunk = same_file[0]
+                enriched.append({
+                    "chunk": chunk,
+                    "ref": ref,
+                    "same_file": chunk["file_path"] == target_file,
+                    "tokens": chunk.get("token_count", 0) or count_tokens(chunk.get("body", "")),
+                })
+            else:
+                # External/unresolved reference
+                enriched.append({
+                    "chunk": None,
+                    "ref": ref,
+                    "same_file": False,
+                    "tokens": 0,
+                })
+
+        # Sort: same-file first, then by smallest token count
+        enriched.sort(key=lambda e: (not e["same_file"], e["tokens"]))
+
+        filled = []
+        used = 0
+        overflow = []
+
+        for entry in enriched:
+            chunk = entry["chunk"]
+            ref = entry["ref"]
+            name = ref.get(key_field, "")
+
+            if chunk is None:
+                # External reference — add to overflow
+                overflow.append(f"external: {name}")
+                continue
+
+            tokens = entry["tokens"]
+            if used + tokens <= budget:
+                filled.append({
+                    "file": chunk["file_path"],
+                    "name": chunk["chunk_name"],
+                    "body": chunk.get("body", ""),
+                    "tokens": tokens,
+                    "line_start": chunk.get("start_line", 0),
+                    "line_end": chunk.get("end_line", 0),
+                    "call_site_line": ref.get(line_field, 0),
+                })
+                used += tokens
+            else:
+                # Budget overflow — add as signature only
+                sig = chunk.get("signature", chunk["chunk_name"])
+                overflow.append(
+                    f"{sig} — {chunk['file_path']}:{chunk.get('start_line', 0)}"
+                )
+
+        return filled, used, overflow
+
+    # ------------------------------------------------------------------
     # Formatting
     # ------------------------------------------------------------------
     def format_markdown(self, result: Dict[str, Any]) -> str:
@@ -1170,6 +1734,8 @@ class ContextEngine:
             payload["file_names_matching"] = result["file_names_matching"]
         if result.get("index_stats"):
             payload["index_stats"] = result["index_stats"]
+        if result.get("session_id"):
+            payload["session_id"] = result["session_id"]
 
         return json.dumps(payload, indent=2)
 

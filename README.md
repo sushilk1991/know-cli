@@ -1,6 +1,6 @@
-# know — Context Intelligence for AI Coding Agents
+# know — 3x Fewer Tokens for AI Coding Agents
 
-> Your AI agent wastes tokens. **know** gives it exactly what it needs.
+> Your AI agent wastes tokens reading code it doesn't need. **know** gives it exactly what it needs, in 3 tiers.
 
 [![PyPI](https://img.shields.io/pypi/v/know-cli)](https://pypi.org/project/know-cli/)
 [![Python](https://img.shields.io/pypi/pyversions/know-cli)](https://pypi.org/project/know-cli/)
@@ -10,326 +10,138 @@
 
 ## The Problem
 
-AI coding agents dump entire files into context. Every `@file` reference, every `cat` command — full files, whether you need 3 lines or 3000.
+AI agents dump entire files into context. Every `grep` match pulls in thousands of tokens of irrelevant code. Repeated queries re-read the same functions.
 
-**Result:** Slow. Expensive. Often irrelevant. Your agent burns through your token budget reading imports it doesn't need.
+**Result:** Slow. Expensive. Your agent burns through token budget reading imports and boilerplate it doesn't need.
 
-## The Solution
+## The Solution — Map, Context, Deep
 
-**know** understands your codebase and serves the *minimum* context needed.
+**know** is a 3-tier context engine. Agents start broad and zoom in, paying only for what they need.
 
-- 🎯 Semantic search finds the *relevant* functions, not entire files
-- 📊 Import graph knows what depends on what
-- 🧠 Cross-session memory means agents never re-discover the same things
-- 💰 Token budgeting keeps costs predictable
-- ⚡ Background daemon for sub-100ms query latency
-- 🤖 Agent-native commands (`next-file`, `signatures`, `related`) for autonomous workflows
+| Tier | Command | Tokens/result | Use case |
+|------|---------|---------------|----------|
+| **Map** | `know map "query"` | ~50 | Orient: what exists? |
+| **Context** | `know context "query" --session S` | ~300-500 | Investigate: relevant code bodies |
+| **Deep** | `know deep "function_name"` | ~1500 | Surgical: function + callers + callees |
 
-**8-18x fewer tokens per query. One tool call instead of seven.**
+Session dedup means the second query never re-sends code from the first.
 
 ---
 
 ## Benchmarks
 
-### Head-to-head: Two AI agents, same task
+### Token efficiency: know context vs Grep+Read
 
-We gave two Claude agents the **same research task** — "explain how the search ranking pipeline works and write a README section" — on the know-cli codebase (35 files). One agent used only `know` commands, the other used only Grep+Read. Both ran in parallel.
+**farfield** (762 files, production TypeScript+Python):
+
+| Scenario | Grep+Read | know context | Reduction |
+|---|---|---|---|
+| WebSocket handling | 12,936 tokens | 1,714 tokens | **7.5x** |
+| Auth and API keys | 3,383 tokens | 1,623 tokens | **2.1x** |
+| Model routing | 27,556 tokens | 1,772 tokens | **15.6x** |
+| Error handling | 25,160 tokens | 1,773 tokens | **14.2x** |
+| Database + storage | 5,357 tokens | 1,773 tokens | **3.0x** |
+| **Total** | **74,392** | **8,655** | **8.6x** |
+
+### Head-to-head agent benchmark (farfield, 762 files)
 
 | Metric | Agent with `know` | Agent with Grep+Read |
 |---|---|---|
-| Total API tokens | 70,542 | 75,602 |
-| Tool calls | 13 | 12 |
-| Wall clock time | 114s | 89s |
-| Context tokens consumed | ~18,355 (from know) | ~14,176 (raw file reads) |
-| Quality | Accurate, found RRF fusion, git recency details | Accurate, found exact BM25F weights, SQL details |
-
-**Takeaway:** On a small codebase where you can guess the right files, Grep+Read is competitive. `know` shines when you **don't know where to look** — it found relevant code across 7+ files in a single call, while Grep+Read required the agent to already know which files mattered.
-
-### Token efficiency: know context vs Grep+Read (per-query)
-
-Each `know context` call returns a ranked, token-budgeted bundle. Here's how the **content delivered** compares to reading full files after grep.
-
-**know-cli** (35 files, 159 chunks):
-
-| Scenario | Grep+Read | know context | Reduction |
-|---|---|---|---|
-| Daemon indexing logic | 27,569 tokens | 1,650 tokens | **16.7x** |
-| FTS5 search implementation | 28,274 tokens | 1,514 tokens | **18.7x** |
-| Python parser functions | 12,446 tokens | 1,369 tokens | **9.1x** |
-| Context engine budget | 18,665 tokens | 1,557 tokens | **12.0x** |
-| Import graph logic | 28,274 tokens | 1,531 tokens | **18.5x** |
-| **Total** | **115,228 tokens** | **7,621 tokens** | **15.1x** |
-
-**farfield** (762 files, 2,228 chunks — production TypeScript+Python app):
-
-| Scenario | Grep+Read | know context | Reduction |
-|---|---|---|---|
-| WebSocket connection handling | 12,936 tokens | 1,714 tokens | **7.5x** |
-| Authentication and API keys | 3,383 tokens | 1,623 tokens | **2.1x** |
-| Model routing and inference | 27,556 tokens | 1,772 tokens | **15.6x** |
-| Error handling and retries | 25,160 tokens | 1,773 tokens | **14.2x** |
-| Database and storage | 5,357 tokens | 1,773 tokens | **3.0x** |
-| **Total** | **74,392 tokens** | **8,655 tokens** | **8.6x** |
-
-### When to use know vs Grep
-
-| Situation | Best tool | Why |
-|---|---|---|
-| You know the exact file | Grep+Read | Direct is faster |
-| Exploring unfamiliar code | **know context** | Finds relevant code across the whole codebase in 1 call |
-| Repeated queries in a session | **know context** | Index is cached, sub-200ms responses |
-| Large codebase (500+ files) | **know context** | Grep returns too many matches to read |
-| Budget-constrained agent | **know context** | Token budgeting prevents waste |
+| Tool calls | 14 | 36 |
+| Total tokens | 105,950 | 113,471 |
+| Quality | Equivalent | Equivalent |
 
 ---
 
-## Quick Start (30 seconds)
+## Quick Start
 
 ```bash
 pip install know-cli
 cd your-project
 know init
-know context "help me fix the auth bug" --budget 4000
 ```
 
-That's it. You just got the most relevant code for your task, packed into exactly 4000 tokens.
+### The 3-Tier Workflow
 
-The background daemon starts automatically on first use — subsequent queries return in under 100ms.
+```bash
+# 1. Orient — what functions exist for "billing"?
+know map "billing"
+
+# 2. Investigate — get ranked code bodies (with session tracking)
+know --json context "billing subscription" --budget 4000 --session auto
+# Returns session_id: "a1b2c3d4"
+
+# 3. Go deep — one function + its callers/callees
+know --json deep "check_cloud_access" --budget 3000
+
+# Follow-up queries skip already-seen code
+know --json context "payment processing" --budget 4000 --session a1b2c3d4
+```
 
 ---
 
-## Works With
+## Commands
 
-| Tool | Integration |
-|------|-------------|
-| **Claude Code** | Drop in `KNOW_SKILL.md` — Claude uses know automatically |
-| **Claude Desktop** | MCP server: `know mcp serve` |
-| **Cursor** | MCP server or CLI |
-| **Any CLI agent** | Pipe-friendly: `know context "query" --json` |
-| **Any MCP client** | Standard MCP protocol |
-
----
-
-## Features
-
-### 🎯 Smart Context — `know context`
-
-The killer feature. Ask for what you need, get exactly that — within budget.
+### Map — Orient Before Reading
 
 ```bash
-know context "fix the authentication middleware" --budget 8000
-know context "add pagination to the users API" --budget 4000 --json
-echo "refactor the config system" | know context --budget 6000
+know map "billing subscription"              # What exists?
+know --json map "auth" --limit 30            # JSON for agents
+know map "config" --type function            # Filter by type
 ```
 
-**How it works:**
-1. Semantic search finds relevant functions/classes (not whole files)
-2. Import graph pulls in dependencies (signatures only)
-3. Test matcher finds related tests
-4. Git recency boosts recently-changed code
-5. Token budgeting packs it all optimally
+Returns signatures + first-line docstrings. No bodies. ~50 tokens per result.
 
-### 🧠 Cross-Session Memory — `know remember` / `know recall`
-
-Agents forget everything between sessions. know doesn't.
+### Context — Ranked Code Bodies
 
 ```bash
-know remember "The auth system uses JWT with Redis session store"
-know remember "Never modify the migration files directly" --tags "warning,db"
+know context "fix the auth bug" --budget 8000
+know --json context "query" --budget 4000 --session auto
+echo "refactor config" | know context --budget 6000
+```
+
+Finds relevant functions across the codebase. Token-budgeted. Optionally deduplicates across queries with `--session`.
+
+### Deep — Function + Dependencies
+
+```bash
+know deep "check_cloud_access" --budget 3000
+know --json deep "BillingService.process_payment"
+know --json deep "service.py:check_cloud_access"
+```
+
+Returns the function body + what it calls (callees) + what calls it (callers), all within budget. Handles ambiguous names, budget overflow, and missing call graphs.
+
+### Memory — Cross-Session Knowledge
+
+```bash
+know remember "Auth uses JWT with Redis session store"
 know recall "how does auth work?"
 ```
 
-Memories are automatically included in `know context` results. Your agent gets smarter over time.
+Memories are automatically included in `know context` results.
 
-### 🔍 Semantic Search — `know search`
-
-Real embeddings, not grep. Understands meaning, not just keywords.
-
-```bash
-know search "error handling"
-know search "database connection pooling" --top-k 10 --json
-know search "authentication" --chunk  # Search at function level
-```
-
-Uses [fastembed](https://github.com/qdrant/fastembed) (BAAI/bge-small-en-v1.5) — runs locally, no API calls.
-
-### 📊 Import Graph — `know graph`
-
-Real dependency resolution, not guessing.
-
-```bash
-know graph src/auth/middleware.py
-```
-
-```
-📊 Import Graph: src/auth/middleware.py
-
-## Imports (dependencies)
-  → src.auth.tokens
-  → src.db.session
-
-## Imported by (dependents)
-  ← src.api.routes
-  ← src.api.admin
-```
-
-### 🔌 MCP Server — `know mcp serve`
-
-Standard [Model Context Protocol](https://modelcontextprotocol.io/) server. Works with Claude Desktop, Cursor, and any MCP client.
-
-```bash
-know mcp serve                    # stdio transport (Claude Desktop)
-know mcp serve --sse --port 3000  # SSE transport (web clients)
-know mcp config                   # Print Claude Desktop config
-```
-
-**MCP Tools:** `get_context`, `search_code`, `remember`, `recall`, `explain_component`, `show_graph`
-
-**MCP Resources:** `codebase://digest`, `codebase://structure`, `codebase://memories`
-
-### 🤖 Agent Commands
-
-Purpose-built for autonomous AI agent workflows.
-
-```bash
-know next-file "authentication" --exclude src/auth/old.py
-know signatures src/auth/middleware.py
-know related src/auth/middleware.py
-know generate-context --budget 8000
-know diff --since "3 days ago"
-```
+### All Commands
 
 | Command | Description |
 |---------|-------------|
-| `know next-file "query"` | Return the single most relevant file for a query |
-| `know signatures [file]` | Get function/class signatures for a file or project |
-| `know related <file>` | Show import dependencies and dependents |
-| `know generate-context` | Generate `.know/CONTEXT.md` for agents to read on session start |
-| `know diff --since "1 week ago"` | Show architectural changes over time |
-
-### ⚡ Background Daemon
-
-A Unix socket daemon keeps indexes in memory for instant responses.
-
-```bash
-know status   # Shows daemon status, index age, cache size
-```
-
-- Starts automatically on first CLI call
-- Serves search, signatures, related, and memory queries over IPC
-- Falls back to direct SQLite access if daemon is unavailable
-- Disable with `KNOW_NO_DAEMON=1` for CI/CD environments
-
-### 📈 Usage Stats — `know stats`
-
-Track your ROI. See how much context you're serving and how efficiently.
-
-```bash
-know stats
-```
-
-```
-📊 know-cli Statistics
-─────────────────────
-  Project: my-app (42 files, 380 functions)
-
-  Knowledge Base:
-    12 memories (5 manual, 7 auto)
-
-  Context Engine:
-    Queries served: 47
-    Avg budget utilization: 82%
-    Avg response time: 340ms
-
-  Search:
-    Queries: 23
-    Avg response time: 85ms
-```
-
----
-
-## For AI Agents
-
-### Claude Code Skill
-
-Drop `KNOW_SKILL.md` into your project root (see below) and Claude Code will automatically use know-cli:
-
-```markdown
-# know-cli Integration
-
-Before starting a task:
-  Run: know context "<task description>" --budget 8000 --quiet
-
-When you learn something about the codebase:
-  Run: know remember "<insight>"
-
-To search for specific code:
-  Run: know search "<query>" --json
-
-To understand dependencies:
-  Run: know graph <file_path>
-```
-
-### MCP Setup (Claude Desktop)
-
-```bash
-know mcp config
-```
-
-Outputs the JSON config to add to your Claude Desktop settings:
-
-```json
-{
-  "mcpServers": {
-    "know-cli": {
-      "command": "know",
-      "args": ["mcp", "serve"],
-      "cwd": "/path/to/your/project"
-    }
-  }
-}
-```
-
-### Pipe-Friendly Output
-
-Every command supports `--json` and `--quiet` for machine consumption:
-
-```bash
-know context "query" --json | jq '.code[0].body'
-know search "auth" --json
-know recall "patterns" --json
-know status --json
-```
-
----
-
-## Commands Reference
-
-| Command | Description |
-|---------|-------------|
-| `know init` | Initialize know in your project |
-| `know context "query"` | Build smart, budgeted context |
+| `know map "query"` | Lightweight signature search |
+| `know context "query"` | Smart, budgeted code context |
+| `know deep "name"` | Function + callers + callees |
 | `know search "query"` | Semantic code search |
 | `know remember "text"` | Store a memory |
 | `know recall "query"` | Recall memories |
-| `know forget <id>` | Delete a memory |
-| `know memories list` | List all memories |
-| `know graph <file>` | Show import dependencies |
-| `know explain -c <name>` | AI-explain a component |
-| `know stats` | Usage statistics |
-| `know status` | Project health check |
-| `know reindex` | Rebuild search index |
-| `know mcp serve` | Start MCP server |
-| `know mcp config` | Print MCP client config |
-| `know digest` | Generate codebase summary |
-| `know watch` | Auto-update on file changes |
-| `know next-file "query"` | Best file for a query (agent use) |
 | `know signatures [file]` | Function/class signatures |
 | `know related <file>` | Import deps and dependents |
-| `know generate-context` | Generate `.know/CONTEXT.md` |
+| `know callers <function>` | What calls this function |
+| `know callees <chunk>` | What this function calls |
+| `know next-file "query"` | Best file for a query |
+| `know graph <file>` | Import graph visualization |
+| `know status` | Project health check |
+| `know stats` | Usage statistics |
 | `know diff --since "1w"` | Architectural changes over time |
-| `know hooks install` | Install git hooks for auto-update |
-| `know hooks uninstall` | Remove git hooks |
+| `know mcp serve` | Start MCP server |
+| `know init` | Initialize know in project |
 
 ### Global Flags
 
@@ -339,7 +151,42 @@ know status --json
 | `--quiet` | Minimal output |
 | `--verbose` | Detailed output |
 | `--time` | Show execution time |
-| `--config <path>` | Custom config file |
+
+---
+
+## Works With
+
+| Tool | Integration |
+|------|-------------|
+| **Claude Code** | Agent skill — Claude uses know automatically |
+| **Claude Desktop** | MCP server: `know mcp serve` |
+| **Cursor** | MCP server or CLI |
+| **Any CLI agent** | Pipe-friendly: `know --json context "query"` |
+
+---
+
+## How It Works
+
+```
+Your Query → know context
+  ├─ FTS5 Search (BM25F field weighting)
+  │    └─ Finds relevant functions/classes
+  ├─ Ranking Pipeline
+  │    ├─ File category demotion (test/vendor/generated)
+  │    ├─ Import graph importance boost
+  │    ├─ Git recency boost
+  │    └─ File-path match boost
+  ├─ Context Expansion
+  │    └─ Module imports, parent classes, adjacent chunks
+  ├─ Session Dedup (optional)
+  │    └─ Skips chunks already returned in this session
+  ├─ Knowledge Base
+  │    └─ Injects cross-session memories
+  └─ Token Budget Allocator
+       └─ 60% code | 15% imports | 15% summaries | 10% overview
+```
+
+All processing is **local**. No data leaves your machine.
 
 ---
 
@@ -349,7 +196,7 @@ know status --json
 # Core (CLI + context engine + memory)
 pip install know-cli
 
-# With semantic search (recommended)
+# With semantic search
 pip install know-cli[search]
 
 # With MCP server
@@ -363,37 +210,11 @@ pip install know-cli[search,mcp]
 
 ---
 
-## How It Works
-
-```
-Your Query → know context
-  ├─ Semantic Search (fastembed embeddings)
-  │    └─ Finds relevant functions/classes
-  ├─ Import Graph (AST-based)
-  │    └─ Pulls in dependency signatures
-  ├─ Test Matcher
-  │    └─ Finds related test files
-  ├─ Git Recency
-  │    └─ Boosts recently-changed code
-  ├─ Knowledge Base
-  │    └─ Injects cross-session memories
-  └─ Token Budget Allocator
-       └─ 40% code | 30% imports | 20% summaries | 10% overview
-```
-
-All processing is **local**. Embeddings run on your machine. No data leaves your laptop (except `know explain` which calls Claude API).
-
-Semantic search via [fastembed](https://github.com/qdrant/fastembed) is optional — install with `pip install know-cli[search]`. Without it, know uses fast BM25 full-text search as the default.
-
----
-
 ## Configuration
 
 ```bash
 know init  # Creates .know/config.yaml
 ```
-
-Configuration lives in `.know/config.yaml`:
 
 ```yaml
 project:
@@ -403,41 +224,19 @@ languages:
   - python
 include_paths:
   - src/
-  - lib/
 exclude_paths:
   - tests/fixtures/
-  - scripts/
 ```
-
----
-
-## Pricing
-
-**Free forever:**
-- Full CLI (`know context`, `know search`, `know remember`, etc.)
-- MCP server
-- Local embeddings
-- Unlimited usage
-
-**Pro (coming soon):**
-- Cloud sync across machines
-- Team knowledge sharing
-- Advanced analytics
-- Priority support
-
----
 
 ## Architecture
 
 ```
 .know/
   config.yaml     # Project configuration
-  daemon.db       # Unified SQLite database (chunks, memories, imports)
-  cache/
-    index.db      # Scanner cache
+  daemon.db       # SQLite database (chunks, memories, imports, sessions)
 ```
 
-**Single database:** All data (code chunks, memories, import graph) lives in one SQLite database with WAL mode for concurrent access. The background daemon keeps it in memory; CLI commands fall back to direct access when the daemon is unavailable.
+Single SQLite database with FTS5 and WAL mode. Background daemon for sub-100ms latency. Falls back to direct DB access when daemon is unavailable.
 
 ## Contributing
 
@@ -445,10 +244,8 @@ exclude_paths:
 git clone https://github.com/sushilk1991/know-cli
 cd know-cli
 pip install -e ".[dev,search,mcp]"
-python -m pytest tests/ -v
+pytest tests/ -v
 ```
-
----
 
 ## License
 

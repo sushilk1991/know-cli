@@ -148,6 +148,18 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
 
             db.upsert_chunks(path_str, lang, chunks)
             db.update_file_index(path_str, content_hash, lang, len(chunks))
+
+            # Extract call references for symbol_refs table
+            try:
+                from know.parsers import ParserFactory
+                parser = ParserFactory.get_parser_for_file(abs_path)
+                if parser and hasattr(parser, "extract_call_refs"):
+                    call_refs = parser.extract_call_refs(content, mod_info)
+                    if call_refs:
+                        db.upsert_symbol_refs(path_str, call_refs)
+            except Exception as e:
+                logger.debug(f"Call extraction failed for {path_str}: {e}")
+
             count += 1
 
     return count, modules
@@ -302,6 +314,10 @@ class KnowDaemon:
             "recall": self._handle_recall,
             "reindex": self._handle_reindex,
             "status": self._handle_status,
+            "callers": self._handle_callers,
+            "callees": self._handle_callees,
+            "map": self._handle_map,
+            "deep": self._handle_deep,
         }
         handler = handlers.get(method)
         if not handler:
@@ -375,6 +391,43 @@ class KnowDaemon:
         limit = params.get("limit", 10)
         memories = self.db.recall_memories(query, limit)
         return {"memories": memories, "count": len(memories)}
+
+    async def _handle_callers(self, params: dict) -> dict:
+        """Find callers of a function."""
+        function_name = params.get("function_name", "")
+        limit = params.get("limit", 50)
+        results = self.db.get_callers(function_name, limit)
+        return {"callers": results, "count": len(results)}
+
+    async def _handle_callees(self, params: dict) -> dict:
+        """Find callees of a chunk."""
+        chunk_name = params.get("chunk_name", "")
+        limit = params.get("limit", 50)
+        results = self.db.get_callees(chunk_name, limit)
+        return {"callees": results, "count": len(results)}
+
+    async def _handle_map(self, params: dict) -> dict:
+        """Lightweight signature search — no bodies."""
+        query = params.get("query", "")
+        limit = params.get("limit", 20)
+        chunk_type = params.get("chunk_type")
+        results = self.db.search_signatures(query, limit, chunk_type)
+        return {"results": results, "count": len(results)}
+
+    async def _handle_deep(self, params: dict) -> dict:
+        """Deep context: function body + callers + callees within budget."""
+        name = params.get("name", "")
+        budget = params.get("budget", 3000)
+        include_tests = params.get("include_tests", False)
+        session_id = params.get("session_id")
+
+        from know.context_engine import ContextEngine
+        engine = ContextEngine(self.config)
+        result = engine.build_deep_context(
+            name, budget=budget, include_tests=include_tests,
+            session_id=session_id, db=self.db,
+        )
+        return result
 
     async def _handle_reindex(self, params: dict) -> dict:
         """Trigger full reindex."""

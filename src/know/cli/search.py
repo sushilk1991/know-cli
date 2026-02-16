@@ -205,6 +205,12 @@ def _search_bm25_fallback(ctx, config, query, top_k):
     is_flag=True,
     help="Use legacy filesystem scan instead of DaemonDB (debugging only)",
 )
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    help="Session ID for cross-query dedup ('auto' creates new, 'new' forces fresh)",
+)
 @click.pass_context
 def context(
     ctx: click.Context,
@@ -217,6 +223,7 @@ def context(
     exclude_patterns: tuple,
     chunk_types: Optional[str],
     legacy: bool,
+    session_id: Optional[str],
 ) -> None:
     """Build LLM-optimized context for a query.
 
@@ -251,6 +258,15 @@ def context(
     if chunk_types:
         parsed_chunk_types = [t.strip() for t in chunk_types.split(",")]
 
+    # Handle session ID
+    resolved_session_id = None
+    if session_id:
+        if session_id in ("auto", "new"):
+            import uuid
+            resolved_session_id = uuid.uuid4().hex[:8]
+        else:
+            resolved_session_id = session_id
+
     engine = ContextEngine(config)
     result = engine.build_context(
         query,
@@ -261,6 +277,7 @@ def context(
         include_patterns=list(include_patterns) if include_patterns else None,
         exclude_patterns=list(exclude_patterns) if exclude_patterns else None,
         chunk_types=parsed_chunk_types,
+        session_id=resolved_session_id,
     )
 
     # Inject relevant memories into context

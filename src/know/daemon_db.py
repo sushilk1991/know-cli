@@ -135,6 +135,37 @@ CREATE TABLE IF NOT EXISTS module_importance (
     score REAL NOT NULL DEFAULT 0.0,
     computed_at REAL NOT NULL
 );
+
+-- Symbol references (call graph from Tree-sitter AST)
+CREATE TABLE IF NOT EXISTS symbol_refs (
+    file_path TEXT NOT NULL,
+    ref_name TEXT NOT NULL,
+    ref_type TEXT NOT NULL,
+    line_number INTEGER NOT NULL,
+    containing_chunk TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_symrefs_name ON symbol_refs(ref_name);
+CREATE INDEX IF NOT EXISTS idx_symrefs_chunk ON symbol_refs(containing_chunk);
+CREATE INDEX IF NOT EXISTS idx_symrefs_file ON symbol_refs(file_path);
+
+-- Session tracking for deduplication
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_seen (
+    session_id TEXT NOT NULL,
+    chunk_key TEXT NOT NULL,
+    provided_at REAL NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, chunk_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(chunk_name);
+-- Note: idx_session_seen_sid not needed — PK (session_id, chunk_key) already covers session_id lookups
 """
 
 
@@ -219,13 +250,20 @@ class DaemonDB:
     def _build_fts_query(query: str) -> str:
         """Build OR-based FTS5 query from natural language string.
 
-        Each term is double-quoted to disable FTS5 operator interpretation.
-        BM25 ranking naturally boosts chunks matching more terms.
+        Uses query understanding to strip stop words, detect identifiers,
+        and build a smarter FTS5 query.  Falls back to raw split if the
+        query module is unavailable.
         """
-        terms = query.strip().split()[:MAX_SEARCH_TERMS]
-        if not terms:
-            return ""
-        return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            from know.query import analyze_query, build_fts_or_query
+            plan = analyze_query(query)
+            return build_fts_or_query(plan.all_search_terms)
+        except Exception:
+            # Fallback: raw whitespace split (pre-v3 behavior)
+            terms = query.strip().split()[:MAX_SEARCH_TERMS]
+            if not terms:
+                return ""
+            return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
     def _init_db(self):
         conn = self._get_conn()
@@ -300,17 +338,27 @@ class DaemonDB:
         try:
             row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
             current = row[0] if row else 0
-            if current < 3:
-                # v3: full source bodies stored — force reindex by clearing all indexed data
+            if current < 4:
+                # v3: full source bodies stored
+                # v4: symbol_refs table for call graph — force reindex
                 try:
                     conn.execute("DELETE FROM file_index")
                     conn.execute("DELETE FROM chunks")
+                    conn.execute("DELETE FROM symbol_refs")
                     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
                 except sqlite3.OperationalError:
                     pass
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
-                    (3, time.time()),
+                    (4, time.time()),
+                )
+                conn.commit()
+            if current < 5:
+                # v5: session tables for dedup (additive — no reindex needed)
+                # Tables are created by _SCHEMA, just bump version
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (5, time.time()),
                 )
                 conn.commit()
         except sqlite3.OperationalError:
@@ -381,19 +429,113 @@ class DaemonDB:
         return 3  # chunk_name, signature, body (old schema)
 
     def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """BM25F full-text search over code chunks with field weighting.
+        """Dual-lane search: OR + AND + exact-name match, fused via RRF.
 
-        Weights: chunk_name=5.0, file_path=5.0, signature=3.0, body=1.0
-        Falls back to equal weights on old 3-column schema.
+        Lane 1: FTS5 BM25F with OR query (broad recall)
+        Lane 2: FTS5 BM25F with AND query (high precision — all terms must match)
+        Lane 3: LIKE match on chunk_name for detected identifiers (exact match)
+
+        Results fused via Reciprocal Rank Fusion with lane-specific weights:
+        AND results get 2x weight, exact name matches get 3x.
         """
+        from know.query import analyze_query, build_fts_or_query, build_fts_and_query
+        from know.ranking import fuse_rankings
+
+        plan = analyze_query(query)
         conn = self._get_conn()
-        safe_query = self._build_fts_query(query)
-        if not safe_query:
+        col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
+
+        lanes: List[List[Dict[str, Any]]] = []
+
+        # Lane 1: OR query (broad recall)
+        or_query = build_fts_or_query(plan.all_search_terms)
+        if or_query:
+            lane1 = self._fts_search(conn, or_query, col_count, limit * 3)
+            if lane1:
+                lanes.append(lane1)
+
+        # Lane 2: AND query (high precision)
+        and_query = build_fts_and_query(plan.all_search_terms)
+        if and_query:
+            lane2 = self._fts_search(conn, and_query, col_count, limit * 2)
+            if lane2:
+                lanes.append(lane2)
+
+        # Lane 3: Exact name match for identifiers
+        lane3: List[Dict[str, Any]] = []
+        for ident in plan.identifiers:
+            try:
+                rows = conn.execute(
+                    """SELECT c.*, 100.0 AS score FROM chunks c
+                       WHERE c.chunk_name LIKE ? LIMIT ?""",
+                    (f"%{ident}%", limit),
+                ).fetchall()
+                lane3.extend(dict(r) for r in rows)
+            except sqlite3.OperationalError:
+                pass
+
+        # Also match file_path components for identifiers
+        for ident in plan.identifiers:
+            try:
+                rows = conn.execute(
+                    """SELECT c.*, 80.0 AS score FROM chunks c
+                       WHERE c.file_path LIKE ? LIMIT ?""",
+                    (f"%{ident}%", limit),
+                ).fetchall()
+                lane3.extend(dict(r) for r in rows)
+            except sqlite3.OperationalError:
+                pass
+
+        if lane3:
+            lanes.append(lane3)
+
+        if not lanes:
             return []
+
+        # If only one lane returned results, skip fusion
+        if len(lanes) == 1:
+            return lanes[0][:limit]
+
+        # RRF fusion with lane-specific weights
+        # Convert to (chunk_key, score) format for fuse_rankings
+        ranked_lists = []
+        for i, lane in enumerate(lanes):
+            # Lane weights: lane1 (OR)=1x, lane2 (AND)=2x, lane3 (exact)=3x
+            weight = [1, 2, 3][min(i, 2)]
+            keyed = []
+            for chunk in lane:
+                key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
+                keyed.append((key, chunk.get("score", 0)))
+            # Repeat the lane to give it more weight in RRF
+            for _ in range(weight):
+                ranked_lists.append(keyed)
+
+        fused = fuse_rankings(ranked_lists)
+
+        # Map back to full chunk dicts
+        chunk_map: Dict[str, Dict] = {}
+        for lane in lanes:
+            for chunk in lane:
+                key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
+                if key not in chunk_map:
+                    chunk_map[key] = chunk
+
+        results = []
+        for key, fused_score in fused[:limit]:
+            if key in chunk_map:
+                chunk = chunk_map[key]
+                chunk["score"] = fused_score
+                results.append(chunk)
+
+        return results
+
+    def _fts_search(
+        self, conn: sqlite3.Connection, fts_query: str,
+        col_count: int, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Execute a single FTS5 search query and return results."""
         try:
-            col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
             if col_count == 4:
-                # New schema: BM25F with field weights
                 rows = conn.execute(
                     """SELECT c.*, -bm25(chunks_fts, 5.0, 5.0, 3.0, 1.0) AS score
                        FROM chunks_fts
@@ -401,10 +543,9 @@ class DaemonDB:
                        WHERE chunks_fts MATCH ?
                        ORDER BY score DESC
                        LIMIT ?""",
-                    (safe_query, limit),
+                    (fts_query, limit),
                 ).fetchall()
             else:
-                # Old schema: default BM25 ranking
                 rows = conn.execute(
                     """SELECT c.*, rank AS score
                        FROM chunks_fts
@@ -412,10 +553,61 @@ class DaemonDB:
                        WHERE chunks_fts MATCH ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (safe_query, limit),
+                    (fts_query, limit),
                 ).fetchall()
+            return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
+
+    def search_signatures(self, query: str, limit: int = 20,
+                          chunk_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search chunks but return only lightweight signature data (no bodies).
+
+        Used by `know map` for fast orientation with minimal token cost.
+        Returns: file_path, chunk_name, chunk_type, signature, start_line, end_line, score,
+                 plus first line of body as docstring hint.
+        """
+        fetch_limit = limit * 3 if chunk_type else limit
+        results = self.search_chunks(query, limit=fetch_limit)
+        sigs = []
+        for r in results:
+            if chunk_type and r.get("chunk_type") != chunk_type:
+                continue
+            # Extract first line of body as docstring hint (after signature line)
+            docstring = ""
+            body = r.get("body", "")
+            if body:
+                lines = body.split("\n")
+                for line in lines[1:]:  # Skip first line (signature itself)
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith(("#", "//", "/*", "*")):
+                        # Look for docstring-like content
+                        if stripped.startswith(('"""', "'''", '"', "'")):
+                            docstring = stripped.strip("\"'").strip()[:120]
+                        elif stripped.startswith(("def ", "class ", "return ", "self.", "if ", "for ")):
+                            break  # Hit code, no docstring
+                        else:
+                            docstring = stripped[:120]
+                        break
+            sigs.append({
+                "file_path": r["file_path"],
+                "chunk_name": r["chunk_name"],
+                "chunk_type": r.get("chunk_type", "function"),
+                "signature": r.get("signature", ""),
+                "start_line": r.get("start_line", 0),
+                "end_line": r.get("end_line", 0),
+                "score": r.get("score", 0),
+                "docstring": docstring,
+            })
+        return sigs[:limit]
+
+    def get_chunks_by_name(self, name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Find chunks by exact chunk_name match. Used by `know deep`."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM chunks WHERE chunk_name = ? ORDER BY file_path LIMIT ?",
+            (name, limit),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
@@ -472,6 +664,7 @@ class DaemonDB:
         conn = self._get_conn()
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
         conn.execute("DELETE FROM file_index WHERE file_path = ?", (file_path,))
+        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
         self._commit(conn)
 
     # ------------------------------------------------------------------
@@ -708,6 +901,130 @@ class DaemonDB:
             modules,
         ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------------------------
+    # Symbol references (call graph)
+    # ------------------------------------------------------------------
+    def upsert_symbol_refs(self, file_path: str, refs: List[Dict[str, Any]]) -> None:
+        """Insert or replace symbol references for a file.
+
+        Each ref dict has: ref_name, ref_type, line_number, containing_chunk.
+        """
+        conn = self._get_conn()
+        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
+        if refs:
+            conn.executemany(
+                "INSERT INTO symbol_refs (file_path, ref_name, ref_type, line_number, containing_chunk) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(file_path, r["ref_name"], r["ref_type"], r["line_number"], r["containing_chunk"])
+                 for r in refs],
+            )
+        self._commit(conn)
+
+    def get_callers(self, function_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Find chunks that call a given function."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT file_path, containing_chunk, ref_type, line_number "
+            "FROM symbol_refs WHERE ref_name = ? LIMIT ?",
+            (function_name, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_callees(self, chunk_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Find functions called by a given chunk."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT ref_name, ref_type, file_path, line_number "
+            "FROM symbol_refs WHERE containing_chunk = ? LIMIT ?",
+            (chunk_name, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Session tracking (deduplication)
+    # ------------------------------------------------------------------
+    def create_session(self, session_id: Optional[str] = None) -> str:
+        """Create a new session. Returns session_id (auto-generated if None)."""
+        import uuid
+        if not session_id:
+            session_id = uuid.uuid4().hex[:8]
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, created_at, last_used_at) "
+            "VALUES (?, ?, ?)",
+            (session_id, now, now),
+        )
+        self._commit(conn)
+        return session_id
+
+    def get_session_seen(self, session_id: str) -> set:
+        """Get set of chunk_keys already provided in this session."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT chunk_key FROM session_seen WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            return {r[0] for r in rows}
+        except sqlite3.OperationalError:
+            return set()
+
+    def mark_session_seen(self, session_id: str, chunk_keys: List[str],
+                          tokens: Optional[List[int]] = None) -> None:
+        """Mark chunks as seen in a session."""
+        if not chunk_keys:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        if tokens is None:
+            tokens = [0] * len(chunk_keys)
+        # Ensure session exists
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
+            "VALUES (?, COALESCE((SELECT created_at FROM sessions WHERE session_id = ?), ?), ?)",
+            (session_id, session_id, now, now),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO session_seen (session_id, chunk_key, provided_at, tokens) "
+            "VALUES (?, ?, ?, ?)",
+            [(session_id, key, now, tok) for key, tok in zip(chunk_keys, tokens)],
+        )
+        self._commit(conn)
+
+    def cleanup_expired_sessions(self, ttl_seconds: int = 14400) -> int:
+        """Remove sessions older than TTL. Returns count removed."""
+        conn = self._get_conn()
+        cutoff = time.time() - ttl_seconds
+        try:
+            # Get expired session IDs
+            expired = conn.execute(
+                "SELECT session_id FROM sessions WHERE last_used_at < ?",
+                (cutoff,),
+            ).fetchall()
+            if expired:
+                ids = [r[0] for r in expired]
+                placeholders = ','.join('?' * len(ids))
+                conn.execute(f"DELETE FROM session_seen WHERE session_id IN ({placeholders})", ids)
+                conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", ids)
+                self._commit(conn)
+                return len(ids)
+        except sqlite3.OperationalError:
+            pass
+        return 0
+
+    def get_session_stats(self, session_id: str) -> Dict[str, Any]:
+        """Get stats for a session."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM session_seen WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return {"chunks_seen": row[0], "tokens_provided": row[1]}
+        except sqlite3.OperationalError:
+            return {"chunks_seen": 0, "tokens_provided": 0}
 
     # ------------------------------------------------------------------
     # Zero-result intelligence
