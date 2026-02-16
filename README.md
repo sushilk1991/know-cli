@@ -25,45 +25,47 @@ AI coding agents dump entire files into context. Every `@file` reference, every 
 - ⚡ Background daemon for sub-100ms query latency
 - 🤖 Agent-native commands (`next-file`, `signatures`, `related`) for autonomous workflows
 
-**10-18x fewer tokens. Same (or better) results.**
+**8-15x fewer tokens. Same (or better) results.**
 
 ---
 
 ## Benchmarks
 
-We compared `know context` against the traditional agent workflow (Grep to find files → Read full files) on two real projects.
+We compared `know context` against the traditional agent workflow (Grep to find files → Read full files) on two real projects. Clean run — indexes deleted before each benchmark.
 
-### know-cli (35 files, 369 functions)
-
-| Scenario | Grep+Read | know context | Reduction |
-|---|---|---|---|
-| Daemon indexing logic | 18,791 tokens | 1,064 tokens | **17.7x** |
-| FTS5 search implementation | 21,937 tokens | 1,046 tokens | **21.0x** |
-| Python parser functions | 11,342 tokens | 975 tokens | **11.6x** |
-| Context engine budget | 24,075 tokens | 1,191 tokens | **20.2x** |
-| Import graph logic | 20,916 tokens | 1,149 tokens | **18.2x** |
-| **Total** | **97,061 tokens** | **5,425 tokens** | **17.9x** |
-
-### farfield (762 files, 2,457 functions — production app)
+### know-cli (35 files, 159 chunks)
 
 | Scenario | Grep+Read | know context | Reduction |
 |---|---|---|---|
-| WebSocket connection handling | 12,936 tokens | 1,475 tokens | **8.8x** |
-| Authentication and API keys | 3,383 tokens | 1,456 tokens | **2.3x** |
-| Model routing and inference | 27,556 tokens | 1,472 tokens | **18.7x** |
-| Error handling and retries | 25,160 tokens | 1,474 tokens | **17.1x** |
-| Database and storage | 5,357 tokens | 1,451 tokens | **3.7x** |
-| **Total** | **74,392 tokens** | **7,328 tokens** | **10.2x** |
+| Daemon indexing logic | 27,569 tokens | 1,650 tokens | **16.7x** |
+| FTS5 search implementation | 28,274 tokens | 1,514 tokens | **18.7x** |
+| Python parser functions | 12,446 tokens | 1,369 tokens | **9.1x** |
+| Context engine budget | 18,665 tokens | 1,557 tokens | **12.0x** |
+| Import graph logic | 28,274 tokens | 1,531 tokens | **18.5x** |
+| **Total** | **115,228 tokens** | **7,621 tokens** | **15.1x** |
+
+### farfield (762 files, 2,228 chunks — production TypeScript+Python app)
+
+| Scenario | Grep+Read | know context | Reduction |
+|---|---|---|---|
+| WebSocket connection handling | 12,936 tokens | 1,714 tokens | **7.5x** |
+| Authentication and API keys | 3,383 tokens | 1,623 tokens | **2.1x** |
+| Model routing and inference | 27,556 tokens | 1,772 tokens | **15.6x** |
+| Error handling and retries | 25,160 tokens | 1,773 tokens | **14.2x** |
+| Database and storage | 5,357 tokens | 1,773 tokens | **3.0x** |
+| **Total** | **74,392 tokens** | **8,655 tokens** | **8.6x** |
 
 ### Summary
 
 | Metric | Grep+Read | know context |
 |---|---|---|
-| Avg token reduction | — | **10-18x fewer** |
+| Avg token reduction | — | **8-15x fewer** |
 | Tool calls per query | 7-9 (grep + read) | **1** |
+| Cold start (first use) | N/A | 0.5s (small) / 13s (large) |
+| Warm query latency | N/A (multi-step) | **170ms** (small) / **1.8s** (large) |
+| Budget utilization | — | **77-80%** |
 | Signal-to-noise ratio | ~5-10% signal | **~100% signal** |
 | Returns actual source code | Full files (mostly irrelevant) | Ranked functions/classes |
-| Warm query latency | N/A (multi-step) | **<100ms** |
 
 ---
 
