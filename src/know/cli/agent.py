@@ -159,6 +159,82 @@ def related(ctx: click.Context, file_path: str) -> None:
             console.print("[dim]No dependents found.[/dim]")
 
 
+@click.command("callers")
+@click.argument("function_name")
+@click.pass_context
+def callers(ctx: click.Context, function_name: str) -> None:
+    """Find all chunks that call a given function."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    client = _get_daemon_client(config)
+    results = None
+    if client:
+        try:
+            result = client.call_sync("callers", {"function_name": function_name})
+            results = result.get("callers", [])
+        except Exception as e:
+            logger.debug(f"Daemon callers failed, falling back: {e}")
+            client = None
+
+    if results is None:
+        db = _get_db_fallback(config)
+        results = db.get_callers(function_name)
+        db.close()
+
+    output = ctx.obj.get("output_format", "rich")
+    if output == "json":
+        console.print(_json.dumps({"callers": results, "count": len(results)}))
+    else:
+        if results:
+            console.print(f"[bold]Callers of [cyan]{function_name}[/cyan]:[/bold]")
+            for r in results:
+                console.print(f"  {r['file_path']} → {r['containing_chunk']}:{r['line_number']}")
+        else:
+            console.print(f"[dim]No callers found for '{function_name}'.[/dim]")
+
+
+@click.command("callees")
+@click.argument("chunk_name")
+@click.pass_context
+def callees(ctx: click.Context, chunk_name: str) -> None:
+    """Find all functions called by a given chunk."""
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized.[/red]")
+        return
+
+    client = _get_daemon_client(config)
+    results = None
+    if client:
+        try:
+            result = client.call_sync("callees", {"chunk_name": chunk_name})
+            results = result.get("callees", [])
+        except Exception as e:
+            logger.debug(f"Daemon callees failed, falling back: {e}")
+            client = None
+
+    if results is None:
+        db = _get_db_fallback(config)
+        results = db.get_callees(chunk_name)
+        db.close()
+
+    output = ctx.obj.get("output_format", "rich")
+    if output == "json":
+        console.print(_json.dumps({"callees": results, "count": len(results)}))
+    else:
+        if results:
+            console.print(f"[bold]Functions called by [cyan]{chunk_name}[/cyan]:[/bold]")
+            for r in results:
+                console.print(f"  → {r['ref_name']} ({r['ref_type']}) at {r['file_path']}:{r['line_number']}")
+        else:
+            console.print(f"[dim]No callees found for '{chunk_name}'.[/dim]")
+
+
 @click.command("generate-context")
 @click.option("--budget", "-b", type=int, default=8000, help="Token budget for CONTEXT.md")
 @click.pass_context

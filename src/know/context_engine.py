@@ -602,6 +602,7 @@ class ContextEngine:
         code_chunks: List[Dict] = []
         code_used = 0
         seen_files: set = set()
+        seen_chunk_keys: set = set()
         for chunk in raw_results:
             tokens = chunk.get("token_count", 0)
             if tokens == 0:
@@ -611,8 +612,20 @@ class ContextEngine:
             code_chunks.append(chunk)
             code_used += tokens
             seen_files.add(chunk["file_path"])
+            seen_chunk_keys.add(
+                f"{chunk['file_path']}:{chunk.get('chunk_name', '')}:{chunk.get('start_line', 0)}"
+            )
+
+        # Step 7.5: Context expansion — add neighborhoods
+        code_chunks, code_used = self._expand_context(
+            db, code_chunks, code_used, budget_code, seen_chunk_keys,
+        )
+
+        # Step 7.6: Chunk deduplication — remove overlapping class/method chunks
+        code_chunks, code_used = self._deduplicate_chunks(code_chunks)
 
         # Step 8: Bundle structural metadata (batch import lookups)
+        seen_files = {c["file_path"] for c in code_chunks}
         if seen_files:
             self._bundle_metadata(db, code_chunks, seen_files)
 
@@ -660,6 +673,160 @@ class ContextEngine:
             "index_stats": stats,
             "confidence": confidence,
         }
+
+    def _expand_context(
+        self,
+        db,
+        code_chunks: List[Dict],
+        code_used: int,
+        budget_code: int,
+        seen_chunk_keys: set,
+    ) -> Tuple[List[Dict], int]:
+        """Expand selected chunks with neighborhoods for better context.
+
+        For each selected chunk:
+        - Include module-level chunk (imports + docstring) from same file
+        - If method, include parent class signature
+        - Include adjacent chunks (within 10 lines) if budget allows
+        """
+        if not code_chunks:
+            return code_chunks, code_used
+
+        # Collect all file paths that need expansion
+        files_to_expand = {c["file_path"] for c in code_chunks}
+
+        # Pre-fetch all chunks for these files (batch)
+        file_chunks_map: Dict[str, List[Dict]] = {}
+        for fp in files_to_expand:
+            file_chunks_map[fp] = db.get_chunks_for_file(fp)
+
+        extra_chunks: List[Dict] = []
+
+        for chunk in list(code_chunks):
+            fp = chunk["file_path"]
+            all_file_chunks = file_chunks_map.get(fp, [])
+            chunk_start = chunk.get("start_line", 0)
+            chunk_end = chunk.get("end_line", 0)
+            chunk_type = chunk.get("chunk_type", "")
+
+            # 1. Include module-level chunk (imports + docstring) from same file
+            for fc in all_file_chunks:
+                if fc.get("chunk_type") == "module":
+                    key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                    if key not in seen_chunk_keys:
+                        tokens = fc.get("token_count", 0)
+                        if code_used + tokens <= budget_code:
+                            extra_chunks.append(fc)
+                            code_used += tokens
+                            seen_chunk_keys.add(key)
+                    break  # Only one module chunk per file
+
+            # 2. If method, include parent class signature
+            if chunk_type == "method":
+                for fc in all_file_chunks:
+                    if fc.get("chunk_type") == "class":
+                        fc_start = fc.get("start_line", 0)
+                        fc_end = fc.get("end_line", 0)
+                        # Class encloses this method
+                        if fc_start <= chunk_start and fc_end >= chunk_end:
+                            key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                            if key not in seen_chunk_keys:
+                                # Add just class signature (first few lines)
+                                sig_body = fc.get("signature", fc.get("chunk_name", ""))
+                                doc = ""
+                                body = fc.get("body", "")
+                                # Extract first ~5 lines as class header
+                                body_lines = body.split("\n")[:5]
+                                sig_text = "\n".join(body_lines)
+                                tokens = count_tokens(sig_text)
+                                if code_used + tokens <= budget_code:
+                                    sig_chunk = dict(fc)
+                                    sig_chunk["body"] = sig_text
+                                    sig_chunk["token_count"] = tokens
+                                    sig_chunk["chunk_name"] = f"{fc.get('chunk_name', '')} (class header)"
+                                    extra_chunks.append(sig_chunk)
+                                    code_used += tokens
+                                    seen_chunk_keys.add(key)
+                            break
+
+            # 3. Include adjacent chunks (within 10 lines) if budget allows
+            for fc in all_file_chunks:
+                fc_start = fc.get("start_line", 0)
+                fc_end = fc.get("end_line", 0)
+                key = f"{fc['file_path']}:{fc.get('chunk_name', '')}:{fc.get('start_line', 0)}"
+                if key in seen_chunk_keys:
+                    continue
+                # Check adjacency: within 10 lines of the selected chunk
+                if (abs(fc_start - chunk_end) <= 10 or abs(chunk_start - fc_end) <= 10):
+                    tokens = fc.get("token_count", 0)
+                    if code_used + tokens <= budget_code:
+                        extra_chunks.append(fc)
+                        code_used += tokens
+                        seen_chunk_keys.add(key)
+
+        code_chunks.extend(extra_chunks)
+        return code_chunks, code_used
+
+    def _deduplicate_chunks(
+        self, code_chunks: List[Dict],
+    ) -> Tuple[List[Dict], int]:
+        """Remove overlapping class/method chunks.
+
+        If a class chunk AND its method chunks are both selected:
+        - If 3+ methods selected from same class → drop the full class body
+        - Otherwise keep the class chunk and drop methods already inside it
+        """
+        if not code_chunks:
+            return code_chunks, 0
+
+        # Group by file
+        by_file: Dict[str, List[Dict]] = {}
+        for c in code_chunks:
+            by_file.setdefault(c["file_path"], []).append(c)
+
+        keep: List[Dict] = []
+        total_tokens = 0
+
+        for fp, chunks in by_file.items():
+            classes = [c for c in chunks if c.get("chunk_type") == "class"]
+            methods = [c for c in chunks if c.get("chunk_type") == "method"]
+            others = [c for c in chunks if c.get("chunk_type") not in ("class", "method")]
+
+            # Always keep non-class/method chunks
+            for c in others:
+                keep.append(c)
+                total_tokens += c.get("token_count", 0)
+
+            for cls in classes:
+                cls_start = cls.get("start_line", 0)
+                cls_end = cls.get("end_line", 0)
+
+                # Find methods that are inside this class
+                enclosed = [
+                    m for m in methods
+                    if m.get("start_line", 0) >= cls_start
+                    and m.get("end_line", 0) <= cls_end
+                ]
+
+                if len(enclosed) >= 3:
+                    # Many methods selected → skip the full class body, keep methods
+                    for m in enclosed:
+                        keep.append(m)
+                        total_tokens += m.get("token_count", 0)
+                        methods = [x for x in methods if x is not m]
+                else:
+                    # Few methods → keep class body, skip enclosed methods
+                    keep.append(cls)
+                    total_tokens += cls.get("token_count", 0)
+                    for m in enclosed:
+                        methods = [x for x in methods if x is not m]
+
+            # Keep methods not enclosed in any class
+            for m in methods:
+                keep.append(m)
+                total_tokens += m.get("token_count", 0)
+
+        return keep, total_tokens
 
     def _apply_filters(
         self,

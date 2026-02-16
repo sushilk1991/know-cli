@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS module_importance (
     score REAL NOT NULL DEFAULT 0.0,
     computed_at REAL NOT NULL
 );
+
+-- Symbol references (call graph from Tree-sitter AST)
+CREATE TABLE IF NOT EXISTS symbol_refs (
+    file_path TEXT NOT NULL,
+    ref_name TEXT NOT NULL,
+    ref_type TEXT NOT NULL,
+    line_number INTEGER NOT NULL,
+    containing_chunk TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_symrefs_name ON symbol_refs(ref_name);
+CREATE INDEX IF NOT EXISTS idx_symrefs_chunk ON symbol_refs(containing_chunk);
+CREATE INDEX IF NOT EXISTS idx_symrefs_file ON symbol_refs(file_path);
 """
 
 
@@ -808,6 +821,45 @@ class DaemonDB:
             modules,
         ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------------------------
+    # Symbol references (call graph)
+    # ------------------------------------------------------------------
+    def upsert_symbol_refs(self, file_path: str, refs: List[Dict[str, Any]]) -> None:
+        """Insert or replace symbol references for a file.
+
+        Each ref dict has: ref_name, ref_type, line_number, containing_chunk.
+        """
+        conn = self._get_conn()
+        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
+        if refs:
+            conn.executemany(
+                "INSERT INTO symbol_refs (file_path, ref_name, ref_type, line_number, containing_chunk) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(file_path, r["ref_name"], r["ref_type"], r["line_number"], r["containing_chunk"])
+                 for r in refs],
+            )
+        self._commit(conn)
+
+    def get_callers(self, function_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Find chunks that call a given function."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT file_path, containing_chunk, ref_type, line_number "
+            "FROM symbol_refs WHERE ref_name = ? LIMIT ?",
+            (function_name, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_callees(self, chunk_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Find functions called by a given chunk."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT ref_name, ref_type, file_path, line_number "
+            "FROM symbol_refs WHERE containing_chunk = ? LIMIT ?",
+            (chunk_name, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Zero-result intelligence

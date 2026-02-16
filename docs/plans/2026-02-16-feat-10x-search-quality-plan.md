@@ -82,9 +82,9 @@ Between step 2 (category demotion) and step 5 (relevance floor):
 
 After greedy budget fill (step 7), for each selected chunk:
 
-- [ ] Include module-level chunk (imports + module docstring) from same file, if budget allows
-- [ ] If method, include parent class signature
-- [ ] Include adjacent chunks (within 10 lines) if budget allows
+- [x] Include module-level chunk (imports + module docstring) from same file, if budget allows
+- [x] If method, include parent class signature
+- [x] Include adjacent chunks (within 10 lines) if budget allows
 - [ ] Group same-file chunks into a single block with line gaps preserved
 
 This gives agents the "story" instead of fragments.
@@ -103,9 +103,9 @@ This gives agents the "story" instead of fragments.
 
 **Modify: `src/know/context_engine.py`**
 
-- [ ] If a class chunk and its method chunks are both selected, keep only the more specific match
-- [ ] Class body contains method bodies → skip method chunks already inside a selected class
-- [ ] Or vice versa: if 3 methods selected from same class, skip the class body chunk
+- [x] If a class chunk and its method chunks are both selected, keep only the more specific match
+- [x] Class body contains method bodies → skip method chunks already inside a selected class
+- [x] Or vice versa: if 3 methods selected from same class, skip the class body chunk
 
 ### Phase 7: Call Graph from Tree-sitter (P2 — the 10x moat grep cannot replicate)
 
@@ -121,11 +121,11 @@ CREATE TABLE IF NOT EXISTS symbol_refs (
 );
 ```
 
-- [ ] During `populate_index()`, walk Tree-sitter AST to extract function call references
-- [ ] Store in `symbol_refs` table with indexes on `ref_name` and `containing_chunk`
-- [ ] Add `get_callers(chunk_name)` and `get_callees(chunk_name)` to DaemonDB
+- [x] During `populate_index()`, walk Tree-sitter AST to extract function call references
+- [x] Store in `symbol_refs` table with indexes on `ref_name` and `containing_chunk`
+- [x] Add `get_callers(chunk_name)` and `get_callees(chunk_name)` to DaemonDB
 - [ ] In ranking: boost chunks that call or are called by top matches (dependency proximity)
-- [ ] New CLI command: `know callers <function_name>` — what grep fundamentally cannot do
+- [x] New CLI command: `know callers <function_name>` — what grep fundamentally cannot do
 
 ## Acceptance Criteria
 
@@ -141,15 +141,15 @@ CREATE TABLE IF NOT EXISTS symbol_refs (
 - [x] File path matches boost results
 
 ### Phase 4+5+6 (Context + Budget)
-- [ ] Selected method chunks include parent class signature
-- [ ] Same-file chunks grouped with imports visible
+- [x] Selected method chunks include parent class signature
+- [x] Same-file chunks grouped with imports visible
 - [x] Budget allocation varies by query type
-- [ ] No duplicate code in output (class + method overlap eliminated)
+- [x] No duplicate code in output (class + method overlap eliminated)
 
 ### Phase 7 (Call graph)
-- [ ] `symbol_refs` table populated during indexing
-- [ ] `know callers verify_session` returns list of calling functions
-- [ ] Call graph is cross-file (not just within-file)
+- [x] `symbol_refs` table populated during indexing
+- [x] `know callers verify_session` returns list of calling functions
+- [x] Call graph is cross-file (not just within-file)
 
 ## Verification: Re-run A/B Test
 
