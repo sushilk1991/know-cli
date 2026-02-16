@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Reads result JSONs and produces a markdown benchmark report."""
+
+import json
+from pathlib import Path
+
+from conftest import RESULTS_DIR, get_know_version
+
+
+def load_json(filename: str) -> dict | None:
+    path = RESULTS_DIR / filename
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def generate_report() -> str:
+    version = get_know_version()
+    lines = [
+        f"# know-cli v{version} Benchmark Report",
+        f"Codebase: farfield (764 files, 2487 functions, TypeScript+Python monorepo)",
+        "",
+    ]
+
+    # ── Suite 1: Token Efficiency ──────────────────────────────────────────
+    te = load_json("token_efficiency.json")
+    if te:
+        lines.append("## Token Efficiency (per-query)")
+        lines.append("")
+        lines.append("| Scenario | Grep+Read | v0.6.0 | v0.7.0 3-tier | v0.7 vs v0.6 |")
+        lines.append("|----------|-----------|--------|---------------|--------------|")
+
+        for s in te["scenarios"]:
+            grep_tok = s["grep_read"]["tokens"]
+            v6_tok = s["v6_context"].get("tokens", 0)
+            v7_tok = s["v7_3tier"].get("tokens", 0)
+            improvement = f"{round((1 - v7_tok/v6_tok)*100)}%" if v6_tok > 0 else "N/A"
+            lines.append(
+                f"| {s['scenario_id']} | {grep_tok:,} | {v6_tok:,} | {v7_tok:,} | {improvement} |"
+            )
+
+        summary = te["summary"]
+        lines.append("")
+        lines.append(f"**Totals**: Grep={summary['total_grep_tokens']:,} | "
+                     f"v0.6={summary['total_v6_tokens']:,} | "
+                     f"v0.7={summary['total_v7_tokens']:,}")
+        lines.append(f"**v0.6 vs Grep**: {summary['v6_vs_grep']}x reduction")
+        lines.append(f"**v0.7 vs Grep**: {summary['v7_vs_grep']}x reduction")
+        lines.append(f"**v0.7 vs v0.6**: {summary['v7_vs_v6']}% fewer tokens")
+        lines.append("")
+
+    # ── Suite 2: Session Dedup ─────────────────────────────────────────────
+    sd = load_json("session_dedup.json")
+    if sd:
+        lines.append("## Session Dedup Effectiveness")
+        lines.append("")
+        lines.append("| Query | No Session | With Session | Savings |")
+        lines.append("|-------|------------|--------------|---------|")
+
+        for pq in sd["per_query"]:
+            lines.append(
+                f"| {pq['query'][:35]} | {pq['no_session_tokens']:,} | "
+                f"{pq['with_session_tokens']:,} | {pq['savings_pct']}% |"
+            )
+
+        summary = sd["summary"]
+        lines.append("")
+        lines.append(f"**Total**: {summary['total_no_session']:,} → "
+                     f"{summary['total_with_session']:,} "
+                     f"({summary['total_savings_pct']}% savings)")
+        lines.append("")
+
+    # ── Suite 3+4: Agent E2E + Quality ─────────────────────────────────────
+    ae = load_json("agent_e2e.json")
+    if ae:
+        lines.append("## Agent Performance (end-to-end)")
+        lines.append("")
+        lines.append("| Metric | v0.7.0 | v0.6.0 | Grep+Read |")
+        lines.append("|--------|--------|--------|-----------|")
+
+        agents_by_name = {a["agent"]: a["summary"] for a in ae["agents"]}
+        v7 = agents_by_name.get("v7_3tier", {})
+        v6 = agents_by_name.get("v6_context", {})
+        gr = agents_by_name.get("grep_read", {})
+
+        lines.append(f"| Tool calls (avg) | {v7.get('avg_tool_calls', 'N/A')} | "
+                     f"{v6.get('avg_tool_calls', 'N/A')} | {gr.get('avg_tool_calls', 'N/A')} |")
+        lines.append(f"| Total tokens (avg) | {v7.get('avg_total_tokens', 'N/A'):,} | "
+                     f"{v6.get('avg_total_tokens', 'N/A'):,} | {gr.get('avg_total_tokens', 'N/A'):,} |")
+
+        if any(a.get("avg_quality") is not None for a in [v7, v6, gr]):
+            def fmt_q(a):
+                q = a.get("avg_quality")
+                return f"{q}/10" if q is not None else "N/A"
+            lines.append(f"| Quality score | {fmt_q(v7)} | {fmt_q(v6)} | {fmt_q(gr)} |")
+
+        lines.append("")
+
+        # Per-question breakdown
+        lines.append("### Per-Question Breakdown")
+        lines.append("")
+
+        for agent_data in ae["agents"]:
+            aname = agent_data["agent"]
+            lines.append(f"**{aname}**:")
+            lines.append("| Question | Tool Calls | Tokens | Quality | Time |")
+            lines.append("|----------|------------|--------|---------|------|")
+
+            for q in agent_data["questions"]:
+                quality = q.get("quality", {})
+                q_score = quality.get("total_score", "N/A")
+                q_max = quality.get("max_score", 10)
+                lines.append(
+                    f"| {q['question_id']} | {q['tool_calls']} | "
+                    f"{q['total_tokens']:,} | {q_score}/{q_max} | {q['elapsed_s']}s |"
+                )
+            lines.append("")
+
+    # ── Footer ─────────────────────────────────────────────────────────────
+    lines.append("---")
+    lines.append(f"*Generated by know-cli benchmark suite v{version}*")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    print("Generating benchmark report...")
+    report = generate_report()
+
+    out = RESULTS_DIR / "BENCHMARK_REPORT.md"
+    out.write_text(report)
+    print(f"Report saved to: {out}")
+    print()
+    print(report)
+
+
+if __name__ == "__main__":
+    main()

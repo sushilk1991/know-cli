@@ -30,26 +30,39 @@ Session dedup means the second query never re-sends code from the first.
 
 ## Benchmarks
 
-### Token efficiency: know context vs Grep+Read
+**farfield** (764 files, 2487 functions, production TypeScript+Python monorepo)
 
-**farfield** (762 files, production TypeScript+Python):
+### Token efficiency: 3-tier vs single-context vs Grep+Read (8 scenarios)
 
-| Scenario | Grep+Read | know context | Reduction |
-|---|---|---|---|
-| WebSocket handling | 12,936 tokens | 1,714 tokens | **7.5x** |
-| Auth and API keys | 3,383 tokens | 1,623 tokens | **2.1x** |
-| Model routing | 27,556 tokens | 1,772 tokens | **15.6x** |
-| Error handling | 25,160 tokens | 1,773 tokens | **14.2x** |
-| Database + storage | 5,357 tokens | 1,773 tokens | **3.0x** |
-| **Total** | **74,392** | **8,655** | **8.6x** |
+| Scenario | Grep+Read | v0.6 context-only | v0.7 3-tier | v0.7 vs v0.6 |
+|---|---|---|---|---|
+| WebSocket handling | 106,257 | 5,976 | 3,549 | **-41%** |
+| Auth & API keys | 145,690 | 4,063 | 3,569 | **-12%** |
+| Model routing | 125,453 | 5,271 | 3,251 | **-38%** |
+| Error handling | 45,205 | 7,517 | 4,226 | **-44%** |
+| Database storage | 180,329 | 5,479 | 3,138 | **-43%** |
+| Billing | 41,789 | 5,424 | 3,295 | **-39%** |
+| LLM providers | 176,184 | 5,085 | 3,184 | **-37%** |
+| Agent execution | 175,338 | 2,250 | 2,445 | -9% |
+| **Total** | **996,245** | **41,065** | **26,657** | **-35%** |
 
-### Head-to-head agent benchmark (farfield, 762 files)
+v0.7 3-tier = `know map` → `know context --session` → `know deep`
+
+- **37.4x** fewer tokens than grep+read
+- **35%** fewer tokens than v0.6 context-only
+
+### Live head-to-head agent benchmark
+
+Two Claude Opus agents answered 3 identical questions about the farfield codebase. One used `know` CLI, the other used grep+read.
 
 | Metric | Agent with `know` | Agent with Grep+Read |
 |---|---|---|
-| Tool calls | 14 | 36 |
-| Total tokens | 105,950 | 113,471 |
-| Quality | Equivalent | Equivalent |
+| Tool calls | **28** | 40 |
+| Total tokens | **98,593** | 107,060 |
+| Duration | 215s | 206s |
+| Answer quality | Equivalent | Equivalent |
+
+**30% fewer tool calls. 8% fewer tokens. Same answer quality.**
 
 ---
 

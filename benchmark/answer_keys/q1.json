@@ -1,0 +1,49 @@
+{
+  "question_id": "q1",
+  "topic": "Billing/Subscription System",
+  "facts": [
+    {
+      "id": "f1",
+      "description": "Names the Subscription model or equivalent billing model class",
+      "keywords": ["Subscription", "subscription", "model"],
+      "weight": 2
+    },
+    {
+      "id": "f2",
+      "description": "Identifies billing plan tiers (e.g. free, pro, team, enterprise or sandbox, paid)",
+      "keywords": ["plan", "tier", "free", "pro", "team", "enterprise", "sandbox"],
+      "weight": 2
+    },
+    {
+      "id": "f3",
+      "description": "Explains how sandbox limits are enforced (rate limits, usage caps, middleware)",
+      "keywords": ["sandbox", "limit", "enforce", "rate", "cap", "usage"],
+      "weight": 2
+    },
+    {
+      "id": "f4",
+      "description": "Names specific files involved in billing (e.g. billing router, subscription service)",
+      "keywords": ["billing", "router", "service", "file"],
+      "weight": 1
+    },
+    {
+      "id": "f5",
+      "description": "Describes the payment processing flow (Stripe integration, webhooks)",
+      "keywords": ["Stripe", "payment", "webhook", "checkout"],
+      "weight": 1
+    },
+    {
+      "id": "f6",
+      "description": "Names specific functions involved in subscription management",
+      "keywords": ["create_subscription", "cancel", "update", "function"],
+      "weight": 1
+    },
+    {
+      "id": "f7",
+      "description": "Describes how plan limits map to features or quotas",
+      "keywords": ["quota", "feature", "limit", "plan"],
+      "weight": 1
+    }
+  ],
+  "max_score": 10
+}

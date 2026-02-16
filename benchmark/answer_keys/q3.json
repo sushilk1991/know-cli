@@ -1,0 +1,49 @@
+{
+  "question_id": "q3",
+  "topic": "Agent Execution Pipeline",
+  "facts": [
+    {
+      "id": "f1",
+      "description": "Describes the flow from user message to agent response",
+      "keywords": ["message", "flow", "pipeline", "request", "response"],
+      "weight": 2
+    },
+    {
+      "id": "f2",
+      "description": "Explains LangGraph's role in the agent execution",
+      "keywords": ["LangGraph", "langgraph", "graph", "state"],
+      "weight": 2
+    },
+    {
+      "id": "f3",
+      "description": "Describes how tools/MCP servers are integrated",
+      "keywords": ["tool", "MCP", "mcp", "server", "integrate"],
+      "weight": 2
+    },
+    {
+      "id": "f4",
+      "description": "Names specific files in the execution pipeline",
+      "keywords": ["file", "agent", "executor", "runner"],
+      "weight": 1
+    },
+    {
+      "id": "f5",
+      "description": "Describes the agent loop or turn-based execution",
+      "keywords": ["loop", "turn", "iteration", "step"],
+      "weight": 1
+    },
+    {
+      "id": "f6",
+      "description": "Explains how agent state is managed between turns",
+      "keywords": ["state", "memory", "context", "history"],
+      "weight": 1
+    },
+    {
+      "id": "f7",
+      "description": "Names specific classes or functions in the pipeline",
+      "keywords": ["class", "function", "agent", "run"],
+      "weight": 1
+    }
+  ],
+  "max_score": 10
+}

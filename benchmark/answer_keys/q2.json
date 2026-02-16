@@ -1,0 +1,49 @@
+{
+  "question_id": "q2",
+  "topic": "LLM Provider System",
+  "facts": [
+    {
+      "id": "f1",
+      "description": "Names provider_discovery module and explains its purpose",
+      "keywords": ["provider_discovery", "discover", "provider"],
+      "weight": 2
+    },
+    {
+      "id": "f2",
+      "description": "Lists supported LLM providers (OpenAI, Anthropic, Gemini, etc.)",
+      "keywords": ["OpenAI", "Anthropic", "Gemini", "provider"],
+      "weight": 2
+    },
+    {
+      "id": "f3",
+      "description": "Explains workspace-level model settings and how they're stored",
+      "keywords": ["workspace", "model", "settings", "config"],
+      "weight": 2
+    },
+    {
+      "id": "f4",
+      "description": "Describes how provider selection/routing works",
+      "keywords": ["select", "route", "routing", "choose"],
+      "weight": 1
+    },
+    {
+      "id": "f5",
+      "description": "Names specific files involved in provider configuration",
+      "keywords": ["file", "config", "provider"],
+      "weight": 1
+    },
+    {
+      "id": "f6",
+      "description": "Explains API key management for different providers",
+      "keywords": ["api_key", "key", "credential", "secret"],
+      "weight": 1
+    },
+    {
+      "id": "f7",
+      "description": "Describes model fallback or default behavior",
+      "keywords": ["fallback", "default", "model"],
+      "weight": 1
+    }
+  ],
+  "max_score": 10
+}
