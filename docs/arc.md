@@ -22,13 +22,13 @@
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.generator](src/know/generator.py)** - Documentation generator.
 - **[src.know.config](src/know/config.py)** - Configuration management for know.
-- ... and 18 more modules
+- ... and 20 more modules
 
 ## 📊 Statistics
 
-- **Files:** 33
-- **Modules:** 33
-- **Functions:** 74
+- **Files:** 35
+- **Modules:** 35
+- **Functions:** 81
 - **Classes:** 55
 
 ---
