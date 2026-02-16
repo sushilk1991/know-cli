@@ -10,6 +10,7 @@ graph TB
     logger["logger\n(2f, 0c)"]
     watcher["watcher\n(0f, 2c)"]
     embeddings["embeddings\n(4f, 0c)"]
+    query["query\n(10f, 1c)"]
     models["models\n(0f, 4c)"]
     token_counter["token_counter\n(5f, 0c)"]
     stats["stats\n(0f, 1c)"]
@@ -21,13 +22,13 @@ graph TB
     exceptions["exceptions\n(0f, 8c)"]
     git_hooks["git_hooks\n(2f, 1c)"]
     file_categories["file_categories\n(7f, 0c)"]
-    daemon_db["daemon_db\n(2f, 2c)"]
 
     daemon --> config
     daemon --> daemon_db
     daemon --> logger
     daemon --> parsers
     daemon --> scanner
+    daemon --> context_engine
     daemon --> import_graph
     ai --> config
     diff --> config
@@ -58,6 +59,8 @@ graph TB
     git_hooks --> config
     daemon_db --> logger
     daemon_db --> token_counter
+    daemon_db --> query
+    daemon_db --> ranking
     mcp_server --> logger
     mcp_server --> config
     mcp_server --> context_engine
@@ -84,6 +87,7 @@ graph TB
     context_engine --> file_categories
     context_engine --> ranking
     context_engine --> scanner
+    context_engine --> query
     context_engine --> import_graph
     context_engine --> daemon
     hooks --> git_hooks
@@ -120,6 +124,7 @@ graph TB
     agent --> daemon
     agent --> import_graph
     agent --> scanner
+    agent --> context_engine
     mcp --> mcp_server
 ```
 

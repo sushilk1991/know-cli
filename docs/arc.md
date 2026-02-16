@@ -15,21 +15,21 @@
 - **[src.know.logger](src/know/logger.py)** - Logging configuration for know.
 - **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
 - **[src.know.embeddings](src/know/embeddings.py)** - Centralized embedding model management.
+- **[src.know.query](src/know/query.py)** - Query understanding for intelligent FTS5 search.
 - **[src.know.models](src/know/models.py)** - Data models for know-cli.
 - **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
 - **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
 - **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
 - **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
 - **[src.know.generator](src/know/generator.py)** - Documentation generator.
-- **[src.know.config](src/know/config.py)** - Configuration management for know.
-- ... and 20 more modules
+- ... and 21 more modules
 
 ## 📊 Statistics
 
-- **Files:** 35
-- **Modules:** 35
-- **Functions:** 102
-- **Classes:** 56
+- **Files:** 36
+- **Modules:** 36
+- **Functions:** 116
+- **Classes:** 57
 
 ---
 
