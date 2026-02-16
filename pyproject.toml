@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.3.0"
+version = "0.4.1"
 description = "Context Intelligence for AI Coding Agents — smart, token-budgeted code context"
 readme = "README.md"
 license = "MIT"
@@ -67,8 +67,8 @@ dev = [
 know = "know.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/vic/know-cli"
-Repository = "https://github.com/vic/know-cli"
+Homepage = "https://github.com/sushilk1991/know-cli"
+Repository = "https://github.com/sushilk1991/know-cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/know"]

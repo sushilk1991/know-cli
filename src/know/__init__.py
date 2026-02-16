@@ -1,7 +1,7 @@
 """know - Living documentation generator for codebases."""
 
-__version__ = "0.3.0"
-__author__ = "Vic"
+__version__ = "0.4.1"
+__author__ = "Sushil Kumar"
 
 from know.cli import main
 
