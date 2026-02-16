@@ -2,7 +2,7 @@
 
 ```mermaid
 graph TB
-    daemon["daemon\n(15f, 2c)"]
+    daemon["daemon\n(16f, 2c)"]
     ai["ai\n(0f, 4c)"]
     diff["diff\n(0f, 1c)"]
     knowledge_base["knowledge_base\n(0f, 2c)"]
@@ -21,7 +21,7 @@ graph TB
     exceptions["exceptions\n(0f, 8c)"]
     git_hooks["git_hooks\n(2f, 1c)"]
     file_categories["file_categories\n(7f, 0c)"]
-    daemon_db["daemon_db\n(2f, 1c)"]
+    daemon_db["daemon_db\n(2f, 2c)"]
 
     daemon --> config
     daemon --> daemon_db
@@ -85,6 +85,7 @@ graph TB
     context_engine --> ranking
     context_engine --> scanner
     context_engine --> import_graph
+    context_engine --> daemon
     hooks --> git_hooks
     core --> config
     core --> scanner

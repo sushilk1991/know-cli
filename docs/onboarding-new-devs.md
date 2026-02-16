@@ -1,7 +1,7 @@
 # Onboarding: new team members
 
 ## Structure
-- {'name': 'src.know.daemon', 'path': 'src/know/daemon.py', 'description': 'Background daemon for maintaining hot indexes.\n\nLifecycle:\n- Auto-started on first CLI call (no explicit `know start` needed)\n- Listens on Unix socket at ~/.know/sockets/<project-hash>.sock\n- PID file', 'function_count': 15, 'class_count': 2}
+- {'name': 'src.know.daemon', 'path': 'src/know/daemon.py', 'description': 'Background daemon for maintaining hot indexes.\n\nLifecycle:\n- Auto-started on first CLI call (no explicit `know start` needed)\n- Listens on Unix socket at ~/.know/sockets/<project-hash>.sock\n- PID file', 'function_count': 16, 'class_count': 2}
 - {'name': 'src.know.ai', 'path': 'src/know/ai.py', 'description': 'AI integration for intelligent code understanding with advanced token optimization.', 'function_count': 0, 'class_count': 4}
 - {'name': 'src.know.diff', 'path': 'src/know/diff.py', 'description': 'Diff mode for tracking architectural changes safely using git worktrees.', 'function_count': 0, 'class_count': 1}
 - {'name': 'src.know.knowledge_base', 'path': 'src/know/knowledge_base.py', 'description': 'Knowledge base: cross-session memory for AI agents.\n\nThin wrapper around DaemonDB — the single source of truth for all\nproject data. Translates between integer display IDs (used by CLI)\nand text UUIDs', 'function_count': 0, 'class_count': 2}
