@@ -83,6 +83,7 @@ def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str
                 {
                     "name": f.name,
                     "line_number": f.line_number,
+                    "end_line": f.end_line,
                     "docstring": f.docstring,
                     "signature": f.signature,
                     "is_async": f.is_async,
@@ -95,12 +96,14 @@ def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str
                 {
                     "name": c.name,
                     "line_number": c.line_number,
+                    "end_line": c.end_line,
                     "docstring": c.docstring,
                     "bases": c.bases,
                     "methods": [
                         {
                             "name": m.name,
                             "line_number": m.line_number,
+                            "end_line": m.end_line,
                             "docstring": m.docstring,
                             "signature": m.signature,
                             "is_async": m.is_async,
@@ -346,7 +349,8 @@ class CodebaseScanner:
                         signature=f["signature"],
                         is_async=f.get("is_async", False),
                         is_method=f.get("is_method", False),
-                        decorators=f.get("decorators", [])
+                        decorators=f.get("decorators", []),
+                        end_line=f.get("end_line", 0),
                     )
                     for f in data.get("functions", [])
                 ],
@@ -356,6 +360,7 @@ class CodebaseScanner:
                         line_number=c["line_number"],
                         docstring=c.get("docstring"),
                         bases=c.get("bases", []),
+                        end_line=c.get("end_line", 0),
                         methods=[
                             FunctionInfo(
                                 name=m["name"],
@@ -364,7 +369,8 @@ class CodebaseScanner:
                                 signature=m["signature"],
                                 is_async=m.get("is_async", False),
                                 is_method=m.get("is_method", False),
-                                decorators=m.get("decorators", [])
+                                decorators=m.get("decorators", []),
+                                end_line=m.get("end_line", 0),
                             )
                             for m in c.get("methods", [])
                         ]
@@ -577,6 +583,7 @@ class CodebaseScanner:
                 {
                     "name": f.name,
                     "line_number": f.line_number,
+                    "end_line": f.end_line,
                     "docstring": f.docstring,
                     "signature": f.signature,
                     "is_async": f.is_async,
@@ -589,12 +596,14 @@ class CodebaseScanner:
                 {
                     "name": c.name,
                     "line_number": c.line_number,
+                    "end_line": c.end_line,
                     "docstring": c.docstring,
                     "bases": c.bases,
                     "methods": [
                         {
                             "name": m.name,
                             "line_number": m.line_number,
+                            "end_line": m.end_line,
                             "docstring": m.docstring,
                             "signature": m.signature,
                             "is_async": m.is_async,

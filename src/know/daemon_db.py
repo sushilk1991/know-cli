@@ -250,10 +250,15 @@ class DaemonDB:
         try:
             row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
             current = row[0] if row else 0
-            if current < 2:
+            if current < 3:
+                # v3: full source bodies stored — force reindex by clearing file_index
+                try:
+                    conn.execute("DELETE FROM file_index")
+                except sqlite3.OperationalError:
+                    pass
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
-                    (2, time.time()),
+                    (3, time.time()),
                 )
                 conn.commit()
         except sqlite3.OperationalError:

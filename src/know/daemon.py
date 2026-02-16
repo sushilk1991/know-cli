@@ -322,26 +322,53 @@ class KnowDaemon:
                 logger.debug(f"Parse error for {path_str}: {e}")
                 continue
 
-            # Convert to chunk dicts
+            # Convert to chunk dicts — store actual source code
             chunks = []
+            lines = content.split("\n")
+
             for func in mod_info.functions:
+                start = func.line_number
+                end = func.end_line if func.end_line > start else start
+                chunk_type = "constant" if "constant" in func.decorators else (
+                    "method" if func.is_method else "function"
+                )
+
+                if end > start:
+                    # Have end_line — extract actual source
+                    body = "\n".join(lines[start - 1 : end])
+                    if len(body) > 5000:
+                        body = body[:5000] + "\n# ... truncated"
+                else:
+                    # Regex parser fallback — no end_line
+                    body = f"{func.signature}\n{func.docstring or ''}"
+
                 chunks.append({
                     "name": func.name,
-                    "type": "method" if func.is_method else "function",
-                    "start_line": func.line_number,
-                    "end_line": func.line_number,
+                    "type": chunk_type,
+                    "start_line": start,
+                    "end_line": end,
                     "signature": func.signature,
-                    "body": f"{func.signature}\n{func.docstring or ''}",
+                    "body": body,
                 })
 
             for cls in mod_info.classes:
+                start = cls.line_number
+                end = cls.end_line if cls.end_line > start else start
+
+                if end > start:
+                    body = "\n".join(lines[start - 1 : end])
+                    if len(body) > 5000:
+                        body = body[:5000] + "\n# ... truncated"
+                else:
+                    body = f"class {cls.name}\n{cls.docstring or ''}"
+
                 chunks.append({
                     "name": cls.name,
                     "type": "class",
-                    "start_line": cls.line_number,
-                    "end_line": cls.line_number,
+                    "start_line": start,
+                    "end_line": end,
                     "signature": cls.name,
-                    "body": f"class {cls.name}\n{cls.docstring or ''}",
+                    "body": body,
                 })
 
             if not chunks:

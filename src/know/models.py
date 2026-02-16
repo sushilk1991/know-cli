@@ -14,6 +14,7 @@ class FunctionInfo:
     is_async: bool = False
     is_method: bool = False
     decorators: List[str] = field(default_factory=list)
+    end_line: int = 0
 
 
 @dataclass
@@ -21,8 +22,9 @@ class ClassInfo:
     name: str
     line_number: int
     docstring: Optional[str]
-    methods: List[FunctionInfo] = field(default_factory=list)
+    methods: List['FunctionInfo'] = field(default_factory=list)
     bases: List[str] = field(default_factory=list)
+    end_line: int = 0
 
 
 @dataclass
