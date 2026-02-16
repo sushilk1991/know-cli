@@ -2,16 +2,16 @@
 
 ```mermaid
 graph TB
-    daemon["daemon\n(10f, 2c)"]
+    daemon["daemon\n(15f, 2c)"]
     ai["ai\n(0f, 4c)"]
     diff["diff\n(0f, 1c)"]
     knowledge_base["knowledge_base\n(0f, 2c)"]
     index["index\n(1f, 1c)"]
     logger["logger\n(2f, 0c)"]
     watcher["watcher\n(0f, 2c)"]
-    embeddings["embeddings\n(3f, 0c)"]
+    embeddings["embeddings\n(4f, 0c)"]
     models["models\n(0f, 4c)"]
-    token_counter["token_counter\n(4f, 0c)"]
+    token_counter["token_counter\n(5f, 0c)"]
     stats["stats\n(0f, 1c)"]
     semantic_search["semantic_search\n(0f, 2c)"]
     __init__["__init__"]
@@ -19,9 +19,9 @@ graph TB
     config["config\n(1f, 6c)"]
     import_graph["import_graph\n(0f, 1c)"]
     exceptions["exceptions\n(0f, 8c)"]
-    git_hooks["git_hooks\n(0f, 1c)"]
-    file_categories["file_categories\n(3f, 0c)"]
-    daemon_db["daemon_db\n(0f, 1c)"]
+    git_hooks["git_hooks\n(2f, 1c)"]
+    file_categories["file_categories\n(7f, 0c)"]
+    daemon_db["daemon_db\n(2f, 1c)"]
 
     daemon --> config
     daemon --> daemon_db
