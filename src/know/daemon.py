@@ -25,7 +25,7 @@ import xxhash
 from know.config import Config
 from know.daemon_db import DaemonDB
 from know.logger import get_logger
-from know.parsers import ParserFactory, EXTENSION_TO_LANGUAGE
+from know.parsers import EXTENSION_TO_LANGUAGE
 
 logger = get_logger()
 
@@ -68,21 +68,29 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
     Called by the context engine on first use when the DB is empty.
     Also used by KnowDaemon._full_index_sync().
 
+    Uses scanner.modules (ModuleInfo objects) directly to avoid re-parsing
+    every file.  The scanner already parsed each file during scan(); we only
+    need to read the raw content for body extraction and content hashing.
+
     Returns (file_count, modules_list) so callers can build import graphs.
     """
     from know.scanner import CodebaseScanner
 
     scanner = CodebaseScanner(config)
-    structure = scanner.get_structure()
-    modules = structure.get("modules", [])
+    scanner.scan()
+    modules = scanner.modules  # List[ModuleInfo] — already parsed
     count = 0
 
     with db.batch():
-        for module in modules:
-            path_str = module["path"] if isinstance(module, dict) else str(module.path)
+        for mod_info in modules:
+            path_str = str(mod_info.path)
             abs_path = root / path_str
 
             if not abs_path.exists():
+                continue
+
+            lang = EXTENSION_TO_LANGUAGE.get(abs_path.suffix.lower(), "")
+            if not lang:
                 continue
 
             content = abs_path.read_text(encoding="utf-8", errors="replace")
@@ -90,20 +98,6 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
             stored_hash = db.get_file_hash(path_str)
 
             if stored_hash == content_hash:
-                continue
-
-            lang = EXTENSION_TO_LANGUAGE.get(abs_path.suffix.lower(), "")
-            if not lang:
-                continue
-
-            parser = ParserFactory.get_parser_for_file(abs_path)
-            if not parser:
-                continue
-
-            try:
-                mod_info = parser.parse(abs_path, root)
-            except Exception as e:
-                logger.debug(f"Parse error for {path_str}: {e}")
                 continue
 
             chunks = []
