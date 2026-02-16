@@ -88,12 +88,19 @@ def status(ctx: click.Context) -> None:
     from know import __version__
 
     # Codebase info
+    from know.scanner import LANGUAGE_EXTENSIONS
     scanner = CodebaseScanner(config)
+    lang_counts: dict = {}
     try:
         structure = scanner.get_structure()
         modules = structure.get("modules", [])
         n_files = structure.get("file_count", len(modules))
         n_functions = structure.get("function_count", 0)
+        for mod in modules:
+            path_str = mod["path"] if isinstance(mod, dict) else str(mod.path)
+            suffix = Path(path_str).suffix.lower()
+            lang = LANGUAGE_EXTENSIONS.get(suffix, "unknown")
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
     except Exception as e:
         logger.debug(f"Status codebase scan failed: {e}")
         n_files = n_functions = 0
@@ -142,12 +149,19 @@ def status(ctx: click.Context) -> None:
     # Config check
     config_ok = (config.root / ".know" / "config.yaml").exists()
 
+    # Format language breakdown
+    lang_str = ", ".join(
+        f"{count} {language.title()}"
+        for language, count in sorted(lang_counts.items(), key=lambda x: -x[1])
+    ) if lang_counts else str(n_files)
+
     if ctx.obj.get("json"):
         import json
         click.echo(json.dumps({
             "version": __version__,
             "project": str(config.root),
             "files": n_files,
+            "languages": lang_counts,
             "functions": n_functions,
             "index_age": index_age,
             "memories": mem_count,
@@ -158,15 +172,7 @@ def status(ctx: click.Context) -> None:
 
     console.print(f"\n[green]✓[/green] [bold]know-cli v{__version__}[/bold]")
     console.print(f"  Project: {config.root}")
-    # Build language breakdown
-    lang_counts = {}
-    try:
-        for _, lang in scanner._discover_files():
-            lang_counts[lang] = lang_counts.get(lang, 0) + 1
-    except Exception:
-        lang_counts = {"files": n_files}
-    lang_str = ", ".join(f"{c} {l.title()}" for l, c in sorted(lang_counts.items(), key=lambda x: -x[1]))
-    console.print(f"  Files: {lang_str or n_files}")
+    console.print(f"  Files: {lang_str}")
     console.print(f"  Functions: {n_functions}")
     console.print(f"  Indexed: {index_age}")
     console.print(f"  Memories: {mem_count}")

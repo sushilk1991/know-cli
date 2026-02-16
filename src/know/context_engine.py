@@ -468,12 +468,12 @@ class ContextEngine:
             logger.debug("DaemonDB empty, running inline index population")
             try:
                 from know.daemon import populate_index
-                indexed = populate_index(self.config.root, self.config, db)
+                indexed, _ = populate_index(self.config.root, self.config, db)
                 logger.debug(f"Inline indexing complete: {indexed} files")
                 stats = db.get_stats()
                 indexing_status = "complete" if stats["files"] > 0 else "indexing"
             except Exception as e:
-                logger.debug(f"Inline indexing failed: {e}")
+                logger.warning(f"Inline indexing failed, falling back to legacy: {e}")
 
             if stats["files"] == 0:
                 # Still empty after indexing attempt — fall back to legacy

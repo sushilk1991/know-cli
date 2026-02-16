@@ -62,16 +62,19 @@ def _extract_body(
     return lines, fallback
 
 
-def populate_index(root: Path, config: Config, db: DaemonDB) -> int:
+def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
     """Populate the daemon DB with code chunks (standalone, no daemon needed).
 
     Called by the context engine on first use when the DB is empty.
     Also used by KnowDaemon._full_index_sync().
+
+    Returns (file_count, modules_list) so callers can build import graphs.
     """
     from know.scanner import CodebaseScanner
 
     scanner = CodebaseScanner(config)
     structure = scanner.get_structure()
+    modules = structure.get("modules", [])
     count = 0
 
     for module in structure.get("modules", []):
@@ -152,7 +155,7 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> int:
         db.update_file_index(path_str, content_hash, lang, len(chunks))
         count += 1
 
-    return count
+    return count, modules
 
 
 async def write_framed_message(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -406,13 +409,13 @@ class KnowDaemon:
 
     def _full_index_sync(self) -> int:
         """Synchronous indexing implementation (runs in thread pool)."""
-        count = populate_index(self.root, self.config, self.db)
+        count, modules = populate_index(self.root, self.config, self.db)
 
         # Build import graph so 'related' queries work
         try:
             from know.import_graph import ImportGraph
             ig = ImportGraph(self.config)
-            ig.build(structure.get("modules", []))
+            ig.build(modules)
         except Exception as e:
             logger.debug(f"Import graph build failed: {e}")
 
