@@ -300,3 +300,152 @@ def generate_context(ctx: click.Context, budget: int) -> None:
 
     tokens = count_tokens(content)
     console.print(f"[green]Generated[/green] {output_path} ({tokens:,} tokens)")
+
+
+@click.command("map")
+@click.argument("query")
+@click.option("--limit", "-k", type=int, default=20, help="Max results (default 20)")
+@click.option("--type", "chunk_type", type=click.Choice(["function", "class", "module", "method"]),
+              default=None, help="Filter by chunk type")
+@click.pass_context
+def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str]) -> None:
+    """Lightweight signature search — orient before reading.
+
+    Returns function/class signatures matching a query with no bodies.
+    Use this to discover what exists before using `know context` or `know deep`.
+
+    Example: know map "billing subscription"
+    """
+    import json as _json
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run: know init[/red]")
+        return
+
+    client = _get_daemon_client(config)
+    results = None
+    if client:
+        try:
+            result = client.call_sync("map", {
+                "query": query, "limit": limit, "chunk_type": chunk_type,
+            })
+            results = result.get("results", [])
+        except Exception as e:
+            logger.debug(f"Daemon map failed, falling back: {e}")
+            client = None
+
+    if results is None:
+        db = _get_db_fallback(config)
+        results = db.search_signatures(query, limit, chunk_type)
+        db.close()
+
+    is_json = ctx.obj.get("json")
+    if is_json:
+        click.echo(_json.dumps({
+            "query": query,
+            "results": results,
+            "count": len(results),
+            "truncated": len(results) >= limit,
+        }))
+    else:
+        if results:
+            console.print(f"[bold]Map results for [cyan]{query}[/cyan]:[/bold] ({len(results)} matches)\n")
+            for r in results:
+                sig = r.get("signature", r["chunk_name"])
+                doc = r.get("docstring", "")
+                score = r.get("score", 0)
+                line = f"  [green]{r['file_path']}[/green]:{r['start_line']}  {sig}"
+                if doc:
+                    line += f"  [dim]— {doc}[/dim]"
+                console.print(line)
+        else:
+            console.print(f"[dim]No matches for '{query}'.[/dim]")
+
+
+@click.command("deep")
+@click.argument("name")
+@click.option("--budget", "-b", type=int, default=3000, help="Token budget (default 3000)")
+@click.option("--session", "session_id", default=None, help="Session ID for dedup")
+@click.option("--include-tests", is_flag=True, help="Include test files in results")
+@click.pass_context
+def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
+         include_tests: bool) -> None:
+    """Deep context: function body + callers + callees.
+
+    Resolve a function by name and return its body along with
+    the functions it calls and the functions that call it.
+
+    Name formats: function_name, Class.method, file.py:function_name
+
+    Example: know deep "check_cloud_access" --budget 3000
+    """
+    import json as _json
+    import sys
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run: know init[/red]")
+        return
+
+    client = _get_daemon_client(config)
+    result = None
+    if client:
+        try:
+            result = client.call_sync("deep", {
+                "name": name, "budget": budget,
+                "include_tests": include_tests,
+                "session_id": session_id,
+            })
+        except Exception as e:
+            logger.debug(f"Daemon deep failed, falling back: {e}")
+            client = None
+
+    if result is None:
+        from know.context_engine import ContextEngine
+        engine = ContextEngine(config)
+        result = engine.build_deep_context(
+            name, budget=budget, include_tests=include_tests,
+            session_id=session_id,
+        )
+
+    is_json = ctx.obj.get("json")
+
+    if "error" in result:
+        if is_json:
+            click.echo(_json.dumps(result))
+        else:
+            err = result["error"]
+            if err == "ambiguous":
+                console.print(f"[yellow]Ambiguous name '{name}'. Candidates:[/yellow]")
+                for c in result.get("candidates", []):
+                    console.print(f"  {c['file_path']}:{c['start_line']} — {c['chunk_name']} ({c['chunk_type']})")
+            elif err == "not_found":
+                console.print(f"[red]Function '{name}' not found.[/red]")
+                nearest = result.get("nearest", [])
+                if nearest:
+                    console.print("[dim]Did you mean:[/dim]")
+                    for n in nearest:
+                        console.print(f"  {n}")
+            else:
+                console.print(f"[red]Error: {err}[/red]")
+        sys.exit(2 if result["error"] == "not_found" else 1)
+
+    if is_json:
+        click.echo(_json.dumps(result))
+    else:
+        target = result.get("target", {})
+        console.print(f"[bold cyan]{target.get('name', name)}[/bold cyan] "
+                       f"[dim]({target.get('file', '')}:{target.get('line_start', '')})[/dim]")
+        console.print(target.get("body", ""))
+        callees = result.get("callees", [])
+        if callees:
+            console.print(f"\n[bold]Calls ({len(callees)}):[/bold]")
+            for c in callees:
+                console.print(f"  [green]{c['name']}[/green] — {c['file']}:{c.get('call_site_line', '')}")
+        callers = result.get("callers", [])
+        if callers:
+            console.print(f"\n[bold]Called by ({len(callers)}):[/bold]")
+            for c in callers:
+                console.print(f"  [green]{c['name']}[/green] — {c['file']}:{c.get('call_site_line', '')}")
+        overflow = result.get("overflow_signatures", [])
+        if overflow:
+            console.print(f"\n[dim]+{len(overflow)} more (budget exhausted)[/dim]")

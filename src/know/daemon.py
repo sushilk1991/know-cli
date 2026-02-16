@@ -316,6 +316,8 @@ class KnowDaemon:
             "status": self._handle_status,
             "callers": self._handle_callers,
             "callees": self._handle_callees,
+            "map": self._handle_map,
+            "deep": self._handle_deep,
         }
         handler = handlers.get(method)
         if not handler:
@@ -403,6 +405,31 @@ class KnowDaemon:
         limit = params.get("limit", 50)
         results = self.db.get_callees(chunk_name, limit)
         return {"callees": results, "count": len(results)}
+
+    async def _handle_map(self, params: dict) -> dict:
+        """Lightweight signature search — no bodies."""
+        query = params.get("query", "")
+        limit = params.get("limit", 20)
+        chunk_type = params.get("chunk_type")
+        results = self.db.search_signatures(query, limit, chunk_type)
+        return {"results": results, "count": len(results)}
+
+    async def _handle_deep(self, params: dict) -> dict:
+        """Deep context: function body + callers + callees within budget."""
+        name = params.get("name", "")
+        budget = params.get("budget", 3000)
+        include_tests = params.get("include_tests", False)
+        session_id = params.get("session_id")
+
+        from know.context_engine import ContextEngine
+        engine = ContextEngine.__new__(ContextEngine)
+        engine.db = self.db
+        engine.root = self.root
+        result = engine.build_deep_context(
+            name, budget=budget, include_tests=include_tests,
+            session_id=session_id,
+        )
+        return result
 
     async def _handle_reindex(self, params: dict) -> dict:
         """Trigger full reindex."""

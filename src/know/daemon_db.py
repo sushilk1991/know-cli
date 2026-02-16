@@ -148,6 +148,23 @@ CREATE TABLE IF NOT EXISTS symbol_refs (
 CREATE INDEX IF NOT EXISTS idx_symrefs_name ON symbol_refs(ref_name);
 CREATE INDEX IF NOT EXISTS idx_symrefs_chunk ON symbol_refs(containing_chunk);
 CREATE INDEX IF NOT EXISTS idx_symrefs_file ON symbol_refs(file_path);
+
+-- Session tracking for deduplication
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_seen (
+    session_id TEXT NOT NULL,
+    chunk_key TEXT NOT NULL,
+    provided_at REAL NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, chunk_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_seen_sid ON session_seen(session_id);
 """
 
 
@@ -333,6 +350,14 @@ class DaemonDB:
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
                     (4, time.time()),
+                )
+                conn.commit()
+            if current < 5:
+                # v5: session tables for dedup (additive — no reindex needed)
+                # Tables are created by _SCHEMA, just bump version
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (5, time.time()),
                 )
                 conn.commit()
         except sqlite3.OperationalError:
@@ -532,6 +557,56 @@ class DaemonDB:
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
+
+    def search_signatures(self, query: str, limit: int = 20,
+                          chunk_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search chunks but return only lightweight signature data (no bodies).
+
+        Used by `know map` for fast orientation with minimal token cost.
+        Returns: file_path, chunk_name, chunk_type, signature, start_line, end_line, score,
+                 plus first line of body as docstring hint.
+        """
+        results = self.search_chunks(query, limit=limit)
+        sigs = []
+        for r in results:
+            if chunk_type and r.get("chunk_type") != chunk_type:
+                continue
+            # Extract first line of body as docstring hint (after signature line)
+            docstring = ""
+            body = r.get("body", "")
+            if body:
+                lines = body.split("\n")
+                for line in lines[1:]:  # Skip first line (signature itself)
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith(("#", "//", "/*", "*")):
+                        # Look for docstring-like content
+                        if stripped.startswith(('"""', "'''", '"', "'")):
+                            docstring = stripped.strip("\"'").strip()[:120]
+                        elif stripped.startswith(("def ", "class ", "return ", "self.", "if ", "for ")):
+                            break  # Hit code, no docstring
+                        else:
+                            docstring = stripped[:120]
+                        break
+            sigs.append({
+                "file_path": r["file_path"],
+                "chunk_name": r["chunk_name"],
+                "chunk_type": r.get("chunk_type", "function"),
+                "signature": r.get("signature", ""),
+                "start_line": r.get("start_line", 0),
+                "end_line": r.get("end_line", 0),
+                "score": r.get("score", 0),
+                "docstring": docstring,
+            })
+        return sigs[:limit]
+
+    def get_chunks_by_name(self, name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Find chunks by exact chunk_name match. Used by `know deep`."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM chunks WHERE chunk_name = ? ORDER BY file_path LIMIT ?",
+            (name, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Get all chunks for a file."""
@@ -863,6 +938,91 @@ class DaemonDB:
             (chunk_name, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Session tracking (deduplication)
+    # ------------------------------------------------------------------
+    def create_session(self, session_id: Optional[str] = None) -> str:
+        """Create a new session. Returns session_id (auto-generated if None)."""
+        import uuid
+        if not session_id:
+            session_id = uuid.uuid4().hex[:8]
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
+            "VALUES (?, ?, ?)",
+            (session_id, now, now),
+        )
+        self._commit(conn)
+        return session_id
+
+    def get_session_seen(self, session_id: str) -> set:
+        """Get set of chunk_keys already provided in this session."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT chunk_key FROM session_seen WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            return {r[0] for r in rows}
+        except sqlite3.OperationalError:
+            return set()
+
+    def mark_session_seen(self, session_id: str, chunk_keys: List[str],
+                          tokens: Optional[List[int]] = None) -> None:
+        """Mark chunks as seen in a session."""
+        if not chunk_keys:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        if tokens is None:
+            tokens = [0] * len(chunk_keys)
+        # Ensure session exists
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
+            "VALUES (?, COALESCE((SELECT created_at FROM sessions WHERE session_id = ?), ?), ?)",
+            (session_id, session_id, now, now),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO session_seen (session_id, chunk_key, provided_at, tokens) "
+            "VALUES (?, ?, ?, ?)",
+            [(session_id, key, now, tok) for key, tok in zip(chunk_keys, tokens)],
+        )
+        self._commit(conn)
+
+    def cleanup_expired_sessions(self, ttl_seconds: int = 14400) -> int:
+        """Remove sessions older than TTL. Returns count removed."""
+        conn = self._get_conn()
+        cutoff = time.time() - ttl_seconds
+        try:
+            # Get expired session IDs
+            expired = conn.execute(
+                "SELECT session_id FROM sessions WHERE last_used_at < ?",
+                (cutoff,),
+            ).fetchall()
+            if expired:
+                ids = [r[0] for r in expired]
+                placeholders = ','.join('?' * len(ids))
+                conn.execute(f"DELETE FROM session_seen WHERE session_id IN ({placeholders})", ids)
+                conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", ids)
+                self._commit(conn)
+                return len(ids)
+        except sqlite3.OperationalError:
+            pass
+        return 0
+
+    def get_session_stats(self, session_id: str) -> Dict[str, Any]:
+        """Get stats for a session."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM session_seen WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return {"chunks_seen": row[0], "tokens_provided": row[1]}
+        except sqlite3.OperationalError:
+            return {"chunks_seen": 0, "tokens_provided": 0}
 
     # ------------------------------------------------------------------
     # Zero-result intelligence
