@@ -570,6 +570,50 @@ class ContextEngine:
         except Exception:
             pass
 
+        # Step 2.8: Domain intent + generic UI noise demotion
+        try:
+            ql = query.lower()
+            frontend_terms = {
+                "react", "tsx", "jsx", "sidebar", "component", "page", "route",
+                "frontend", "client", "ui", "css", "tailwind", "next", "redirect",
+            }
+            backend_terms = {
+                "api", "backend", "server", "database", "db", "sql", "endpoint",
+                "middleware", "auth", "worker", "queue", "python",
+            }
+            fscore = sum(1 for t in frontend_terms if t in ql)
+            bscore = sum(1 for t in backend_terms if t in ql)
+            intent = "frontend" if fscore > bscore else "backend" if bscore > fscore else "mixed"
+
+            noisy_tokens = {"navigationmenu", "navmenu", "menuitem", "dropdownmenu"}
+            for r in raw_results:
+                fp = r.get("file_path", "").lower()
+                ext = Path(fp).suffix
+                score = float(r.get("score", 0.0))
+
+                if intent == "frontend":
+                    if ext in {".ts", ".tsx", ".js", ".jsx"}:
+                        score *= 1.35
+                    if any(p in fp for p in ("frontend/", "web/", "client/", "components/", "app/")):
+                        score *= 1.20
+                    if ext == ".py":
+                        score *= 0.90
+                elif intent == "backend":
+                    if ext == ".py":
+                        score *= 1.35
+                    if any(p in fp for p in ("backend/", "server/", "api/", "services/")):
+                        score *= 1.20
+                    if ext in {".ts", ".tsx", ".js", ".jsx"}:
+                        score *= 0.90
+
+                body = (r.get("body", "") or "")[:240].lower()
+                if any(tok in fp or tok in body for tok in noisy_tokens):
+                    score *= 0.75
+
+                r["score"] = score
+        except Exception:
+            pass
+
         # Step 3: Apply file path filtering
         if include_patterns or exclude_patterns or chunk_types:
             raw_results = self._apply_filters(
@@ -1467,6 +1511,12 @@ class ContextEngine:
 
         # Step 6: Check call graph availability
         call_graph_available = bool(raw_callees or raw_callers)
+        if not call_graph_available:
+            try:
+                call_graph_available = db.has_symbol_refs()
+            except Exception:
+                call_graph_available = False
+        call_graph_reason = None if call_graph_available else "no_symbol_refs_indexed_or_resolved"
 
         result = {
             "target": {
@@ -1482,6 +1532,7 @@ class ContextEngine:
             "callers": callers_result,
             "overflow_signatures": overflow,
             "call_graph_available": call_graph_available,
+            "call_graph_reason": call_graph_reason,
             "budget_used": total_used,
             "budget": budget,
         }

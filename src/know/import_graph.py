@@ -8,6 +8,8 @@ modules with the same leaf name (e.g., auth.config vs db.config).
 """
 
 import ast
+import posixpath
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -17,6 +19,90 @@ if TYPE_CHECKING:
     from know.config import Config
 
 logger = get_logger()
+
+_JS_IMPORT_RE = re.compile(
+    r"""(?:import\s+.*?\s+from\s+|import\s+|export\s+.*?\s+from\s+|require\()\s*["']([^"']+)["']"""
+)
+_PY_IMPORT_RE = re.compile(r"^(?:from|import)\s+([\.A-Za-z_][\w\.]*)")
+
+
+def _extract_import_target(import_stmt: str) -> Optional[str]:
+    """Extract the imported module path from a raw import statement."""
+    stmt = (import_stmt or "").strip()
+    if not stmt:
+        return None
+    m = _JS_IMPORT_RE.search(stmt)
+    if m:
+        return m.group(1).strip()
+    m = _PY_IMPORT_RE.match(stmt)
+    if m:
+        return m.group(1).strip()
+    # Parser may already provide normalized bare module tokens like ".utils" or "pkg.mod".
+    if re.match(r"^[\.A-Za-z_][\w\.]*$", stmt):
+        return stmt
+    return None
+
+
+def _build_module_maps(modules: List[dict]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Build helper maps: file->module and module->file."""
+    file_to_module: Dict[str, str] = {}
+    module_to_file: Dict[str, str] = {}
+    for m in modules:
+        file_path = m.get("path", "")
+        module_name = m.get("name", "")
+        if not file_path or not module_name:
+            continue
+        file_to_module[file_path] = module_name
+        module_to_file[module_name] = file_path
+    return file_to_module, module_to_file
+
+
+def _resolve_relative_import(source_file: str, target: str, module_to_file: Dict[str, str]) -> Optional[str]:
+    """Resolve JS/TS relative import to project file path."""
+    src = Path(source_file)
+    base = src.parent
+    rel_target = target
+
+    # Python relative imports use dotted level notation: .utils, ..core.types
+    if target.startswith(".") and "/" not in target:
+        level = len(target) - len(target.lstrip("."))
+        remainder = target.lstrip(".")
+        for _ in range(max(level - 1, 0)):
+            base = base.parent
+        rel_target = remainder.replace(".", "/") if remainder else ""
+
+    candidates = []
+    raw = base / rel_target
+    candidates.extend([raw, raw.with_suffix(".ts"), raw.with_suffix(".tsx"),
+                       raw.with_suffix(".js"), raw.with_suffix(".jsx"),
+                       raw.with_suffix(".py")])
+    candidates.extend([
+        raw / "index.ts", raw / "index.tsx", raw / "index.js", raw / "index.jsx",
+        raw / "__init__.py",
+    ])
+    module_files = {posixpath.normpath(str(v).replace("\\", "/")) for v in module_to_file.values()}
+    for c in candidates:
+        normalized = posixpath.normpath(str(c).replace("\\", "/"))
+        if normalized in module_files:
+            return normalized
+    return None
+
+
+def _resolve_absolute_import(target: str, module_to_file: Dict[str, str]) -> Optional[str]:
+    """Resolve a module import against indexed modules."""
+    if target in module_to_file:
+        return module_to_file[target]
+    dotted = target.replace("/", ".")
+    if dotted in module_to_file:
+        return module_to_file[dotted]
+    if f"{dotted}.index" in module_to_file:
+        return module_to_file[f"{dotted}.index"]
+    for mod, fp in module_to_file.items():
+        if mod.endswith("." + dotted) or mod.endswith("." + target):
+            return fp
+        if mod.endswith("." + dotted + ".index") or mod.endswith("." + target + ".index"):
+            return fp
+    return None
 
 
 class ImportGraph:
@@ -209,3 +295,42 @@ class ImportGraph:
             lines.append("## Imported by: (none)")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def related_files_from_modules(file_path: str, modules: List[dict]) -> Tuple[List[str], List[str]]:
+        """Language-agnostic related files based on parser-extracted imports."""
+        target_path = file_path.replace("\\", "/")
+        file_to_module, module_to_file = _build_module_maps(modules)
+        if target_path not in file_to_module:
+            # Try loose suffix match
+            for fp in file_to_module:
+                if fp.endswith(target_path):
+                    target_path = fp
+                    break
+
+        outgoing: Set[str] = set()
+        incoming: Set[str] = set()
+
+        for m in modules:
+            src_file = m.get("path", "").replace("\\", "/")
+            imports = m.get("imports", []) or []
+            if not src_file:
+                continue
+            for imp in imports:
+                target = _extract_import_target(imp)
+                if not target:
+                    continue
+                resolved_fp = None
+                if target.startswith("."):
+                    resolved_fp = _resolve_relative_import(src_file, target, module_to_file)
+                else:
+                    resolved_fp = _resolve_absolute_import(target, module_to_file)
+                if not resolved_fp:
+                    continue
+                resolved_fp = posixpath.normpath(str(resolved_fp).replace("\\", "/"))
+                if src_file == target_path:
+                    outgoing.add(resolved_fp)
+                if resolved_fp == target_path:
+                    incoming.add(src_file)
+
+        return sorted(outgoing), sorted(incoming)

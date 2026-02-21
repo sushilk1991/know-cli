@@ -484,7 +484,9 @@ class PythonParser(BaseParser):
                 for alias in node.names:
                     module.imports.append(alias.name)
             elif isinstance(node, ast.ImportFrom):
-                module.imports.append(node.module or "")
+                level = getattr(node, "level", 0) or 0
+                dotted = "." * level + (node.module or "")
+                module.imports.append(dotted)
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -669,6 +671,127 @@ class TypeScriptRegexParser(RegexParser):
     _class_pattern = r"(?:export\s+)?class\s+(\w+)"
     _import_pattern = r"import\s+"
 
+    _FUNC_PATTERNS = (
+        re.compile(r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)"),
+        re.compile(
+            r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*="
+            r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>"
+        ),
+        re.compile(r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?function\b"),
+    )
+
+    _CALL_PATTERN = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    _IMPORT_TARGET_PATTERN = re.compile(
+        r"""(?:import\s+.*?\s+from\s+|export\s+.*?\s+from\s+|import\s+)\s*["']([^"']+)["']""",
+        re.DOTALL,
+    )
+    _CALL_SKIP = {
+        "if", "for", "while", "switch", "catch", "return", "typeof", "new",
+        "function", "await", "import", "console",
+    }
+
+    @staticmethod
+    def _find_block_end(lines: List[str], start_idx: int) -> int:
+        """Best-effort brace matching to estimate function body end line."""
+        depth = 0
+        saw_open = False
+        for i in range(start_idx, len(lines)):
+            for ch in lines[i]:
+                if ch == "{":
+                    depth += 1
+                    saw_open = True
+                elif ch == "}":
+                    depth -= 1
+            if saw_open and depth <= 0:
+                return i + 1
+        return start_idx + 1
+
+    def parse(self, path: Path, root: Path) -> ModuleInfo:
+        """Parse TS/JS files with improved function/component extraction."""
+        content = self._read_file(path)
+        relative_path = path.relative_to(root)
+        module_name = str(relative_path.with_suffix("")).replace("/", ".")
+
+        module = ModuleInfo(
+            path=relative_path,
+            name=module_name,
+            docstring=None,
+            functions=[],
+            classes=[],
+            imports=[],
+        )
+
+        lines = content.split("\n")
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            is_import_stmt = stripped.startswith("import ") or stripped.startswith("export ")
+            if is_import_stmt:
+                stmt = stripped
+                if (" from " not in stmt and not re.search(r'import\s+["\']', stmt)) and i < len(lines):
+                    # Multi-line imports/exports: keep appending until module literal appears.
+                    for j in range(i, min(len(lines), i + 12)):
+                        stmt += " " + lines[j].strip()
+                        if " from " in stmt or re.search(r'import\s+["\']', stmt):
+                            break
+                m = self._IMPORT_TARGET_PATTERN.search(stmt)
+                if m:
+                    module.imports.append(f'import "{m.group(1)}"')
+
+            if self._class_pattern:
+                match = re.match(self._class_pattern, stripped)
+                if match:
+                    module.classes.append(ClassInfo(
+                        name=match.group(1), line_number=i, end_line=0,
+                        docstring=None, methods=[], bases=[],
+                    ))
+
+            for pattern in self._FUNC_PATTERNS:
+                match = pattern.match(stripped)
+                if not match:
+                    continue
+                name = match.group(1)
+                end_line = self._find_block_end(lines, i - 1)
+                module.functions.append(FunctionInfo(
+                    name=name,
+                    line_number=i,
+                    end_line=end_line,
+                    docstring=None,
+                    signature=stripped.rstrip("{:").strip(),
+                    is_async="async" in stripped,
+                    is_method=False,
+                ))
+                break
+
+        return module
+
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        """Extract call refs via regex when tree-sitter is unavailable."""
+        refs: List[Dict[str, Any]] = []
+        chunk_ranges = []
+        for func in module.functions:
+            end = func.end_line if func.end_line >= func.line_number else func.line_number
+            chunk_ranges.append((func.line_number, end, func.name))
+        for cls in module.classes:
+            end = cls.end_line if cls.end_line >= cls.line_number else cls.line_number
+            chunk_ranges.append((cls.line_number, end, cls.name))
+
+        for line_no, line in enumerate(content.split("\n"), 1):
+            for match in self._CALL_PATTERN.finditer(line):
+                ref_name = match.group(1)
+                if ref_name in self._CALL_SKIP or len(ref_name) < 2:
+                    continue
+                containing = TreeSitterParser._find_containing_chunk(line_no, chunk_ranges)
+                refs.append({
+                    "ref_name": ref_name,
+                    "ref_type": "call",
+                    "line_number": line_no,
+                    "containing_chunk": containing or "<module>",
+                })
+        return refs
+
 
 class GoRegexParser(RegexParser):
     language = "go"
@@ -731,7 +854,7 @@ class TypeScriptParser(TypeScriptRegexParser):
     def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
         if self._delegate:
             return self._delegate.extract_call_refs(content, module)
-        return []
+        return TypeScriptRegexParser.extract_call_refs(self, content, module)
 
 
 class GoParser(GoRegexParser):

@@ -941,6 +941,20 @@ class DaemonDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def has_symbol_refs(self, file_path: Optional[str] = None) -> bool:
+        """Return True if symbol_refs contains at least one row."""
+        conn = self._get_conn()
+        if file_path:
+            row = conn.execute(
+                "SELECT 1 FROM symbol_refs WHERE file_path = ? LIMIT 1",
+                (file_path,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM symbol_refs LIMIT 1",
+            ).fetchone()
+        return row is not None
+
     # ------------------------------------------------------------------
     # Session tracking (deduplication)
     # ------------------------------------------------------------------

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.7.1"
+version = "0.7.5"
 description = "Context Intelligence for AI Coding Agents — smart, token-budgeted code context"
 readme = "README.md"
 license = "MIT"
@@ -41,13 +41,12 @@ dependencies = [
     "tree-sitter-java>=0.23.0",
     "tree-sitter-ruby>=0.23.0",
     "tree-sitter-c>=0.23.0",
+    "numpy>=1.24.0",
+    "fastembed>=0.3.0",
 ]
 
 [project.optional-dependencies]
-search = [
-    "fastembed>=0.3.0",
-    "numpy>=1.24.0",
-]
+search = []
 ai = [
     "anthropic>=0.8.0",
 ]

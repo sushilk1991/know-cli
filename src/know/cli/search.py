@@ -48,17 +48,18 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool, chunk: bool)
 
 def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
     """Semantic search using fastembed embeddings."""
+    is_json = ctx.obj.get("json")
     if index:
-        if not ctx.obj.get("quiet"):
+        if not ctx.obj.get("quiet") and not is_json:
             console.print(f"[dim]Indexing {config.root}...[/dim]")
         if chunk:
             count = searcher.index_chunks(config.root)
         else:
             count = searcher.index_directory(config.root)
-        if not ctx.obj.get("quiet"):
+        if not ctx.obj.get("quiet") and not is_json:
             console.print(f"[green]✓[/green] Indexed {count} {'chunks' if chunk else 'files'}")
 
-    if not ctx.obj.get("quiet"):
+    if not ctx.obj.get("quiet") and not is_json:
         console.print(f"[dim]Searching for: {query}[/dim]")
 
     import time as _time
@@ -78,7 +79,7 @@ def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
     except Exception as e:
         logger.debug(f"Stats tracking (search) failed: {e}")
 
-    if ctx.obj.get("json"):
+    if is_json:
         import json
         click.echo(json.dumps({"results": results}))
     elif ctx.obj.get("quiet"):
@@ -176,34 +177,40 @@ def _search_bm25_fallback(ctx, config, query, top_k):
     "--no-tests",
     is_flag=True,
     help="Skip test file inclusion",
+    hidden=True,
 )
 @click.option(
     "--no-imports",
     is_flag=True,
     help="Skip import expansion",
+    hidden=True,
 )
 @click.option(
     "--include",
     "include_patterns",
     multiple=True,
     help="Include only files matching glob pattern (e.g., 'src/**')",
+    hidden=True,
 )
 @click.option(
     "--exclude",
     "exclude_patterns",
     multiple=True,
     help="Exclude files matching glob pattern (e.g., 'tests/**')",
+    hidden=True,
 )
 @click.option(
     "--chunk-types",
     type=str,
     default=None,
     help="Comma-separated chunk types to include (function,class,method,module)",
+    hidden=True,
 )
 @click.option(
     "--legacy",
     is_flag=True,
     help="Use legacy filesystem scan instead of DaemonDB (debugging only)",
+    hidden=True,
 )
 @click.option(
     "--session",

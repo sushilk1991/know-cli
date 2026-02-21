@@ -29,6 +29,56 @@ def _get_db_fallback(config):
     return DaemonDB(config.root)
 
 
+def _query_domain_intent(query: str) -> str:
+    """Infer whether query is frontend/backend/mixed intent."""
+    q = (query or "").lower()
+    frontend_terms = {
+        "react", "tsx", "jsx", "sidebar", "component", "page", "route",
+        "frontend", "client", "ui", "css", "tailwind", "nextjs", "next",
+    }
+    backend_terms = {
+        "api", "backend", "server", "database", "db", "sql", "endpoint",
+        "middleware", "auth", "worker", "queue", "python", "fastapi",
+    }
+    f = sum(1 for t in frontend_terms if t in q)
+    b = sum(1 for t in backend_terms if t in q)
+    if f > b and f >= 1:
+        return "frontend"
+    if b > f and b >= 1:
+        return "backend"
+    return "mixed"
+
+
+def _file_intent_boost(file_path: str, intent: str) -> float:
+    """Score boost/penalty for query intent vs file path."""
+    fp = file_path.lower()
+    ext = os.path.splitext(fp)[1]
+    frontend_ext = {".ts", ".tsx", ".js", ".jsx", ".css", ".scss"}
+    backend_ext = {".py", ".go", ".rs", ".java", ".sql"}
+    frontend_dirs = ("web/", "frontend/", "client/", "components/", "pages/", "app/")
+    backend_dirs = ("backend/", "server/", "api/", "services/", "db/", "models/")
+
+    if intent == "frontend":
+        boost = 0.0
+        if ext in frontend_ext:
+            boost += 2.0
+        if any(d in fp for d in frontend_dirs):
+            boost += 2.0
+        if ext in backend_ext:
+            boost -= 1.0
+        return boost
+    if intent == "backend":
+        boost = 0.0
+        if ext in backend_ext:
+            boost += 2.0
+        if any(d in fp for d in backend_dirs):
+            boost += 2.0
+        if ext in frontend_ext:
+            boost -= 1.0
+        return boost
+    return 0.0
+
+
 @click.command("next-file")
 @click.argument("query")
 @click.option("--exclude", "-x", multiple=True, help="Files to exclude")
@@ -56,14 +106,32 @@ def next_file(ctx: click.Context, query: str, exclude: tuple, budget: int) -> No
         results = db.search_chunks(query, limit=50)
         db.close()
 
+    # Rerank file candidates by inferred domain intent + best chunk score
+    intent = _query_domain_intent(query)
+    file_best = {}
+    for chunk in results:
+        fp = chunk.get("file_path", "")
+        if not fp:
+            continue
+        raw = float(chunk.get("score", chunk.get("rank", 0.0)) or 0.0)
+        boosted = raw + _file_intent_boost(fp, intent)
+        prev = file_best.get(fp)
+        if prev is None or boosted > prev:
+            file_best[fp] = boosted
+
+    ranked_files = [fp for fp, _ in sorted(file_best.items(), key=lambda kv: kv[1], reverse=True)]
+
     # Filter excluded files and find best match
     seen_files = set(exclude)
-    for chunk in results:
-        fp = chunk["file_path"]
+    for fp in ranked_files:
         if fp not in seen_files:
             output = ctx.obj.get("output_format", "rich")
             if output == "json":
-                console.print(_json.dumps({"file": fp, "relevance": chunk.get("rank", 0)}))
+                console.print(_json.dumps({
+                    "file": fp,
+                    "relevance": file_best.get(fp, 0.0),
+                    "intent": intent,
+                }))
             else:
                 console.print(fp)
             return
@@ -116,29 +184,45 @@ def related(ctx: click.Context, file_path: str) -> None:
         console.print("[red]Not initialized.[/red]")
         return
 
-    # Convert file path to module name
-    module = file_path.replace("/", ".").replace(".py", "").replace(".ts", "")
-
     client = _get_daemon_client(config)
+    imports = []
+    imported_by = []
     if client:
         try:
+            # Daemon's related is Python-centric; use it as best-effort signal.
+            module = file_path.replace("/", ".").replace("\\", ".")
+            module = module.removesuffix(".py").removesuffix(".ts").removesuffix(".tsx")
+            module = module.removesuffix(".js").removesuffix(".jsx")
             result = client.call_sync("related", {"module": module})
             imports = result.get("imports", [])
             imported_by = result.get("imported_by", [])
         except Exception as e:
             logger.debug(f"Daemon related failed, falling back: {e}")
-            client = None
 
-    if not client:
-        # Build import graph if not already populated
+    # Always run language-agnostic resolver and merge, because daemon graph is
+    # currently Python-only and often misses TS/TSX relationships.
+    try:
         from know.import_graph import ImportGraph
-        ig = ImportGraph(config)
         from know.scanner import CodebaseScanner
         scanner = CodebaseScanner(config)
-        structure = scanner.get_structure()
-        ig.build(structure.get("modules", []))
-        imports = ig.imports_of(module)
-        imported_by = ig.imported_by(module)
+        scanner.get_structure()  # Populates scanner.modules
+        modules_with_imports = [
+            {
+                "path": str(m.path),
+                "name": m.name,
+                "imports": list(getattr(m, "imports", []) or []),
+            }
+            for m in scanner.modules
+        ]
+        lang_imports, lang_imported_by = ImportGraph.related_files_from_modules(
+            file_path, modules_with_imports,
+        )
+        if lang_imports:
+            imports = sorted(set(imports).union(lang_imports))
+        if lang_imported_by:
+            imported_by = sorted(set(imported_by).union(lang_imported_by))
+    except Exception as e:
+        logger.debug(f"Language-agnostic related lookup failed: {e}")
 
     output = ctx.obj.get("output_format", "rich")
     if output == "json":
@@ -446,6 +530,9 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
             console.print(f"\n[bold]Called by ({len(callers)}):[/bold]")
             for c in callers:
                 console.print(f"  [green]{c['name']}[/green] — {c['file']}:{c.get('call_site_line', '')}")
+        if not result.get("call_graph_available", True):
+            reason = result.get("call_graph_reason", "unavailable")
+            console.print(f"\n[dim]Call graph unavailable: {reason}[/dim]")
         overflow = result.get("overflow_signatures", [])
         if overflow:
             console.print(f"\n[dim]+{len(overflow)} more (budget exhausted)[/dim]")
