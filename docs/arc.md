@@ -7,28 +7,28 @@
 
 ## 📁 Project Structure
 
-- **[src.know.daemon](src/know/daemon.py)** - Background daemon for maintaining hot indexes.
-- **[src.know.ai](src/know/ai.py)** - AI integration for intelligent code understanding with advanced token optimization.
-- **[src.know.diff](src/know/diff.py)** - Diff mode for tracking architectural changes safely using git worktrees.
-- **[src.know.knowledge_base](src/know/knowledge_base.py)** - Knowledge base: cross-session memory for AI agents.
-- **[src.know.index](src/know/index.py)** - Index management for incremental code scanning.
 - **[src.know.logger](src/know/logger.py)** - Logging configuration for know.
-- **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
-- **[src.know.embeddings](src/know/embeddings.py)** - Centralized embedding model management.
-- **[src.know.query](src/know/query.py)** - Query understanding for intelligent FTS5 search.
-- **[src.know.models](src/know/models.py)** - Data models for know-cli.
 - **[src.know.token_counter](src/know/token_counter.py)** - Token counting for context budget management.
-- **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
+- **[src.know.embeddings](src/know/embeddings.py)** - Centralized embedding model management.
 - **[src.know.semantic_search](src/know/semantic_search.py)** - Semantic code search using real embeddings and vector similarity.
-- **[src.know.__init__](src/know/__init__.py)** - know - Living documentation generator for codebases.
-- **[src.know.generator](src/know/generator.py)** - Documentation generator.
+- **[src.know.ai](src/know/ai.py)** - AI integration for intelligent code understanding with advanced token optimization.
+- **[src.know.file_categories](src/know/file_categories.py)** - File category detection and demotion for search ranking.
+- **[src.know.import_graph](src/know/import_graph.py)** - Import graph: tracks dependencies between project modules.
+- **[src.know.watcher](src/know/watcher.py)** - File system watcher for auto-updating documentation.
+- **[src.know.stats](src/know/stats.py)** - Usage statistics tracker for know-cli.
+- **[src.know.mcp_server](src/know/mcp_server.py)** - MCP (Model Context Protocol) server for know-cli.
+- **[src.know.ranking](src/know/ranking.py)** - Score fusion for combining multiple ranking signals.
+- **[src.know.daemon_db](src/know/daemon_db.py)** - Unified daemon database — SQLite with FTS5 for search.
+- **[src.know.query](src/know/query.py)** - Query understanding for intelligent FTS5 search.
+- **[src.know.exceptions](src/know/exceptions.py)** - Custom exceptions for know-cli.
+- **[src.know.diff](src/know/diff.py)** - Diff mode for tracking architectural changes safely using git worktrees.
 - ... and 21 more modules
 
 ## 📊 Statistics
 
 - **Files:** 36
 - **Modules:** 36
-- **Functions:** 116
+- **Functions:** 124
 - **Classes:** 57
 
 ---

@@ -2,65 +2,39 @@
 
 ```mermaid
 graph TB
-    daemon["daemon\n(16f, 2c)"]
-    ai["ai\n(0f, 4c)"]
-    diff["diff\n(0f, 1c)"]
-    knowledge_base["knowledge_base\n(0f, 2c)"]
-    index["index\n(1f, 1c)"]
     logger["logger\n(2f, 0c)"]
-    watcher["watcher\n(0f, 2c)"]
-    embeddings["embeddings\n(4f, 0c)"]
-    query["query\n(10f, 1c)"]
-    models["models\n(0f, 4c)"]
     token_counter["token_counter\n(5f, 0c)"]
-    stats["stats\n(0f, 1c)"]
+    embeddings["embeddings\n(4f, 0c)"]
     semantic_search["semantic_search\n(0f, 2c)"]
-    __init__["__init__"]
-    generator["generator\n(0f, 1c)"]
-    config["config\n(1f, 6c)"]
-    import_graph["import_graph\n(0f, 1c)"]
-    exceptions["exceptions\n(0f, 8c)"]
-    git_hooks["git_hooks\n(2f, 1c)"]
+    ai["ai\n(0f, 4c)"]
     file_categories["file_categories\n(7f, 0c)"]
+    import_graph["import_graph\n(6f, 1c)"]
+    watcher["watcher\n(0f, 2c)"]
+    stats["stats\n(0f, 1c)"]
+    mcp_server["mcp_server\n(6f, 0c)"]
+    ranking["ranking\n(2f, 0c)"]
+    daemon_db["daemon_db\n(2f, 2c)"]
+    query["query\n(10f, 1c)"]
+    exceptions["exceptions\n(0f, 8c)"]
+    diff["diff\n(0f, 1c)"]
+    generator["generator\n(0f, 1c)"]
+    parsers["parsers\n(1f, 13c)"]
+    quality["quality\n(0f, 2c)"]
+    daemon["daemon\n(16f, 2c)"]
+    git_hooks["git_hooks\n(2f, 1c)"]
 
-    daemon --> config
-    daemon --> daemon_db
-    daemon --> logger
-    daemon --> parsers
-    daemon --> scanner
-    daemon --> context_engine
-    daemon --> import_graph
-    ai --> config
-    diff --> config
-    diff --> scanner
-    knowledge_base --> logger
-    knowledge_base --> config
-    knowledge_base --> daemon_db
-    knowledge_base --> token_counter
-    knowledge_base --> embeddings
-    index --> exceptions
-    index --> logger
-    index --> config
-    index --> scanner
-    watcher --> config
-    watcher --> scanner
-    watcher --> generator
     embeddings --> logger
-    stats --> logger
-    stats --> config
     semantic_search --> embeddings
     semantic_search --> context_engine
-    generator --> config
-    generator --> scanner
-    generator --> ai
+    ai --> config
     import_graph --> logger
     import_graph --> config
     import_graph --> daemon_db
-    git_hooks --> config
-    daemon_db --> logger
-    daemon_db --> token_counter
-    daemon_db --> query
-    daemon_db --> ranking
+    watcher --> config
+    watcher --> scanner
+    watcher --> generator
+    stats --> logger
+    stats --> config
     mcp_server --> logger
     mcp_server --> config
     mcp_server --> context_engine
@@ -70,15 +44,26 @@ graph TB
     mcp_server --> ai
     mcp_server --> import_graph
     mcp_server --> stats
-    scanner --> exceptions
-    scanner --> logger
-    scanner --> parsers
-    scanner --> models
-    scanner --> config
-    scanner --> index
+    daemon_db --> logger
+    daemon_db --> token_counter
+    daemon_db --> query
+    daemon_db --> ranking
+    diff --> config
+    diff --> scanner
+    generator --> config
+    generator --> scanner
+    generator --> ai
     parsers --> exceptions
     parsers --> models
     parsers --> logger
+    daemon --> config
+    daemon --> daemon_db
+    daemon --> logger
+    daemon --> parsers
+    daemon --> scanner
+    daemon --> context_engine
+    daemon --> import_graph
+    git_hooks --> config
     context_engine --> token_counter
     context_engine --> logger
     context_engine --> embeddings
@@ -90,13 +75,31 @@ graph TB
     context_engine --> query
     context_engine --> import_graph
     context_engine --> daemon
-    hooks --> git_hooks
-    core --> config
-    core --> scanner
-    core --> generator
-    core --> ai
-    core --> watcher
-    core --> knowledge_base
+    scanner --> exceptions
+    scanner --> logger
+    scanner --> parsers
+    scanner --> models
+    scanner --> config
+    scanner --> index
+    knowledge_base --> logger
+    knowledge_base --> config
+    knowledge_base --> daemon_db
+    knowledge_base --> token_counter
+    knowledge_base --> embeddings
+    index --> exceptions
+    index --> logger
+    index --> config
+    index --> scanner
+    agent --> daemon_db
+    agent --> token_counter
+    agent --> daemon
+    agent --> import_graph
+    agent --> scanner
+    agent --> context_engine
+    stats --> scanner
+    stats --> knowledge_base
+    knowledge --> knowledge_base
+    knowledge --> stats
     search --> scanner
     search --> agent
     search --> context_engine
@@ -104,8 +107,13 @@ graph TB
     search --> semantic_search
     search --> stats
     search --> knowledge_base
-    stats --> scanner
-    stats --> knowledge_base
+    core --> config
+    core --> scanner
+    core --> generator
+    core --> ai
+    core --> watcher
+    core --> knowledge_base
+    mcp --> mcp_server
     __init__ --> config
     __init__ --> logger
     __init__ --> exceptions
@@ -117,15 +125,7 @@ graph TB
     __init__ --> mcp
     __init__ --> agent
     __init__ --> diff
-    knowledge --> knowledge_base
-    knowledge --> stats
-    agent --> daemon_db
-    agent --> token_counter
-    agent --> daemon
-    agent --> import_graph
-    agent --> scanner
-    agent --> context_engine
-    mcp --> mcp_server
+    hooks --> git_hooks
 ```
 
 *Generated by know*
