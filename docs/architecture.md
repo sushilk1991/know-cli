@@ -18,7 +18,7 @@ graph TB
     exceptions["exceptions\n(0f, 8c)"]
     diff["diff\n(0f, 1c)"]
     generator["generator\n(0f, 1c)"]
-    parsers["parsers\n(1f, 13c)"]
+    parsers["parsers\n(1f, 14c)"]
     quality["quality\n(0f, 2c)"]
     daemon["daemon\n(16f, 2c)"]
     git_hooks["git_hooks\n(2f, 1c)"]
@@ -26,6 +26,7 @@ graph TB
     embeddings --> logger
     semantic_search --> embeddings
     semantic_search --> context_engine
+    semantic_search --> parsers
     ai --> config
     import_graph --> logger
     import_graph --> config
@@ -33,6 +34,7 @@ graph TB
     watcher --> config
     watcher --> scanner
     watcher --> generator
+    watcher --> parsers
     stats --> logger
     stats --> config
     mcp_server --> logger
