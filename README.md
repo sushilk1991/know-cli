@@ -118,6 +118,12 @@ know --json workflow "auth token validation" --context-budget 5000 --deep-budget
 
 Runs `map -> context -> deep` in a single daemon request to cut tool-call overhead for coding agents.
 
+### Docs Update Policy (Local-First)
+
+- Recommended default: run docs updates locally via `know watch` or git hooks (`know hooks install`).
+- GitHub workflow examples in this repo are `workflow_dispatch` and **non-mutating by default**.
+- If a downstream repo enables CI docs updates, keep CI read-only (review/comment artifacts) unless explicit auto-commit is required.
+
 ### Map — Orient Before Reading
 
 ```bash

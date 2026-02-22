@@ -126,11 +126,7 @@ jobs:
               });
             }
       
-      - name: Commit documentation changes
+      - name: Local-first policy note
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add docs/ .know/ || true
-          git commit -m "docs: Auto-update documentation via know-cli" || true
-          git push || true
-        continue-on-error: true
+          echo "Docs auto-commit is intentionally disabled in this example."
+          echo "Prefer local hooks/watch for docs updates; use CI for read-only review output."

@@ -24,5 +24,6 @@ jobs:
         uses: sushilk1991/know-cli/.github/actions/know-cli@main
         with:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          comment-on-pr: 'true'
-          generate-on-push: 'true'
+          # Local-first default: do not mutate PRs/branches from CI unless explicitly opted in.
+          comment-on-pr: 'false'
+          generate-on-push: 'false'
