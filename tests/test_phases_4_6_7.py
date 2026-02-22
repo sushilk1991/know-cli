@@ -231,6 +231,31 @@ def process():
         assert "query" in ref_names
         assert "sort" in ref_names
 
+    def test_python_parser_resolves_import_alias_calls(self):
+        """Alias calls should map to declaration names for deep call graph lookup."""
+        from know.parsers import PythonParser
+
+        code = '''
+from agents import create_agent as build_agent
+
+def run():
+    return build_agent()
+'''
+        parser = PythonParser()
+        module = ModuleInfo(
+            path=Path("test.py"), name="test", docstring=None,
+            functions=[
+                FunctionInfo(name="run", line_number=4, end_line=5, docstring=None,
+                             signature="run()", is_async=False, is_method=False),
+            ],
+            classes=[], imports=[],
+        )
+
+        refs = parser.extract_call_refs(code, module)
+        names = {r["ref_name"] for r in refs}
+        assert "create_agent" in names
+        assert "build_agent" not in names
+
     def test_treesitter_extract_calls(self):
         """TreeSitterParser extracts function calls."""
         try:

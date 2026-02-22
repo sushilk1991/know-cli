@@ -98,6 +98,26 @@ def test_typescript_parser_captures_multiline_import_target(tmp_path):
     assert any("./ui/sidebar" in imp for imp in mod.imports)
 
 
+def test_typescript_parser_extracts_jsx_component_refs(tmp_path):
+    root = tmp_path / "proj4"
+    root.mkdir()
+    src = root / "src"
+    src.mkdir()
+    file_path = src / "sidebar.tsx"
+    file_path.write_text(
+        "export const AppSidebar: React.FC = () => {\n"
+        "  return <SidebarUserMenuItem><DownloadAppButton /></SidebarUserMenuItem>\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    parser = TypeScriptRegexParser()
+    mod = parser.parse(file_path, root)
+    refs = parser.extract_call_refs(file_path.read_text(encoding="utf-8"), mod)
+    names = {r["ref_name"] for r in refs}
+    assert "SidebarUserMenuItem" in names
+    assert "DownloadAppButton" in names
+
+
 def test_extract_import_target_supports_python_relative_imports():
     assert _extract_import_target("from .utils import parse") == ".utils"
     assert _extract_import_target("from ..core.types import User") == "..core.types"

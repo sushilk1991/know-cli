@@ -1471,39 +1471,57 @@ class ContextEngine:
         callees_budget = int(remaining * 0.50)
         raw_callees = db.get_callees(target_name, limit=30)
 
-        # Deduplicate: exclude target itself and external refs
+        # Deduplicate by location, not just symbol name.
         callees_data = []
-        seen_names = {target_name}
+        seen_callee_keys = set()
         for ref in raw_callees:
             ref_name = ref.get("ref_name", "")
-            if ref_name in seen_names:
+            key = (
+                ref_name,
+                ref.get("file_path", ""),
+                ref.get("line_number", 0),
+            )
+            if key in seen_callee_keys:
                 continue
-            seen_names.add(ref_name)
+            seen_callee_keys.add(key)
             callees_data.append(ref)
 
         # Step 3: Get callers (what calls the function)
         callers_budget = remaining - callees_budget
         raw_callers = db.get_callers(target_name, limit=30)
+        if "." in target_name:
+            leaf_name = target_name.rsplit(".", 1)[-1]
+            if leaf_name and leaf_name != target_name:
+                raw_callers.extend(db.get_callers(leaf_name, limit=30))
 
         callers_data = []
-        seen_caller_names = {target_name}
+        seen_caller_keys = set()
         for ref in raw_callers:
             caller_name = ref.get("containing_chunk", "")
-            if caller_name in seen_caller_names:
+            key = (
+                caller_name,
+                ref.get("file_path", ""),
+                ref.get("line_number", 0),
+            )
+            if key in seen_caller_keys:
                 continue
-            seen_caller_names.add(caller_name)
+            seen_caller_keys.add(key)
             callers_data.append(ref)
 
         # Step 4: Fetch full bodies for callees, sorted by locality then size
         callees_result, callees_used, overflow = self._fill_related_chunks(
             db, callees_data, callees_budget, target_chunk["file_path"],
             key_field="ref_name", line_field="line_number",
+            exclude_target=target_chunk,
+            allow_method_suffix_fallback=True,
         )
 
         # Step 5: Fetch full bodies for callers
         callers_result, callers_used, overflow_callers = self._fill_related_chunks(
             db, callers_data, callers_budget, target_chunk["file_path"],
             key_field="containing_chunk", line_field="line_number",
+            exclude_target=target_chunk,
+            allow_method_suffix_fallback=False,
         )
         overflow.extend(overflow_callers)
 
@@ -1607,6 +1625,8 @@ class ContextEngine:
         target_file: str,
         key_field: str,
         line_field: str,
+        exclude_target: Optional[Dict] = None,
+        allow_method_suffix_fallback: bool = True,
     ) -> Tuple[List[Dict], int, List[str]]:
         """Fill budget with related chunk bodies, sorted by locality then size.
 
@@ -1621,7 +1641,36 @@ class ContextEngine:
             name = ref.get(key_field, "")
             if not name:
                 continue
+
+            def _exclude_target(chunks_list: List[Dict]) -> List[Dict]:
+                if not exclude_target:
+                    return chunks_list
+                target_key = (
+                    exclude_target.get("file_path"),
+                    exclude_target.get("chunk_name"),
+                    exclude_target.get("start_line"),
+                )
+                return [
+                    c for c in chunks_list
+                    if (
+                        c.get("file_path"),
+                        c.get("chunk_name"),
+                        c.get("start_line"),
+                    ) != target_key
+                ]
+
             chunks = db.get_chunks_by_name(name)
+            chunks = _exclude_target(chunks)
+            if (
+                allow_method_suffix_fallback
+                and not chunks
+                and "." not in name
+                and hasattr(db, "get_method_chunks_by_suffix")
+            ):
+                # Attribute calls like `service.create_agent()` usually reference methods
+                # stored as `ClassName.create_agent` chunk names.
+                chunks = db.get_method_chunks_by_suffix(name)
+                chunks = _exclude_target(chunks)
             if chunks:
                 chunk = chunks[0]
                 # Prefer same-file chunk

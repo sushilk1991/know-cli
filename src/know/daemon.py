@@ -136,6 +136,24 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
                     "body": body,
                 })
 
+                # Python parser stores class methods on cls.methods (not module.functions).
+                for method in getattr(cls, "methods", []) or []:
+                    m_start = method.line_number
+                    m_end = method.end_line if method.end_line >= m_start else m_start
+                    method_sig = method.signature or method.name
+                    if not method_sig.startswith(f"{cls.name}."):
+                        method_sig = f"{cls.name}.{method_sig}"
+                    fallback = f"{method_sig}\n{method.docstring or ''}"
+                    lines, method_body = _extract_body(lines, content, m_start, m_end, fallback)
+                    chunks.append({
+                        "name": f"{cls.name}.{method.name}",
+                        "type": "method",
+                        "start_line": m_start,
+                        "end_line": m_end,
+                        "signature": method_sig,
+                        "body": method_body,
+                    })
+
             if not chunks:
                 chunks.append({
                     "name": mod_info.name,

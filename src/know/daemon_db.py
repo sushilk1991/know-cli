@@ -610,6 +610,15 @@ class DaemonDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_method_chunks_by_suffix(self, method_name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Find method chunks by trailing method name (e.g. '*.create_agent')."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM chunks WHERE chunk_type = 'method' AND chunk_name LIKE ? ORDER BY file_path LIMIT ?",
+            (f"%.{method_name}", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Get all chunks for a file."""
         conn = self._get_conn()

@@ -112,11 +112,13 @@ class DocUpdateHandler(FileSystemEventHandler):
         try:
             scanner = CodebaseScanner(self.config)
             generator = DocGenerator(self.config)
-            
+            from know.parsers import ParserFactory
+
             # Filter to only code files we care about
+            supported_exts = ParserFactory.supported_extensions()
             code_paths = [
                 p for p in self.pending_paths 
-                if p.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".go"}
+                if p.suffix in supported_exts
             ]
             
             if code_paths:

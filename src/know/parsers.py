@@ -39,6 +39,7 @@ EXTENSION_TO_LANGUAGE: Dict[str, str] = {
     ".cc": "cpp",
     ".cxx": "cpp",
     ".hpp": "cpp",
+    ".swift": "swift",
 }
 
 # Tree-sitter grammar packages for each language
@@ -59,10 +60,10 @@ _TS_GRAMMAR_PACKAGES: Dict[str, str] = {
 # Node types per language for function/class extraction
 _FUNCTION_NODE_TYPES: Dict[str, set] = {
     "python": {"function_definition"},
-    "typescript": {"function_declaration", "method_definition", "arrow_function"},
-    "tsx": {"function_declaration", "method_definition", "arrow_function"},
-    "javascript": {"function_declaration", "method_definition", "arrow_function"},
-    "jsx": {"function_declaration", "method_definition", "arrow_function"},
+    "typescript": {"function_declaration", "method_definition", "arrow_function", "function_expression"},
+    "tsx": {"function_declaration", "method_definition", "arrow_function", "function_expression"},
+    "javascript": {"function_declaration", "method_definition", "arrow_function", "function_expression"},
+    "jsx": {"function_declaration", "method_definition", "arrow_function", "function_expression"},
     "go": {"function_declaration", "method_declaration"},
     "rust": {"function_item"},
     "java": {"method_declaration", "constructor_declaration"},
@@ -277,6 +278,19 @@ class TreeSitterParser(BaseParser):
                 name = content[child.start_byte:child.end_byte].decode("utf-8")
                 break
 
+        # Arrow/function expressions often store name on parent variable declarator.
+        if not name and node.type in ("arrow_function", "function_expression"):
+            parent = getattr(node, "parent", None)
+            while parent is not None:
+                if parent.type in ("variable_declarator", "pair", "property_assignment", "public_field_definition"):
+                    for child in parent.children:
+                        if child.type in ("identifier", "property_identifier", "name", "field_identifier"):
+                            name = content[child.start_byte:child.end_byte].decode("utf-8")
+                            break
+                    if name:
+                        break
+                parent = getattr(parent, "parent", None)
+
         if not name:
             return None
 
@@ -408,6 +422,18 @@ class TreeSitterParser(BaseParser):
                         "containing_chunk": chunk or "<module>",
                     })
 
+        elif self.language in ("tsx", "jsx") and node.type in ("jsx_opening_element", "jsx_self_closing_element"):
+            comp_name = self._extract_jsx_component_name(node, content)
+            if comp_name:
+                line = node.start_point[0] + 1
+                chunk = self._find_containing_chunk(line, chunk_ranges)
+                refs.append({
+                    "ref_name": comp_name,
+                    "ref_type": "jsx_component",
+                    "line_number": line,
+                    "containing_chunk": chunk or "<module>",
+                })
+
         for child in node.children:
             self._walk_calls(child, content, chunk_ranges, refs)
 
@@ -421,6 +447,20 @@ class TreeSitterParser(BaseParser):
                 if child.type in ("identifier", "property_identifier", "name", "field_identifier"):
                     return content[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
         return None
+
+    def _extract_jsx_component_name(self, node, content: bytes) -> Optional[str]:
+        """Extract referenced JSX component names from opening/self-closing elements."""
+        raw = content[node.start_byte:node.end_byte].decode("utf-8", errors="replace").strip()
+        if raw.startswith("</"):
+            return None
+
+        # Covers tags like <AppSidebar>, <UI.Sidebar>, <Foo.Bar.Baz />
+        m = re.match(r"<\s*([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\b", raw)
+        if not m:
+            return None
+        name = m.group(1)
+        # Use final segment so it can match chunk_name for local declarations.
+        return name.split(".")[-1]
 
     @staticmethod
     def _find_containing_chunk(line: int, chunk_ranges) -> Optional[str]:
@@ -560,18 +600,40 @@ class PythonParser(BaseParser):
         for cls in module.classes:
             chunk_ranges.append((cls.line_number, cls.end_line, cls.name))
 
+        # Resolve import aliases so call-graph links map back to declaration names.
+        alias_map: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        alias_map[alias.asname] = alias.name.split(".")[-1]
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    local_name = alias.asname or alias.name
+                    alias_map[local_name] = alias.name.split(".")[-1]
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                resolved = alias_map.get(node.value.id, node.value.id)
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        alias_map[target.id] = resolved
+
         refs = []
+        seen = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 name = None
                 if isinstance(node.func, ast.Name):
-                    name = node.func.id
+                    name = alias_map.get(node.func.id, node.func.id)
                 elif isinstance(node.func, ast.Attribute):
                     name = node.func.attr
 
                 if name and len(name) >= 2 and not name.startswith("__"):
                     line = getattr(node, "lineno", 0)
                     chunk = TreeSitterParser._find_containing_chunk(line, chunk_ranges)
+                    key = (name, line, chunk or "<module>")
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     refs.append({
                         "ref_name": name,
                         "ref_type": "call",
@@ -677,10 +739,15 @@ class TypeScriptRegexParser(RegexParser):
             r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*="
             r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>"
         ),
+        re.compile(
+            r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*"
+            r"(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>"
+        ),
         re.compile(r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?function\b"),
     )
 
     _CALL_PATTERN = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    _JSX_COMPONENT_PATTERN = re.compile(r"<\s*([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\b")
     _IMPORT_TARGET_PATTERN = re.compile(
         r"""(?:import\s+.*?\s+from\s+|export\s+.*?\s+from\s+|import\s+)\s*["']([^"']+)["']""",
         re.DOTALL,
@@ -770,6 +837,7 @@ class TypeScriptRegexParser(RegexParser):
     def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
         """Extract call refs via regex when tree-sitter is unavailable."""
         refs: List[Dict[str, Any]] = []
+        seen = set()
         chunk_ranges = []
         for func in module.functions:
             end = func.end_line if func.end_line >= func.line_number else func.line_number
@@ -784,9 +852,27 @@ class TypeScriptRegexParser(RegexParser):
                 if ref_name in self._CALL_SKIP or len(ref_name) < 2:
                     continue
                 containing = TreeSitterParser._find_containing_chunk(line_no, chunk_ranges)
+                key = (ref_name, line_no, containing or "<module>")
+                if key in seen:
+                    continue
+                seen.add(key)
                 refs.append({
                     "ref_name": ref_name,
                     "ref_type": "call",
+                    "line_number": line_no,
+                    "containing_chunk": containing or "<module>",
+                })
+            # JSX component references behave like calls for dependency tracing.
+            for match in self._JSX_COMPONENT_PATTERN.finditer(line):
+                ref_name = match.group(1).split(".")[-1]
+                containing = TreeSitterParser._find_containing_chunk(line_no, chunk_ranges)
+                key = (ref_name, line_no, containing or "<module>")
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs.append({
+                    "ref_name": ref_name,
+                    "ref_type": "jsx_component",
                     "line_number": line_no,
                     "containing_chunk": containing or "<module>",
                 })
@@ -833,18 +919,27 @@ class CRegexParser(RegexParser):
     _import_pattern = r"#include"
 
 
+class SwiftRegexParser(RegexParser):
+    language = "swift"
+    extensions = {".swift"}
+    _func_pattern = r"(?:public|private|fileprivate|internal|open)?\s*(?:static\s+)?func\s+([A-Za-z_]\w*)"
+    _class_pattern = r"(?:public|private|fileprivate|internal|open)?\s*(?:final\s+)?(?:class|struct|enum|protocol)\s+([A-Za-z_]\w*)"
+    _import_pattern = r"import\s+"
+
+
 # ---------------------------------------------------------------------------
 # Backwards-compatible aliases (used by tests and external code)
 # ---------------------------------------------------------------------------
 class TypeScriptParser(TypeScriptRegexParser):
     """TypeScript parser — delegates to tree-sitter or regex."""
 
-    def __init__(self, use_treesitter: bool = True):
+    def __init__(self, use_treesitter: bool = True, language: str = "typescript"):
         self._delegate = None
+        self.language = language if language in {"typescript", "tsx", "javascript", "jsx"} else "typescript"
         if use_treesitter:
-            parser, _ = _get_ts_parser("typescript")
+            parser, _ = _get_ts_parser(self.language)
             if parser is not None:
-                self._delegate = TreeSitterParser("typescript")
+                self._delegate = TreeSitterParser(self.language)
 
     def parse(self, path: Path, root: Path) -> ModuleInfo:
         if self._delegate:
@@ -892,6 +987,7 @@ _REGEX_PARSERS: Dict[str, type] = {
     "ruby": RubyRegexParser,
     "c": CRegexParser,
     "cpp": CRegexParser,
+    "swift": SwiftRegexParser,
 }
 
 
@@ -914,7 +1010,7 @@ class ParserFactory:
             if language == "python":
                 cls._parsers[cache_key] = PythonParser()
             elif language in ("typescript", "tsx", "javascript", "jsx"):
-                cls._parsers[cache_key] = TypeScriptParser(use_treesitter)
+                cls._parsers[cache_key] = TypeScriptParser(use_treesitter=use_treesitter, language=language)
             elif language == "go":
                 cls._parsers[cache_key] = GoParser(use_treesitter)
             elif use_treesitter:

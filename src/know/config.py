@@ -65,7 +65,7 @@ class APIConfig:
 class Config:
     project: ProjectConfig = field(default_factory=ProjectConfig)
     languages: List[str] = field(default_factory=lambda: [
-        "python", "javascript", "typescript", "go", "rust"
+        "python", "javascript", "typescript", "go", "rust", "swift"
     ])
     include: List[str] = field(default_factory=lambda: [
         "src/", "lib/", "app/", "packages/", "apps/", "cmd/", "internal/"
@@ -131,6 +131,10 @@ class Config:
         # Check for Rust
         if (root / "Cargo.toml").exists():
             languages.append("rust")
+
+        # Check for Swift
+        if (root / "Package.swift").exists() or list(root.glob("**/*.swift")):
+            languages.append("swift")
         
         return languages
     

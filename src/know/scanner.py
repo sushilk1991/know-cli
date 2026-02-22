@@ -14,7 +14,7 @@ from pathspec import PathSpec
 
 from know.exceptions import ParseError, ScanError
 from know.logger import get_logger
-from know.parsers import ParserFactory
+from know.parsers import EXTENSION_TO_LANGUAGE, ParserFactory
 from know.models import FunctionInfo, ClassInfo, ModuleInfo, APIRoute
 
 if TYPE_CHECKING:
@@ -33,18 +33,12 @@ except Exception:
 
 logger = get_logger()
 
-# File extension to language mapping
-LANGUAGE_EXTENSIONS = {
-    ".py": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "typescript",
-    ".jsx": "typescript",
-    ".go": "go",
-}
+# File extension to language mapping (single source of truth from parsers.py)
+LANGUAGE_EXTENSIONS = dict(EXTENSION_TO_LANGUAGE)
+TS_JS_LANGUAGES = {"typescript", "tsx", "javascript", "jsx"}
 
-# Maximum TypeScript files to scan (for performance)
-MAX_TS_FILES = 500
+# Maximum TS/JS-family files to scan (0 = no cap, default).
+MAX_TS_FILES = int(os.environ.get("KNOW_MAX_TS_FILES", "0"))
 
 # Timeout for parsing individual files (seconds)
 FILE_PARSE_TIMEOUT = 30
@@ -156,8 +150,25 @@ class CodebaseScanner:
             relative = path.relative_to(self.root)
         except ValueError:
             return False
-        
+
         relative_str = str(relative)
+
+        # Always skip generated/build/cache directories regardless of user config.
+        hard_excludes = {
+            ".git",
+            ".know",
+            "__pycache__",
+            "node_modules",
+            ".next",
+            ".nuxt",
+            ".turbo",
+            "dist",
+            "build",
+            "target",
+            ".cache",
+        }
+        if any(part in hard_excludes for part in relative.parts):
+            return False
 
         if self._pathspec.match_file(relative_str):
             return False
@@ -194,8 +205,8 @@ class CodebaseScanner:
             if not language:
                 continue
             
-            if language == "typescript":
-                if ts_count < MAX_TS_FILES:
+            if language in TS_JS_LANGUAGES:
+                if MAX_TS_FILES <= 0 or ts_count < MAX_TS_FILES:
                     ts_files.append((path, language))
                     ts_count += 1
                 continue
@@ -208,7 +219,8 @@ class CodebaseScanner:
                 "spec" in str(x[0]).lower(),
                 "__tests__" in str(x[0]).lower()
             ))
-            for path, lang in ts_files[:MAX_TS_FILES]:
+            selected = ts_files[:MAX_TS_FILES] if MAX_TS_FILES > 0 else ts_files
+            for path, lang in selected:
                 yield path, lang
 
     def scan(self, max_workers: Optional[int] = None, progress_callback=None) -> Dict[str, int]:

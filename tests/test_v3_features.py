@@ -434,6 +434,76 @@ class TestKnowDeep:
         caller_names = [c["name"] for c in result.get("callers", [])]
         assert "authenticate" in caller_names
 
+    def test_deep_keeps_cross_file_same_name_edges(self, tmp_project, indexed_db):
+        """Cross-file edges with same symbol names should not be dropped."""
+        from know.context_engine import ContextEngine
+
+        conn = indexed_db._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/api/service.py",
+                "CodingAgentService.create_agent",
+                "method",
+                "python",
+                10,
+                13,
+                "def CodingAgentService.create_agent(payload):",
+                "def CodingAgentService.create_agent(payload):\n    return payload",
+                "hash_ca_service",
+                20,
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/api/router.py",
+                "create_agent",
+                "function",
+                "python",
+                20,
+                24,
+                "def create_agent(payload, service):",
+                "def create_agent(payload, service):\n    return service.create_agent(payload)",
+                "hash_ca_router",
+                24,
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO symbol_refs "
+            "(file_path, containing_chunk, ref_name, ref_type, line_number) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("src/api/router.py", "create_agent", "create_agent", "call", 22),
+        )
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        conn.commit()
+
+        config = MagicMock()
+        config.root = tmp_project
+
+        engine = ContextEngine.__new__(ContextEngine)
+        engine.db = indexed_db
+        engine.root = tmp_project
+        engine.config = config
+
+        router_result = engine.build_deep_context("router.py:create_agent", budget=3000)
+        assert any(
+            c["file"] == "src/api/service.py" and c["name"] == "CodingAgentService.create_agent"
+            for c in router_result.get("callees", [])
+        )
+
+        service_result = engine.build_deep_context("service.py:CodingAgentService.create_agent", budget=3000)
+        assert any(c["file"] == "src/api/router.py" for c in service_result.get("callers", []))
+
     def test_deep_file_colon_name_format(self, tmp_project, indexed_db):
         """build_deep_context resolves 'file:function' format."""
         from know.context_engine import ContextEngine

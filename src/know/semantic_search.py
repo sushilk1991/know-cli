@@ -324,7 +324,8 @@ class SemanticSearcher:
     def index_directory(self, root: Path, extensions: List[str] = None) -> int:
         """Index all files in a directory. Returns count of indexed files."""
         if extensions is None:
-            extensions = [".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cpp", ".c", ".h"]
+            from know.parsers import ParserFactory
+            extensions = sorted(ParserFactory.supported_extensions())
         
         # Load .gitignore if present
         ignore_spec = None
@@ -422,14 +423,15 @@ class SemanticSearcher:
     # ------------------------------------------------------------------
     def index_chunks(self, root: Path, extensions: List[str] = None) -> int:
         """Index code at function/class level for Python files.
-        
+
         Non-Python files fall back to file-level embedding.
         Returns number of chunks indexed.
         """
         from know.context_engine import extract_chunks_from_file
 
         if extensions is None:
-            extensions = [".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".cpp", ".c", ".h"]
+            from know.parsers import ParserFactory
+            extensions = sorted(ParserFactory.supported_extensions())
 
         ignore_spec = None
         gitignore_path = root / ".gitignore"

@@ -16,7 +16,7 @@ from know.parsers import (
     GoParser,
     BaseParser
 )
-from know.scanner import CodebaseScanner
+from know.scanner import CodebaseScanner, LANGUAGE_EXTENSIONS
 from know.models import ModuleInfo, FunctionInfo, ClassInfo
 from know.index import CodebaseIndex
 from know.exceptions import ParseError
@@ -182,6 +182,19 @@ class MyClass {
         assert len(module.classes) == 1
         assert module.classes[0].name == "MyClass"
 
+    def test_parse_typed_arrow_component_regex(self, temp_dir):
+        """TSX typed arrow components should be parsed as functions."""
+        parser = TypeScriptParser(use_treesitter=False, language="tsx")
+        test_file = temp_dir / "sidebar.tsx"
+        test_file.write_text("""
+export const AppSidebar: React.FC = () => {
+    return <div />;
+}
+""")
+        module = parser.parse(test_file, temp_dir)
+        function_names = {f.name for f in module.functions}
+        assert "AppSidebar" in function_names
+
 
 class TestGoParser:
     """Tests for GoParser."""
@@ -261,6 +274,11 @@ class TestParserFactory:
         """Test getting Go parser."""
         parser = ParserFactory.get_parser("go")
         assert isinstance(parser, GoParser)
+
+    def test_get_parser_swift(self):
+        """Swift should be available via regex parser fallback."""
+        parser = ParserFactory.get_parser("swift", use_treesitter=False)
+        assert parser is not None
     
     def test_get_parser_unknown(self):
         """Test getting unknown parser."""
@@ -271,6 +289,9 @@ class TestParserFactory:
         """Test getting parser by file path."""
         assert isinstance(ParserFactory.get_parser_for_file(Path("test.py")), PythonParser)
         assert isinstance(ParserFactory.get_parser_for_file(Path("test.ts")), TypeScriptParser)
+        tsx_parser = ParserFactory.get_parser_for_file(Path("test.tsx"))
+        assert isinstance(tsx_parser, TypeScriptParser)
+        assert tsx_parser.language == "tsx"
         assert isinstance(ParserFactory.get_parser_for_file(Path("test.go")), GoParser)
         assert ParserFactory.get_parser_for_file(Path("test.txt")) is None
     
@@ -359,11 +380,14 @@ class Component {}
         # Create a file in __pycache__
         (temp_project / "__pycache__").mkdir()
         (temp_project / "__pycache__" / "cached.py").write_text("def cached(): pass")
+        # Create generated build artifact under .next
+        (temp_project / ".next").mkdir()
+        (temp_project / ".next" / "generated.js").write_text("function bundled() {}")
         
         scanner = CodebaseScanner(config)
         stats = scanner.scan()
         
-        # Should not include __pycache__ files
+        # Should not include generated/cache files
         assert stats["files"] == 3
     
     def test_find_component(self, config, temp_project):
@@ -388,10 +412,17 @@ class Component {}
         """Test getting structure."""
         scanner = CodebaseScanner(config)
         structure = scanner.get_structure()
-        
+
         assert "modules" in structure
         assert "file_count" in structure
         assert structure["file_count"] == 3
+
+    def test_language_extension_mapping_includes_multilanguage_set(self):
+        """Scanner extension map should match parser language granularity."""
+        assert LANGUAGE_EXTENSIONS[".tsx"] == "tsx"
+        assert LANGUAGE_EXTENSIONS[".jsx"] == "jsx"
+        assert LANGUAGE_EXTENSIONS[".rs"] == "rust"
+        assert LANGUAGE_EXTENSIONS[".swift"] == "swift"
 
 
 class TestCodebaseIndex:
