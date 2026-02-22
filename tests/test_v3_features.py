@@ -803,3 +803,149 @@ class TestGetChunksByName:
     def test_limit_respected(self, indexed_db):
         results = indexed_db.get_chunks_by_name("check_cloud_access", limit=1)
         assert len(results) <= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: hybrid retrieval + graph-first expansion + packing
+# ---------------------------------------------------------------------------
+
+class TestHybridGraphAndPacking:
+    """High-impact retrieval improvements (TDD guardrails)."""
+
+    @staticmethod
+    def _engine(tmp_project):
+        from know.context_engine import ContextEngine
+
+        config = MagicMock()
+        config.root = tmp_project
+        config.project.name = "test"
+        config.project.description = ""
+        return ContextEngine(config)
+
+    def test_graph_expand_lane_adds_cross_file_call_neighbors(self, tmp_project, indexed_db):
+        """Graph lane should pull call-neighborhood chunks from other files."""
+        conn = indexed_db._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/gateway/router.py",
+                "handle_request",
+                "function",
+                "python",
+                3,
+                9,
+                "def handle_request(req):",
+                "def handle_request(req):\n    return validate_api_key(req.headers.get('x-api-key'))",
+                "hash_router_handle",
+                24,
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/security/keys.py",
+                "validate_api_key",
+                "function",
+                "python",
+                5,
+                11,
+                "def validate_api_key(value):",
+                "def validate_api_key(value):\n    return bool(value and len(value) > 8)",
+                "hash_validate_api_key",
+                20,
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO symbol_refs "
+            "(file_path, containing_chunk, ref_name, ref_type, line_number) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("src/gateway/router.py", "handle_request", "validate_api_key", "call", 4),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO file_index "
+            "(file_path, content_hash, language, chunk_count, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("src/gateway/router.py", "hash_router_file", "python", 1, now),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO file_index "
+            "(file_path, content_hash, language, chunk_count, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("src/security/keys.py", "hash_keys_file", "python", 1, now),
+        )
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        conn.commit()
+
+        engine = self._engine(tmp_project)
+        seed = indexed_db.get_chunks_by_name("handle_request")
+        assert seed
+        seed[0]["score"] = 1.0
+
+        expanded = engine._graph_expand_lane(indexed_db, seed, query="api key validation", limit=20)
+        names = {c.get("chunk_name") for c in expanded}
+        assert "validate_api_key" in names
+
+    def test_fuse_hybrid_lanes_rrf_promotes_multi_signal_candidates(self, tmp_project):
+        """Hybrid fusion should prioritize chunks that win in multiple lanes."""
+        engine = self._engine(tmp_project)
+
+        lexical = [
+            {"file_path": "src/a.py", "chunk_name": "alpha", "start_line": 1, "score": 1.0},
+            {"file_path": "src/b.py", "chunk_name": "beta", "start_line": 1, "score": 0.8},
+        ]
+        graph = [
+            {"file_path": "src/c.py", "chunk_name": "gamma", "start_line": 1, "score": 1.0},
+            {"file_path": "src/b.py", "chunk_name": "beta", "start_line": 1, "score": 0.7},
+        ]
+        semantic = [
+            {"file_path": "src/c.py", "chunk_name": "gamma", "start_line": 1, "score": 0.95},
+            {"file_path": "src/a.py", "chunk_name": "alpha", "start_line": 1, "score": 0.6},
+        ]
+
+        fused = engine._fuse_hybrid_lanes(lexical, graph, semantic, limit=3)
+        assert fused
+        # Top rank should come from a multi-signal candidate (not lane-only noise).
+        assert fused[0]["chunk_name"] in {"alpha", "gamma"}
+
+    def test_context_pipeline_uses_hybrid_retrieval(self, tmp_project, indexed_db):
+        """v3 context should route through hybrid retrieval helper."""
+        engine = self._engine(tmp_project)
+        with patch.object(engine, "_retrieve_hybrid_candidates", wraps=engine._retrieve_hybrid_candidates) as spy:
+            result = engine._build_context_v3_inner(
+                indexed_db, "billing", budget=3000,
+                include_tests=True, include_imports=True,
+                include_patterns=None, exclude_patterns=None,
+                chunk_types=None, session_id=None,
+            )
+
+        assert spy.call_count == 1
+        assert result["used_tokens"] >= 0
+
+    def test_pack_chunks_for_prompt_places_top_utility_on_edges(self, tmp_project):
+        """Packing should place top-utility chunks at prompt edges, not the middle."""
+        engine = self._engine(tmp_project)
+        chunks = [
+            {"file_path": "src/a.py", "chunk_name": "top1", "start_line": 1, "score": 1.00, "token_count": 30},
+            {"file_path": "src/b.py", "chunk_name": "top2", "start_line": 1, "score": 0.95, "token_count": 30},
+            {"file_path": "src/c.py", "chunk_name": "mid1", "start_line": 1, "score": 0.70, "token_count": 30},
+            {"file_path": "src/d.py", "chunk_name": "mid2", "start_line": 1, "score": 0.60, "token_count": 30},
+            {"file_path": "src/e.py", "chunk_name": "low1", "start_line": 1, "score": 0.50, "token_count": 30},
+            {"file_path": "src/f.py", "chunk_name": "low2", "start_line": 1, "score": 0.40, "token_count": 30},
+        ]
+
+        packed = engine._pack_chunks_for_prompt(chunks)
+        assert len(packed) == len(chunks)
+
+        edge_names = {packed[0]["chunk_name"], packed[-1]["chunk_name"]}
+        assert "top1" in edge_names
+        assert "top2" in edge_names
+        assert packed[len(packed) // 2]["chunk_name"] not in {"top1", "top2"}

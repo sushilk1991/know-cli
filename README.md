@@ -73,6 +73,9 @@ know init
 
 - New `know workflow "query"` command: single-call daemon workflow (`map -> context -> deep`).
 - `know context` now uses daemon-first full v3 context assembly (same ranking/budget pipeline as local fallback).
+- `know context` retrieval is now hybrid: lexical BM25 + graph neighborhood + semantic rerank fused with RRF.
+- Added graph-first neighborhood expansion (call/import neighbors) before final rerank.
+- Added prompt packing policy to reduce "lost in the middle" by placing highest-utility chunks at context edges.
 - `know deep` now performs opportunistic stale-file refresh for likely candidate files before resolving symbols.
 - `know related` refreshes the target file on demand, reducing stale import/dependency outputs.
 - Incremental refresh path re-indexes chunks + symbol refs for changed files without full reindex.

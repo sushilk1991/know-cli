@@ -520,8 +520,8 @@ class ContextEngine:
                 result["index_stats"] = stats
                 return result
 
-        # Step 1: FTS5 search with BM25F weights
-        raw_results = db.search_chunks(query, limit=100)
+        # Step 1: Hybrid retrieval (lexical + graph + semantic lanes, RRF fused)
+        raw_results = self._retrieve_hybrid_candidates(db, query, limit=120)
 
         if not raw_results:
             # Zero-result intelligence
@@ -711,6 +711,9 @@ class ContextEngine:
         # Step 9: Group chunks by file
         code_chunks = self._group_by_file(code_chunks)
 
+        # Step 9.5: Prompt packing to reduce "lost in the middle"
+        code_chunks = self._pack_chunks_for_prompt(code_chunks)
+
         # Step 10: Dependency signatures
         dep_chunks: List[Dict] = []
         dep_used = 0
@@ -770,6 +773,283 @@ class ContextEngine:
             result["session_id"] = session_id
 
         return result
+
+    @staticmethod
+    def _chunk_key(chunk: Dict[str, Any]) -> str:
+        return f"{chunk.get('file_path', '')}:{chunk.get('chunk_name', '')}:{chunk.get('start_line', 0)}"
+
+    def _retrieve_hybrid_candidates(
+        self, db, query: str, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve candidates via lexical + graph + semantic lanes, fused with RRF."""
+        lexical = db.search_chunks(query, limit=limit)
+        if not lexical:
+            return []
+
+        graph = self._graph_expand_lane(db, lexical, query, limit=max(20, limit // 2))
+        semantic = self._semantic_rerank_lane(query, lexical + graph, limit=max(20, limit // 2))
+
+        fused = self._fuse_hybrid_lanes(lexical, graph, semantic, limit=limit)
+        return fused or lexical[:limit]
+
+    def _graph_expand_lane(
+        self,
+        db,
+        seeds: List[Dict[str, Any]],
+        query: str,
+        limit: int = 80,
+    ) -> List[Dict[str, Any]]:
+        """Build graph-neighborhood retrieval lane from call/import neighborhoods."""
+        if not seeds:
+            return []
+
+        neighbors: Dict[str, Dict[str, Any]] = {}
+        top_seeds = sorted(seeds, key=lambda c: c.get("score", 0), reverse=True)[:12]
+
+        def _add_chunk(chunk: Dict[str, Any], base_score: float) -> None:
+            if not chunk:
+                return
+            key = self._chunk_key(chunk)
+            score = float(base_score)
+            current = neighbors.get(key)
+            if current is None or score > float(current.get("score", 0)):
+                item = dict(chunk)
+                item["score"] = score
+                neighbors[key] = item
+
+        # Call-neighborhood expansion.
+        for seed in top_seeds:
+            seed_name = seed.get("chunk_name", "")
+            if not seed_name:
+                continue
+
+            try:
+                callees = db.get_callees(seed_name, limit=25)
+            except Exception:
+                callees = []
+            for ref in callees:
+                ref_name = ref.get("ref_name", "")
+                if not ref_name:
+                    continue
+                for match in db.get_chunks_by_name(ref_name, limit=4):
+                    _add_chunk(match, 1.0)
+                if "." in ref_name and hasattr(db, "get_method_chunks_by_suffix"):
+                    leaf = ref_name.rsplit(".", 1)[-1]
+                    for match in db.get_method_chunks_by_suffix(leaf, limit=4):
+                        _add_chunk(match, 0.95)
+
+            try:
+                callers = db.get_callers(seed_name, limit=25)
+            except Exception:
+                callers = []
+            for ref in callers:
+                caller_name = ref.get("containing_chunk", "")
+                if not caller_name:
+                    continue
+                for match in db.get_chunks_by_name(caller_name, limit=4):
+                    _add_chunk(match, 0.9)
+
+        # Import-neighborhood expansion (module-level graph).
+        modules = []
+        for seed in top_seeds:
+            fp = seed.get("file_path", "")
+            if not fp:
+                continue
+            p = Path(fp)
+            module = str(p.with_suffix("")).replace("/", ".").replace("\\", ".")
+            modules.append(module)
+
+        module_neighbors: Set[str] = set()
+        if modules:
+            try:
+                imports_map = db.get_imports_batch(modules)
+                imported_by_map = db.get_imported_by_batch(modules)
+                for v in imports_map.values():
+                    module_neighbors.update(v)
+                for v in imported_by_map.values():
+                    module_neighbors.update(v)
+            except Exception:
+                pass
+
+        for mod in list(module_neighbors)[:120]:
+            file_path = self._resolve_module_to_file(db, mod)
+            if not file_path:
+                continue
+            chunks = db.get_chunks_for_file(file_path)
+            if not chunks:
+                continue
+            rank_priority = {"function": 0, "method": 1, "class": 2, "module": 3}
+            chunks = sorted(
+                chunks,
+                key=lambda c: (rank_priority.get(c.get("chunk_type", "module"), 9), c.get("start_line", 0)),
+            )
+            for chunk in chunks[:2]:
+                _add_chunk(chunk, 0.7)
+
+        # Keep graph lane deterministic and bounded.
+        results = sorted(neighbors.values(), key=lambda c: c.get("score", 0), reverse=True)
+        return results[:limit]
+
+    def _resolve_module_to_file(self, db, module_name: str) -> Optional[str]:
+        """Resolve a module name to an indexed file path across supported extensions."""
+        module = (module_name or "").strip()
+        if not module:
+            return None
+
+        stem = module.replace(".", "/")
+        ext_candidates = [
+            ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".swift",
+            ".java", ".rb", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp",
+        ]
+        file_candidates = [f"{stem}{ext}" for ext in ext_candidates]
+        file_candidates.append(f"{stem}/__init__.py")
+
+        for fp in file_candidates:
+            try:
+                if db.get_chunks_for_file(fp):
+                    return fp
+            except Exception:
+                continue
+        return None
+
+    def _semantic_rerank_lane(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        limit: int = 80,
+    ) -> List[Dict[str, Any]]:
+        """Embedding-based rerank lane over lexical+graph candidates."""
+        if not candidates:
+            return []
+
+        model = _get_cached_embedding_model()
+        if model is None:
+            return []
+
+        # Deduplicate before embedding.
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for c in candidates:
+            key = self._chunk_key(c)
+            existing = deduped.get(key)
+            if existing is None or float(c.get("score", 0)) > float(existing.get("score", 0)):
+                deduped[key] = c
+        unique = list(deduped.values())[:200]
+        if not unique:
+            return []
+
+        texts = [
+            f"{c.get('chunk_name', '')} {c.get('signature', '')}\n{(c.get('body', '') or '')[:500]}"
+            for c in unique
+        ]
+
+        try:
+            import numpy as np
+            query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
+            chunk_emb = np.array(list(model.embed(texts)), dtype=np.float32)
+            q_norm = np.linalg.norm(query_emb)
+            if q_norm == 0 or chunk_emb.size == 0:
+                return []
+            query_emb = query_emb / q_norm
+            norms = np.linalg.norm(chunk_emb, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            chunk_emb = chunk_emb / norms
+            sims = chunk_emb @ query_emb
+        except Exception as e:
+            logger.debug(f"Semantic lane skipped: {e}")
+            return []
+
+        scored = []
+        for i, chunk in enumerate(unique):
+            item = dict(chunk)
+            item["score"] = float(sims[i])
+            scored.append(item)
+        scored.sort(key=lambda c: c.get("score", 0), reverse=True)
+        return scored[:limit]
+
+    def _fuse_hybrid_lanes(
+        self,
+        lexical: List[Dict[str, Any]],
+        graph: List[Dict[str, Any]],
+        semantic: List[Dict[str, Any]],
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Fuse ranked lanes with weighted RRF."""
+        from know.ranking import fuse_rankings
+
+        lane_defs: List[Tuple[List[Dict[str, Any]], int]] = []
+        if lexical:
+            lane_defs.append((lexical, 3))
+        if graph:
+            lane_defs.append((graph, 2))
+        if semantic:
+            lane_defs.append((semantic, 2))
+        if not lane_defs:
+            return []
+        if len(lane_defs) == 1:
+            return lane_defs[0][0][:limit]
+
+        ranked_lists: List[List[Tuple[str, float]]] = []
+        chunk_map: Dict[str, Dict[str, Any]] = {}
+
+        for lane, weight in lane_defs:
+            seen = set()
+            keyed: List[Tuple[str, float]] = []
+            lane_sorted = sorted(lane, key=lambda c: c.get("score", 0), reverse=True)
+            for chunk in lane_sorted:
+                key = self._chunk_key(chunk)
+                if key in seen:
+                    continue
+                seen.add(key)
+                keyed.append((key, float(chunk.get("score", 0))))
+                prev = chunk_map.get(key)
+                if prev is None or float(chunk.get("score", 0)) > float(prev.get("score", 0)):
+                    chunk_map[key] = dict(chunk)
+            for _ in range(weight):
+                ranked_lists.append(keyed)
+
+        fused = fuse_rankings(ranked_lists)
+        out: List[Dict[str, Any]] = []
+        for key, fused_score in fused[:limit]:
+            base = chunk_map.get(key)
+            if not base:
+                continue
+            item = dict(base)
+            item["score"] = float(fused_score)
+            out.append(item)
+        return out
+
+    def _pack_chunks_for_prompt(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Place highest-utility chunks at prompt edges to reduce lost-in-middle."""
+        if len(chunks) <= 2:
+            return chunks
+
+        # Keep one entry per chunk key.
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for chunk in chunks:
+            key = self._chunk_key(chunk)
+            if key not in deduped:
+                deduped[key] = chunk
+        unique = list(deduped.values())
+
+        def utility(c: Dict[str, Any]) -> float:
+            score = float(c.get("score", 0.0))
+            imported_by = c.get("imported_by", []) or []
+            centrality = min(len(imported_by), 10) / 10.0
+            token_count = max(1, int(c.get("token_count", 0) or 0))
+            compactness = 1.0 / (1.0 + (token_count / 300.0))
+            return score + 0.2 * centrality + 0.1 * compactness
+
+        ranked = sorted(unique, key=utility, reverse=True)
+
+        left: List[Dict[str, Any]] = []
+        right: List[Dict[str, Any]] = []
+        for idx, chunk in enumerate(ranked):
+            if idx % 2 == 0:
+                left.append(chunk)
+            else:
+                right.append(chunk)
+
+        return left + list(reversed(right))
 
     def _expand_context(
         self,
