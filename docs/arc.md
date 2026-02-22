@@ -28,7 +28,7 @@
 
 - **Files:** 36
 - **Modules:** 36
-- **Functions:** 125
+- **Functions:** 128
 - **Classes:** 58
 
 ---

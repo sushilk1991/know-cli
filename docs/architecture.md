@@ -20,7 +20,7 @@ graph TB
     generator["generator\n(0f, 1c)"]
     parsers["parsers\n(1f, 14c)"]
     quality["quality\n(0f, 2c)"]
-    daemon["daemon\n(16f, 2c)"]
+    daemon["daemon\n(19f, 2c)"]
     git_hooks["git_hooks\n(2f, 1c)"]
 
     embeddings --> logger
@@ -74,9 +74,9 @@ graph TB
     context_engine --> file_categories
     context_engine --> ranking
     context_engine --> scanner
+    context_engine --> daemon
     context_engine --> query
     context_engine --> import_graph
-    context_engine --> daemon
     scanner --> exceptions
     scanner --> logger
     scanner --> parsers
