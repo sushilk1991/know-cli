@@ -111,7 +111,7 @@ class TestAISummarizer:
         """Create a test config."""
         return Config(
             project=ProjectConfig(name="Test Project", description="A test project"),
-            ai=AIConfig(provider="anthropic", model="claude-haiku-4-5-20251022"),
+            ai=AIConfig(provider="anthropic", model="claude-haiku-4-5-20251001"),
             output=OutputConfig(directory="docs")
         )
     

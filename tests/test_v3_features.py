@@ -599,6 +599,40 @@ class TestKnowDeep:
         seen = indexed_db.get_session_seen("deep-session")
         assert len(seen) > 0
 
+    def test_deep_refreshes_stale_file_on_file_hint(self, tmp_project, indexed_db):
+        """Deep should refresh stale file index for explicit file:name queries."""
+        from know.context_engine import ContextEngine
+
+        service_file = tmp_project / "src" / "billing" / "service.py"
+        service_file.write_text(
+            '''"""Billing service module."""
+
+def check_workspace_access(workspace):
+    """Renamed function after edit."""
+    count = count_active_sessions(workspace.id)
+    if count > workspace.limit:
+        raise LimitExceeded(workspace)
+    return True
+
+def count_active_sessions(workspace_id):
+    return 0
+''',
+            encoding="utf-8",
+        )
+
+        config = MagicMock()
+        config.root = tmp_project
+
+        engine = ContextEngine.__new__(ContextEngine)
+        engine.db = indexed_db
+        engine.root = tmp_project
+        engine.config = config
+
+        result = engine.build_deep_context("service.py:check_workspace_access", budget=3000, db=indexed_db)
+        assert "error" not in result
+        assert result["target"]["name"] == "check_workspace_access"
+        assert result["target"]["file"] == "src/billing/service.py"
+
     def test_deep_cli_json_output(self, tmp_project, indexed_db):
         """CLI `know deep` with --json produces valid JSON."""
         runner = CliRunner()

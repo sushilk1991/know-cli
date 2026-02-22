@@ -20,9 +20,9 @@ AI agents dump entire files into context. Every `grep` match pulls in thousands 
 
 | Tier | Command | Tokens/result | Use case |
 |------|---------|---------------|----------|
-| **Map** | `know map "query"` | ~50 | Orient: what exists? |
-| **Context** | `know context "query" --session S` | ~300-500 | Investigate: relevant code bodies |
-| **Deep** | `know deep "function_name"` | ~1500 | Surgical: function + callers + callees |
+| **Map** | `know map "query"` | ~10-25 per signature | Orient: what exists? |
+| **Context** | `know context "query" --session S` | ~150-350 per chunk | Investigate: relevant code bodies |
+| **Deep** | `know deep "function_name"` | ~300-1500 per call | Surgical: function + callers + callees |
 
 Session dedup means the second query never re-sends code from the first.
 
@@ -30,39 +30,32 @@ Session dedup means the second query never re-sends code from the first.
 
 ## Benchmarks
 
-**farfield** (764 files, 2487 functions, production TypeScript+Python monorepo)
+### Dual-Repo Parallel Benchmark (v0.7.6, February 22, 2026)
 
-### Token efficiency: 3-tier vs single-context vs Grep+Read (8 scenarios)
+Method:
+- Ran in parallel per query: `grep+read` baseline vs `know map -> context -> deep`.
+- 4 shared architecture questions, on both repos.
+- File coverage in baseline search: `py, ts, tsx, js, jsx, go, rs, swift`.
 
-| Scenario | Grep+Read | v0.6 context-only | v0.7 3-tier | v0.7 vs v0.6 |
-|---|---|---|---|---|
-| WebSocket handling | 106,257 | 5,976 | 3,549 | **-41%** |
-| Auth & API keys | 145,690 | 4,063 | 3,569 | **-12%** |
-| Model routing | 125,453 | 5,271 | 3,251 | **-38%** |
-| Error handling | 45,205 | 7,517 | 4,226 | **-44%** |
-| Database storage | 180,329 | 5,479 | 3,138 | **-43%** |
-| Billing | 41,789 | 5,424 | 3,295 | **-39%** |
-| LLM providers | 176,184 | 5,085 | 3,184 | **-37%** |
-| Agent execution | 175,338 | 2,250 | 2,445 | -9% |
-| **Total** | **996,245** | **41,065** | **26,657** | **-35%** |
+| Repo | Grep Tokens (4 queries) | know Tokens (4 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `know-cli` | 227,592 | 15,646 | **93.1%** | 0.333s | 2.546s | 7.65x | 64 -> 12 |
+| `farfield` | 284,293 | 14,377 | **94.9%** | 0.529s | 2.451s | 4.63x | 64 -> 12 |
 
-v0.7 3-tier = `know map` → `know context --session` → `know deep`
+Deep call-graph quality snapshot from the same run:
+- `know-cli`: call-graph available in 100% of deep queries, non-empty edges in 100%.
+- `farfield`: call-graph available in 100%, non-empty edges in 25% (major remaining gap).
 
-- **37.4x** fewer tokens than grep+read
-- **35%** fewer tokens than v0.6 context-only
+Artifacts:
+- `benchmark/results/dual_repo_parallel.json`
+- `benchmark/results/DUAL_REPO_BENCHMARK.md`
+- Runner: `benchmark/bench_dual_repo_parallel.py`
 
-### Live head-to-head agent benchmark
+### What this means
 
-Two Claude Opus agents answered 3 identical questions about the farfield codebase. One used `know` CLI, the other used grep+read.
-
-| Metric | Agent with `know` | Agent with Grep+Read |
-|---|---|---|
-| Tool calls | **28** | 40 |
-| Total tokens | **98,593** | 107,060 |
-| Duration | 215s | 206s |
-| Answer quality | Equivalent | Equivalent |
-
-**30% fewer tool calls. 8% fewer tokens. Same answer quality.**
+- **Token and tool-call efficiency is strong now.**
+- **Latency is still behind raw grep** for this benchmark setup.
+- The biggest product gap remains **deep call-graph completeness on large TSX/Python codebases**.
 
 ---
 
@@ -73,6 +66,12 @@ pip install know-cli
 cd your-project
 know init
 ```
+
+### What's New in 0.7.6 (Phase 2)
+
+- `know deep` now performs opportunistic stale-file refresh for likely candidate files before resolving symbols.
+- `know related` refreshes the target file on demand, reducing stale import/dependency outputs.
+- Incremental refresh path re-indexes chunks + symbol refs for changed files without full reindex.
 
 ### The 3-Tier Workflow
 

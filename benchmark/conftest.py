@@ -71,7 +71,7 @@ V7_DEEP_BUDGET = 3000        # v0.7.0 tier-3 budget
 MAP_LIMIT = 20               # v0.7.0 tier-1 map results
 
 # Agent config
-AGENT_MODEL = "claude-sonnet-4-20250514"
+AGENT_MODEL = "claude-sonnet-4-5-20250929"
 AGENT_MAX_TURNS = 20
 AGENT_TEMPERATURE = 0
 

@@ -445,21 +445,21 @@ class DaemonDB:
         conn = self._get_conn()
         col_count = getattr(self, '_fts_cols', None) or self._fts_column_count(conn)
 
-        lanes: List[List[Dict[str, Any]]] = []
+        lanes: List[Tuple[List[Dict[str, Any]], int]] = []
 
         # Lane 1: OR query (broad recall)
         or_query = build_fts_or_query(plan.all_search_terms)
         if or_query:
             lane1 = self._fts_search(conn, or_query, col_count, limit * 3)
             if lane1:
-                lanes.append(lane1)
+                lanes.append((lane1, 1))
 
         # Lane 2: AND query (high precision)
         and_query = build_fts_and_query(plan.all_search_terms)
         if and_query:
             lane2 = self._fts_search(conn, and_query, col_count, limit * 2)
             if lane2:
-                lanes.append(lane2)
+                lanes.append((lane2, 2))
 
         # Lane 3: Exact name match for identifiers
         lane3: List[Dict[str, Any]] = []
@@ -487,21 +487,19 @@ class DaemonDB:
                 pass
 
         if lane3:
-            lanes.append(lane3)
+            lanes.append((lane3, 3))
 
         if not lanes:
             return []
 
         # If only one lane returned results, skip fusion
         if len(lanes) == 1:
-            return lanes[0][:limit]
+            return lanes[0][0][:limit]
 
         # RRF fusion with lane-specific weights
         # Convert to (chunk_key, score) format for fuse_rankings
         ranked_lists = []
-        for i, lane in enumerate(lanes):
-            # Lane weights: lane1 (OR)=1x, lane2 (AND)=2x, lane3 (exact)=3x
-            weight = [1, 2, 3][min(i, 2)]
+        for lane, weight in lanes:
             keyed = []
             for chunk in lane:
                 key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
@@ -514,7 +512,7 @@ class DaemonDB:
 
         # Map back to full chunk dicts
         chunk_map: Dict[str, Dict] = {}
-        for lane in lanes:
+        for lane, _weight in lanes:
             for chunk in lane:
                 key = f"{chunk['file_path']}:{chunk['chunk_name']}:{chunk.get('start_line', 0)}"
                 if key not in chunk_map:

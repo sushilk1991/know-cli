@@ -184,6 +184,22 @@ def related(ctx: click.Context, file_path: str) -> None:
         console.print("[red]Not initialized.[/red]")
         return
 
+    # Phase 2 freshness: re-index target file on demand if stale.
+    db_refresh = None
+    try:
+        from know.daemon import refresh_file_if_stale
+        db_refresh = _get_db_fallback(config)
+        refresh_file_if_stale(
+            config.root, config, db_refresh, file_path, remove_missing=True,
+        )
+    except Exception as e:
+        logger.debug(f"Related stale-file refresh skipped: {e}")
+    finally:
+        try:
+            db_refresh.close()
+        except Exception:
+            pass
+
     client = _get_daemon_client(config)
     imports = []
     imported_by = []

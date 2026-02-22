@@ -305,3 +305,50 @@ class TestDualLaneSearch:
         assert len(results) > 0
         # The RRF fusion should produce scores > 0
         assert all(r.get("score", 0) > 0 for r in results)
+
+    def test_lane_weights_stable_when_or_lane_empty(self, search_db, monkeypatch):
+        """AND+exact lanes keep their native weights when OR lane is empty."""
+        from know.query import SearchPlan
+        import know.query as query_mod
+        import know.ranking as ranking_mod
+
+        monkeypatch.setattr(
+            query_mod, "analyze_query",
+            lambda _q: SearchPlan(
+                original="q",
+                terms=["needle"],
+                identifiers=["verify_session"],
+                expanded_terms=[],
+                query_type="identifier",
+                all_search_terms=["needle", "verify_session"],
+            ),
+        )
+        monkeypatch.setattr(query_mod, "build_fts_or_query", lambda _terms: "OR_ONLY")
+        monkeypatch.setattr(query_mod, "build_fts_and_query", lambda _terms: "AND_ONLY")
+
+        sample = {
+            "file_path": "src/auth.py",
+            "chunk_name": "verify_session",
+            "chunk_type": "function",
+            "start_line": 10,
+            "body": "def verify_session(token): pass",
+            "score": 1.0,
+        }
+        monkeypatch.setattr(
+            search_db,
+            "_fts_search",
+            lambda _conn, fts_query, _col_count, _limit: [] if fts_query == "OR_ONLY" else [sample],
+        )
+
+        seen_ranked_lists = {}
+
+        def fake_fuse_rankings(ranked_lists, k=60):
+            seen_ranked_lists["count"] = len(ranked_lists)
+            return [("src/auth.py:verify_session:10", 42.0)]
+
+        monkeypatch.setattr(ranking_mod, "fuse_rankings", fake_fuse_rankings)
+
+        results = search_db.search_chunks("needle")
+        assert results and results[0]["chunk_name"] == "verify_session"
+        # AND lane weight (2x) + exact lane weight (3x) = 5 ranked lists.
+        assert seen_ranked_lists["count"] == 5

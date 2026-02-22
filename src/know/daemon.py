@@ -18,7 +18,7 @@ import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable
 
 import xxhash
 
@@ -62,6 +62,218 @@ def _extract_body(
     return lines, fallback
 
 
+def _build_chunks_from_module(content: str, mod_info) -> list[dict]:
+    """Build chunk rows for a parsed module."""
+    chunks: list[dict] = []
+    lines = None
+
+    for func in mod_info.functions:
+        start = func.line_number
+        end = func.end_line if func.end_line >= start else start
+        chunk_type = "constant" if "constant" in func.decorators else (
+            "method" if func.is_method else "function"
+        )
+        fallback = f"{func.signature}\n{func.docstring or ''}"
+        lines, body = _extract_body(lines, content, start, end, fallback)
+
+        chunks.append({
+            "name": func.name,
+            "type": chunk_type,
+            "start_line": start,
+            "end_line": end,
+            "signature": func.signature,
+            "body": body,
+        })
+
+    for cls in mod_info.classes:
+        start = cls.line_number
+        end = cls.end_line if cls.end_line >= start else start
+        fallback = f"class {cls.name}\n{cls.docstring or ''}"
+        lines, body = _extract_body(lines, content, start, end, fallback)
+
+        chunks.append({
+            "name": cls.name,
+            "type": "class",
+            "start_line": start,
+            "end_line": end,
+            "signature": cls.name,
+            "body": body,
+        })
+
+        # Python parser stores class methods on cls.methods (not module.functions).
+        for method in getattr(cls, "methods", []) or []:
+            m_start = method.line_number
+            m_end = method.end_line if method.end_line >= m_start else m_start
+            method_sig = method.signature or method.name
+            if not method_sig.startswith(f"{cls.name}."):
+                method_sig = f"{cls.name}.{method_sig}"
+            fallback = f"{method_sig}\n{method.docstring or ''}"
+            lines, method_body = _extract_body(lines, content, m_start, m_end, fallback)
+            chunks.append({
+                "name": f"{cls.name}.{method.name}",
+                "type": "method",
+                "start_line": m_start,
+                "end_line": m_end,
+                "signature": method_sig,
+                "body": method_body,
+            })
+
+    if not chunks:
+        chunks.append({
+            "name": mod_info.name,
+            "type": "module",
+            "start_line": 1,
+            "end_line": content.count("\n") + 1,
+            "signature": mod_info.name,
+            "body": content[:MAX_CHUNK_BODY_CHARS],
+        })
+
+    return chunks
+
+
+def refresh_file_if_stale(
+    root: Path,
+    config: Config,
+    db: DaemonDB,
+    file_path: str | Path,
+    *,
+    force: bool = False,
+    remove_missing: bool = False,
+) -> Dict[str, Any]:
+    """Re-index a single file when missing or stale.
+
+    Returns metadata with keys: updated(bool), removed(bool), file_path, reason,
+    and optional chunks/call_refs counts.
+    """
+    from know.parsers import ParserFactory
+
+    candidate = Path(file_path)
+    abs_path = candidate if candidate.is_absolute() else (root / candidate)
+    abs_path = abs_path.resolve()
+
+    try:
+        rel_path = str(abs_path.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        # Ignore paths outside project root
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": str(file_path),
+            "reason": "outside_project_root",
+        }
+
+    if not abs_path.exists():
+        if remove_missing:
+            db.remove_file(rel_path)
+            return {
+                "updated": True,
+                "removed": True,
+                "file_path": rel_path,
+                "reason": "file_missing_removed",
+            }
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "file_missing_skipped",
+        }
+
+    lang = EXTENSION_TO_LANGUAGE.get(abs_path.suffix.lower(), "")
+    if not lang:
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "unsupported_extension",
+        }
+
+    content = abs_path.read_text(encoding="utf-8", errors="replace")
+    content_hash = xxhash.xxh64(content.encode()).hexdigest()
+    stored_hash = db.get_file_hash(rel_path)
+    if stored_hash == content_hash and not force:
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "up_to_date",
+        }
+
+    parser = ParserFactory.get_parser_for_file(abs_path)
+    if parser is None:
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "no_parser",
+        }
+
+    try:
+        mod_info = parser.parse(abs_path, root)
+    except Exception as e:
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": f"parse_failed:{e.__class__.__name__}",
+        }
+
+    chunks = _build_chunks_from_module(content, mod_info)
+    db.upsert_chunks(rel_path, lang, chunks)
+    db.update_file_index(rel_path, content_hash, lang, len(chunks))
+
+    call_refs = []
+    try:
+        if hasattr(parser, "extract_call_refs"):
+            call_refs = parser.extract_call_refs(content, mod_info) or []
+        # Always replace symbol refs so stale rows are removed on file edits.
+        db.upsert_symbol_refs(rel_path, call_refs)
+    except Exception as e:
+        logger.debug(f"Call extraction failed for {rel_path}: {e}")
+        db.upsert_symbol_refs(rel_path, [])
+
+    return {
+        "updated": True,
+        "removed": False,
+        "file_path": rel_path,
+        "reason": "reindexed",
+        "chunks": len(chunks),
+        "call_refs": len(call_refs),
+    }
+
+
+def refresh_files_if_stale(
+    root: Path,
+    config: Config,
+    db: DaemonDB,
+    file_paths: Iterable[str | Path],
+    *,
+    force: bool = False,
+    remove_missing: bool = False,
+) -> Dict[str, Any]:
+    """Refresh multiple files and return an aggregate summary."""
+    refreshed = 0
+    removed = 0
+    skipped = 0
+    results = []
+    for fp in file_paths:
+        result = refresh_file_if_stale(
+            root, config, db, fp, force=force, remove_missing=remove_missing,
+        )
+        results.append(result)
+        if result.get("updated"):
+            refreshed += 1
+            if result.get("removed"):
+                removed += 1
+        else:
+            skipped += 1
+    return {
+        "refreshed": refreshed,
+        "removed": removed,
+        "skipped": skipped,
+        "results": results,
+    }
+
+
 def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
     """Populate the daemon DB with code chunks (standalone, no daemon needed).
 
@@ -100,69 +312,7 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
             if stored_hash == content_hash:
                 continue
 
-            chunks = []
-            lines = None
-
-            for func in mod_info.functions:
-                start = func.line_number
-                end = func.end_line if func.end_line >= start else start
-                chunk_type = "constant" if "constant" in func.decorators else (
-                    "method" if func.is_method else "function"
-                )
-                fallback = f"{func.signature}\n{func.docstring or ''}"
-                lines, body = _extract_body(lines, content, start, end, fallback)
-
-                chunks.append({
-                    "name": func.name,
-                    "type": chunk_type,
-                    "start_line": start,
-                    "end_line": end,
-                    "signature": func.signature,
-                    "body": body,
-                })
-
-            for cls in mod_info.classes:
-                start = cls.line_number
-                end = cls.end_line if cls.end_line >= start else start
-                fallback = f"class {cls.name}\n{cls.docstring or ''}"
-                lines, body = _extract_body(lines, content, start, end, fallback)
-
-                chunks.append({
-                    "name": cls.name,
-                    "type": "class",
-                    "start_line": start,
-                    "end_line": end,
-                    "signature": cls.name,
-                    "body": body,
-                })
-
-                # Python parser stores class methods on cls.methods (not module.functions).
-                for method in getattr(cls, "methods", []) or []:
-                    m_start = method.line_number
-                    m_end = method.end_line if method.end_line >= m_start else m_start
-                    method_sig = method.signature or method.name
-                    if not method_sig.startswith(f"{cls.name}."):
-                        method_sig = f"{cls.name}.{method_sig}"
-                    fallback = f"{method_sig}\n{method.docstring or ''}"
-                    lines, method_body = _extract_body(lines, content, m_start, m_end, fallback)
-                    chunks.append({
-                        "name": f"{cls.name}.{method.name}",
-                        "type": "method",
-                        "start_line": m_start,
-                        "end_line": m_end,
-                        "signature": method_sig,
-                        "body": method_body,
-                    })
-
-            if not chunks:
-                chunks.append({
-                    "name": mod_info.name,
-                    "type": "module",
-                    "start_line": 1,
-                    "end_line": content.count("\n") + 1,
-                    "signature": mod_info.name,
-                    "body": content[:MAX_CHUNK_BODY_CHARS],
-                })
+            chunks = _build_chunks_from_module(content, mod_info)
 
             db.upsert_chunks(path_str, lang, chunks)
             db.update_file_index(path_str, content_hash, lang, len(chunks))

@@ -30,7 +30,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from know.token_counter import count_tokens, truncate_to_budget, format_budget
 from know.logger import get_logger
@@ -1423,6 +1423,18 @@ class ContextEngine:
     ) -> Dict[str, Any]:
         """Inner deep context pipeline."""
         from know.file_categories import categorize_file
+        from know.daemon import refresh_files_if_stale
+
+        # Step 0: Opportunistic stale-file refresh for the queried symbol.
+        # This keeps deep context accurate without requiring full reindex.
+        refresh_candidates = self._collect_deep_refresh_candidates(db, name)
+        if refresh_candidates:
+            try:
+                refresh_files_if_stale(
+                    self.config.root, self.config, db, refresh_candidates,
+                )
+            except Exception as e:
+                logger.debug(f"Deep stale-file refresh failed: {e}")
 
         # Step 1: Resolve function name to chunk(s)
         candidates = self._resolve_function(db, name, include_tests)
@@ -1574,6 +1586,61 @@ class ContextEngine:
             result["session_id"] = session_id
 
         return result
+
+    def _collect_deep_refresh_candidates(self, db, name: str, limit: int = 25) -> List[str]:
+        """Collect likely files to refresh for a deep query."""
+        files: Set[str] = set()
+        query = (name or "").strip()
+        if not query:
+            return []
+
+        symbol = query
+        # file:name or path:name hint
+        if ":" in query:
+            file_hint, symbol_hint = query.rsplit(":", 1)
+            symbol = symbol_hint.strip() or symbol
+            if "/" in file_hint or file_hint.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".swift")):
+                files.add(file_hint.strip())
+
+        lookup_names = {query, symbol}
+        if "." in symbol:
+            lookup_names.add(symbol.rsplit(".", 1)[-1])
+
+        for lookup in lookup_names:
+            if not lookup:
+                continue
+            try:
+                for c in db.get_chunks_by_name(lookup, limit=limit):
+                    fp = c.get("file_path")
+                    if fp:
+                        files.add(fp)
+            except Exception:
+                pass
+            try:
+                for c in db.get_callers(lookup, limit=limit):
+                    fp = c.get("file_path")
+                    if fp:
+                        files.add(fp)
+            except Exception:
+                pass
+            try:
+                for c in db.get_callees(lookup, limit=limit):
+                    fp = c.get("file_path")
+                    if fp:
+                        files.add(fp)
+            except Exception:
+                pass
+
+        try:
+            for r in db.search_chunks(symbol, limit=limit):
+                fp = r.get("file_path")
+                if fp:
+                    files.add(fp)
+        except Exception:
+            pass
+
+        # Keep refresh bounded.
+        return sorted(files)[:limit]
 
     def _resolve_function(
         self, db, name: str, include_tests: bool,

@@ -518,6 +518,66 @@ class TestCodebaseIndex:
         assert index.get_stats()["cached_files"] == 0
 
 
+class TestIncrementalRefresh:
+    """Tests for single-file stale index refresh."""
+
+    def test_refresh_file_if_stale_reindexes_python_file(self, tmp_path):
+        from know.config import Config, OutputConfig
+        from know.daemon import refresh_file_if_stale
+        from know.daemon_db import DaemonDB
+
+        root = tmp_path
+        src = root / "src"
+        src.mkdir()
+        py = src / "service.py"
+        py.write_text(
+            "def fresh_name():\n    return 1\n",
+            encoding="utf-8",
+        )
+
+        config = Config(
+            root=root,
+            exclude=[],
+            include=[],
+            output=OutputConfig(directory="docs", watch=OutputConfig.WatchConfig()),
+        )
+        db = DaemonDB(root)
+
+        # Seed stale row with mismatched hash/chunk.
+        conn = db._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))",
+            (
+                "src/service.py",
+                "old_name",
+                "function",
+                "python",
+                1,
+                1,
+                "def old_name():",
+                "def old_name():\n    return 0",
+                "oldhash",
+                10,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO file_index "
+            "(file_path, content_hash, language, chunk_count, indexed_at) "
+            "VALUES (?, ?, ?, ?, strftime('%s','now'))",
+            ("src/service.py", "stale_hash", "python", 1),
+        )
+        conn.commit()
+
+        result = refresh_file_if_stale(root, config, db, "src/service.py")
+        assert result["updated"] is True
+        assert db.get_chunks_by_name("fresh_name")
+        assert not db.get_chunks_by_name("old_name")
+        db.close()
+
+
 class TestIntegration:
     """Integration tests for full workflow."""
     
