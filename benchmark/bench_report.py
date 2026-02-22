@@ -70,6 +70,22 @@ def generate_report() -> str:
                      f"({summary['total_savings_pct']}% savings)")
         lines.append("")
 
+    # ── Suite 2b: Memory Quality ───────────────────────────────────────────
+    mq = load_json("memory_quality.json")
+    if mq:
+        lines.append("## Memory Quality (Structured Recall)")
+        lines.append("")
+        lines.append(
+            f"**Top-1**: {mq.get('top1_hits', 0)}/{mq.get('cases', 0)} ({mq.get('top1_rate', 0)}%) | "
+            f"**Top-3**: {mq.get('top3_hits', 0)}/{mq.get('cases', 0)} ({mq.get('top3_rate', 0)}%) | "
+            f"**Top-5**: {mq.get('top5_hits', 0)}/{mq.get('cases', 0)} ({mq.get('top5_rate', 0)}%)"
+        )
+        lines.append(
+            f"**Latency**: avg {mq.get('latency_ms_avg', 0)}ms, "
+            f"p50 {mq.get('latency_ms_p50', 0)}ms, p95 {mq.get('latency_ms_p95', 0)}ms"
+        )
+        lines.append("")
+
     # ── Suite 3+4: Agent E2E + Quality ─────────────────────────────────────
     ae = load_json("agent_e2e.json")
     if ae:

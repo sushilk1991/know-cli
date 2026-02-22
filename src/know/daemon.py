@@ -650,7 +650,7 @@ class KnowDaemon:
             + int(deep_result.get("budget_used", deep_result.get("used_tokens", 0)) or 0)
         )
 
-        return {
+        payload = {
             "query": query,
             "session_id": session_id,
             "budgets": {
@@ -670,6 +670,23 @@ class KnowDaemon:
             "total_tokens": total_tokens,
         }
 
+        # Persist high-signal decision memory for future sessions.
+        try:
+            from know.memory_capture import capture_workflow_decision
+
+            capture_workflow_decision(
+                self.config,
+                query,
+                payload,
+                session_id=session_id,
+                source="auto-workflow",
+                agent="daemon",
+            )
+        except Exception as e:
+            logger.debug(f"Daemon workflow decision capture failed: {e}")
+
+        return payload
+
     async def _handle_signatures(self, params: dict) -> dict:
         """Get function/class signatures."""
         file_path = params.get("file", None)
@@ -685,20 +702,53 @@ class KnowDaemon:
 
     async def _handle_remember(self, params: dict) -> dict:
         """Store a memory."""
-        import uuid
         content = params.get("content", "")
-        tags = json.dumps(params.get("tags", []))
+        tags_val = params.get("tags", [])
+        if isinstance(tags_val, list):
+            tags = ",".join(str(t) for t in tags_val)
+        else:
+            tags = str(tags_val or "")
         source = params.get("source", "manual")
-        memory_id = str(uuid.uuid4())[:8]
-        stored = self.db.store_memory(memory_id, content, tags, source)
-        return {"stored": stored, "id": memory_id if stored else None}
+
+        try:
+            from know.knowledge_base import KnowledgeBase
+
+            kb = KnowledgeBase(self.config)
+            mem_id = kb.remember(
+                content,
+                source=source,
+                tags=tags,
+                memory_type=params.get("memory_type", "note"),
+                decision_status=params.get("decision_status", "active"),
+                confidence=float(params.get("confidence", 0.5) or 0.5),
+                evidence=params.get("evidence", ""),
+                session_id=params.get("session_id", ""),
+                agent=params.get("agent", "daemon"),
+                trust_level=params.get("trust_level", "local_verified"),
+                supersedes_id=params.get("supersedes_id", ""),
+                expires_at=params.get("expires_at"),
+            )
+            return {"stored": True, "id": mem_id}
+        except Exception as e:
+            logger.debug(f"Daemon remember fallback path: {e}")
+            return {"stored": False, "id": None}
 
     async def _handle_recall(self, params: dict) -> dict:
         """Recall memories by query."""
         query = params.get("query", "")
         limit = params.get("limit", 10)
-        memories = self.db.recall_memories(query, limit)
-        return {"memories": memories, "count": len(memories)}
+        from know.knowledge_base import KnowledgeBase
+
+        kb = KnowledgeBase(self.config)
+        memories = kb.recall(
+            query,
+            top_k=limit,
+            memory_type=params.get("memory_type"),
+            decision_status=params.get("decision_status"),
+            include_blocked=bool(params.get("include_blocked", False)),
+            include_expired=bool(params.get("include_expired", False)),
+        )
+        return {"memories": [m.to_dict() for m in memories], "count": len(memories)}
 
     async def _handle_callers(self, params: dict) -> dict:
         """Find callers of a function."""

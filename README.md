@@ -110,7 +110,7 @@ know --json context "payment processing" --budget 4000 --session a1b2c3d4
 
 ---
 
-## Commands
+## Commands Reference
 
 ### Workflow — Single Daemon Call
 
@@ -162,9 +162,14 @@ Returns the function body + what it calls (callees) + what calls it (callers), a
 ```bash
 know remember "Auth uses JWT with Redis session store"
 know recall "how does auth work?"
+know decide "Use single daemon workflow" --why "lower tool-call overhead" --evidence src/know/daemon.py:572
+know recall "workflow decisions" --type decision --status active
+know memories resolve 12 --status resolved
+know memories export > memories.json
 ```
 
 Memories are automatically included in `know context` results.
+Structured memory fields now include `memory_type`, `decision_status`, `confidence`, `evidence`, `session_id`, `agent`, and `trust_level`.
 
 ### All Commands
 
@@ -176,7 +181,9 @@ Memories are automatically included in `know context` results.
 | `know deep "name"` | Function + callers + callees |
 | `know search "query"` | Semantic code search |
 | `know remember "text"` | Store a memory |
+| `know decide "decision"` | Store structured decision memory |
 | `know recall "query"` | Recall memories |
+| `know memories resolve <id>` | Resolve/supersede/reject a memory |
 | `know signatures [file]` | Function/class signatures |
 | `know related <file>` | Import deps and dependents |
 | `know callers <function>` | What calls this function |
@@ -188,6 +195,17 @@ Memories are automatically included in `know context` results.
 | `know diff --since "1w"` | Architectural changes over time |
 | `know mcp serve` | Start MCP server |
 | `know init` | Initialize know in project |
+
+### MCP Memory Interop (Cross-Agent)
+
+When using `know mcp serve`, agents can share structured memory through MCP tools:
+
+- `remember(...)` with structured fields (`memory_type`, `decision_status`, `confidence`, `evidence`, `session_id`, `agent`, `trust_level`)
+- `recall(...)` with filters (`memory_type`, `decision_status`, blocked/expiry controls)
+- `resolve_memory(memory_id, status)`
+- `export_memories()`
+
+This is the canonical path for Codex/Claude/Gemini memory portability.
 
 ### Global Flags
 
@@ -253,6 +271,11 @@ pip install know-cli[search,mcp]
 ```
 
 **Requirements:** Python 3.10+
+
+## Pricing
+
+`know-cli` is free and open-source (MIT). It runs locally and does not add usage-based fees.
+If you enable optional model APIs in your own workflows, those provider costs are separate.
 
 ## Releasing
 

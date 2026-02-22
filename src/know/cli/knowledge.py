@@ -13,17 +13,54 @@ from know.cli import console, logger
 @click.argument("text")
 @click.option("--tags", "-t", default="", help="Comma-separated tags")
 @click.option("--source", "-s", default="manual", help="Memory source (manual, auto-explain, auto-digest)")
+@click.option("--type", "memory_type", default="note", help="Memory type (note, decision, fact, constraint, todo, risk)")
+@click.option("--status", "decision_status", default="active", help="Decision status (active, resolved, superseded, rejected)")
+@click.option("--confidence", type=float, default=0.5, help="Confidence score [0-1]")
+@click.option("--evidence", default="", help="Evidence pointer (path:line or note)")
+@click.option("--session-id", default="", help="Session identifier")
+@click.option("--agent", default="", help="Originating agent name")
+@click.option("--trust-level", default="local_verified", help="Trust level (local_verified, imported_unverified, blocked)")
+@click.option("--expires-in-hours", type=float, default=None, help="Optional expiry in hours from now")
 @click.pass_context
-def remember(ctx: click.Context, text: str, tags: str, source: str) -> None:
+def remember(
+    ctx: click.Context,
+    text: str,
+    tags: str,
+    source: str,
+    memory_type: str,
+    decision_status: str,
+    confidence: float,
+    evidence: str,
+    session_id: str,
+    agent: str,
+    trust_level: str,
+    expires_in_hours: Optional[float],
+) -> None:
     """Store a memory for cross-session recall.
 
     Example: know remember "The auth system uses JWT with Redis session store"
     """
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
+    import time as _time
 
     kb = KnowledgeBase(config)
-    mem_id = kb.remember(text, source=source, tags=tags)
+    expires_at = None
+    if expires_in_hours is not None:
+        expires_at = _time.time() + (expires_in_hours * 3600)
+    mem_id = kb.remember(
+        text,
+        source=source,
+        tags=tags,
+        memory_type=memory_type,
+        decision_status=decision_status,
+        confidence=confidence,
+        evidence=evidence,
+        session_id=session_id,
+        agent=agent,
+        trust_level=trust_level,
+        expires_at=expires_at,
+    )
 
     # Track stats
     try:
@@ -42,10 +79,74 @@ def remember(ctx: click.Context, text: str, tags: str, source: str) -> None:
 
 
 @click.command()
+@click.argument("decision")
+@click.option("--why", default="", help="Why this decision was made")
+@click.option("--tags", "-t", default="decision", help="Comma-separated tags")
+@click.option("--confidence", type=float, default=0.7, help="Confidence score [0-1]")
+@click.option("--evidence", default="", help="Evidence pointer (path:line)")
+@click.option("--session-id", default="", help="Session identifier")
+@click.option("--agent", default="", help="Originating agent name")
+@click.option("--status", "decision_status", default="active", help="Decision status")
+@click.pass_context
+def decide(
+    ctx: click.Context,
+    decision: str,
+    why: str,
+    tags: str,
+    confidence: float,
+    evidence: str,
+    session_id: str,
+    agent: str,
+    decision_status: str,
+) -> None:
+    """Store a structured decision memory."""
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    text = decision.strip()
+    if why.strip():
+        text = f"{text} Why: {why.strip()}"
+
+    kb = KnowledgeBase(config)
+    mem_id = kb.remember(
+        text=text,
+        source="manual",
+        tags=tags,
+        memory_type="decision",
+        decision_status=decision_status,
+        confidence=confidence,
+        evidence=evidence,
+        session_id=session_id,
+        agent=agent,
+        trust_level="local_verified",
+    )
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"id": mem_id, "decision": decision, "status": decision_status}))
+    elif ctx.obj.get("quiet"):
+        click.echo(str(mem_id))
+    else:
+        console.print(f"[green]✓[/green] Decision stored (id={mem_id})")
+
+
+@click.command()
 @click.argument("query")
 @click.option("--top-k", "-k", type=int, default=5, help="Max results")
+@click.option("--type", "memory_type", default=None, help="Filter by memory type")
+@click.option("--status", "decision_status", default=None, help="Filter by decision status")
+@click.option("--include-blocked", is_flag=True, help="Include blocked memories")
+@click.option("--include-expired", is_flag=True, help="Include expired memories")
 @click.pass_context
-def recall(ctx: click.Context, query: str, top_k: int) -> None:
+def recall(
+    ctx: click.Context,
+    query: str,
+    top_k: int,
+    memory_type: Optional[str],
+    decision_status: Optional[str],
+    include_blocked: bool,
+    include_expired: bool,
+) -> None:
     """Recall memories semantically similar to a query.
 
     Example: know recall "how does auth work?"
@@ -57,7 +158,14 @@ def recall(ctx: click.Context, query: str, top_k: int) -> None:
     t0 = _time.monotonic()
 
     kb = KnowledgeBase(config)
-    memories = kb.recall(query, top_k=top_k)
+    memories = kb.recall(
+        query,
+        top_k=top_k,
+        memory_type=memory_type,
+        decision_status=decision_status,
+        include_blocked=include_blocked,
+        include_expired=include_expired,
+    )
     duration_ms = int((_time.monotonic() - t0) * 1000)
 
     # Track stats
@@ -119,14 +227,28 @@ def memories() -> None:
 
 @memories.command(name="list")
 @click.option("--source", "-s", default=None, help="Filter by source")
+@click.option("--type", "memory_type", default=None, help="Filter by memory type")
+@click.option("--status", "decision_status", default=None, help="Filter by decision status")
+@click.option("--session-id", default=None, help="Filter by session id")
 @click.pass_context
-def memories_list(ctx: click.Context, source: Optional[str]) -> None:
+def memories_list(
+    ctx: click.Context,
+    source: Optional[str],
+    memory_type: Optional[str],
+    decision_status: Optional[str],
+    session_id: Optional[str],
+) -> None:
     """List all stored memories."""
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
 
     kb = KnowledgeBase(config)
-    mems = kb.list_all(source=source)
+    mems = kb.list_all(
+        source=source,
+        memory_type=memory_type,
+        decision_status=decision_status,
+        session_id=session_id,
+    )
 
     if ctx.obj.get("json"):
         import json
@@ -140,11 +262,37 @@ def memories_list(ctx: click.Context, source: Optional[str]) -> None:
             sys.exit(2)
         console.print(f"\n[bold]📝 {len(mems)} memories:[/bold]\n")
         for m in mems:
-            console.print(f"  [cyan]#{m.id}[/cyan] [{m.source}] {m.text}")
+            console.print(
+                f"  [cyan]#{m.id}[/cyan] [{m.source}] [{m.memory_type}/{m.decision_status}] {m.text}"
+            )
             if m.tags:
                 console.print(f"       tags: {m.tags}")
             console.print(f"       [dim]{m.created_at}[/dim]")
         console.print()
+
+
+@memories.command(name="resolve")
+@click.argument("memory_id", type=int)
+@click.option("--status", default="resolved", help="resolved|superseded|rejected|active")
+@click.pass_context
+def memories_resolve(ctx: click.Context, memory_id: int, status: str) -> None:
+    """Resolve/supersede/reject a memory."""
+    config = ctx.obj["config"]
+    from know.knowledge_base import KnowledgeBase
+
+    kb = KnowledgeBase(config)
+    ok = kb.resolve(memory_id, status=status)
+
+    if ctx.obj.get("json"):
+        import json
+        click.echo(json.dumps({"id": memory_id, "updated": ok, "status": status}))
+    elif ctx.obj.get("quiet"):
+        click.echo("1" if ok else "0")
+    else:
+        if ok:
+            console.print(f"[green]✓[/green] Memory #{memory_id} -> {status}")
+        else:
+            console.print(f"[red]✗[/red] Memory #{memory_id} not found")
 
 
 @memories.command(name="export")

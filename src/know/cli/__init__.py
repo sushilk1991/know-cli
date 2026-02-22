@@ -116,7 +116,7 @@ def _print_timing():
 # -----------------------------------------------------------------------
 from know.cli.core import init, explain, diagram, api, onboard, digest, update, watch
 from know.cli.search import search, context, graph, reindex
-from know.cli.knowledge import remember, recall, forget, memories
+from know.cli.knowledge import remember, recall, forget, memories, decide
 from know.cli.stats import stats, status
 from know.cli.hooks import hooks
 from know.cli.mcp import mcp
@@ -138,6 +138,7 @@ cli.add_command(context)
 cli.add_command(graph)
 cli.add_command(reindex)
 cli.add_command(remember)
+cli.add_command(decide)
 cli.add_command(recall)
 cli.add_command(forget)
 cli.add_command(memories)

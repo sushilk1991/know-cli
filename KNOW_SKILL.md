@@ -58,6 +58,9 @@ Recall and persist project-specific knowledge:
 ```bash
 know recall "<query>"
 know remember "<insight>"
+know decide "<decision>" --why "<rationale>" --evidence <file:line>
+know recall "<query>" --type decision --status active
+know memories resolve <id> --status resolved
 ```
 
 Examples:
@@ -65,7 +68,20 @@ Examples:
 ```bash
 know remember "Auth middleware validates JWT then hydrates request.user"
 know recall "where is token validation and refresh logic"
+know decide "Use RRF-fused retrieval lanes for memory recall" \
+  --why "more robust than single-lane fallback" \
+  --evidence src/know/knowledge_base.py:190
 ```
+
+## Structured Memory Policy
+
+- Store architectural choices as `decision` memories, not generic notes.
+- Include evidence (`file:line`) for every decision memory whenever possible.
+- Use `session_id` for workflow/deep runs so follow-up recall can bind to the same thread.
+- Keep trust strict:
+  - `local_verified` for direct code observations
+  - `imported_unverified` for imported memory sets
+  - `blocked` for poisoned/unsafe notes (excluded by default recall)
 
 ## Context Commands (Direct Use)
 

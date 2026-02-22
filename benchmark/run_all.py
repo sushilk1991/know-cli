@@ -30,6 +30,12 @@ def main():
     from bench_session_dedup import run_suite as run_suite_2
     run_suite_2()
 
+    # Suite 2b: Memory Quality
+    print()
+    print("─" * 60)
+    from bench_memory_quality import run_suite as run_suite_memory
+    run_suite_memory()
+
     # Suites 3+4: Agent E2E + Quality (requires API key)
     if has_api_key():
         print()

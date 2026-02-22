@@ -87,10 +87,20 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     tags TEXT DEFAULT '[]',
     source_type TEXT DEFAULT 'manual',
+    memory_type TEXT DEFAULT 'note',
+    decision_status TEXT DEFAULT 'active',
+    confidence REAL DEFAULT 0.5,
+    evidence TEXT DEFAULT '',
+    session_id TEXT DEFAULT '',
+    agent TEXT DEFAULT '',
+    trust_level TEXT DEFAULT 'local_verified',
+    supersedes_id TEXT DEFAULT '',
     quality_score REAL DEFAULT 1.0,
     access_count INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     last_accessed_at REAL,
+    resolved_at REAL,
+    expires_at REAL,
     content_hash TEXT NOT NULL,
     embedding BLOB DEFAULT NULL
 );
@@ -316,12 +326,35 @@ class DaemonDB:
 
     def _migrate(self, conn: sqlite3.Connection):
         """Run schema migrations for backwards compatibility."""
-        # Add embedding column if missing (pre-v2 databases)
+        # Add memory metadata columns if missing (additive migrations)
         cursor = conn.execute("PRAGMA table_info(memories)")
         columns = {row[1] for row in cursor.fetchall()}
-        if "embedding" not in columns:
-            conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB DEFAULT NULL")
+        required_columns = {
+            "embedding": "ALTER TABLE memories ADD COLUMN embedding BLOB DEFAULT NULL",
+            "memory_type": "ALTER TABLE memories ADD COLUMN memory_type TEXT DEFAULT 'note'",
+            "decision_status": "ALTER TABLE memories ADD COLUMN decision_status TEXT DEFAULT 'active'",
+            "confidence": "ALTER TABLE memories ADD COLUMN confidence REAL DEFAULT 0.5",
+            "evidence": "ALTER TABLE memories ADD COLUMN evidence TEXT DEFAULT ''",
+            "session_id": "ALTER TABLE memories ADD COLUMN session_id TEXT DEFAULT ''",
+            "agent": "ALTER TABLE memories ADD COLUMN agent TEXT DEFAULT ''",
+            "trust_level": "ALTER TABLE memories ADD COLUMN trust_level TEXT DEFAULT 'local_verified'",
+            "supersedes_id": "ALTER TABLE memories ADD COLUMN supersedes_id TEXT DEFAULT ''",
+            "resolved_at": "ALTER TABLE memories ADD COLUMN resolved_at REAL",
+            "expires_at": "ALTER TABLE memories ADD COLUMN expires_at REAL",
+        }
+        migrated = False
+        for col, ddl in required_columns.items():
+            if col not in columns:
+                conn.execute(ddl)
+                migrated = True
+        if migrated:
             conn.commit()
+
+        # Ensure secondary indexes for memory metadata exist on pre-upgrade DBs.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(decision_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_trust ON memories(trust_level)")
+        conn.commit()
 
         # Rebuild FTS5 index if it was just migrated (has 0 rows but chunks exist)
         try:
@@ -359,6 +392,13 @@ class DaemonDB:
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
                     (5, time.time()),
+                )
+                conn.commit()
+            if current < 6:
+                # v6: structured memory metadata columns
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (6, time.time()),
                 )
                 conn.commit()
         except sqlite3.OperationalError:
@@ -746,9 +786,24 @@ class DaemonDB:
     # ------------------------------------------------------------------
     # Memories
     # ------------------------------------------------------------------
-    def store_memory(self, memory_id: str, content: str,
-                     tags: str = "[]", source_type: str = "manual",
-                     embedding: Optional[bytes] = None) -> bool:
+    def store_memory(
+        self,
+        memory_id: str,
+        content: str,
+        tags: str = "[]",
+        source_type: str = "manual",
+        embedding: Optional[bytes] = None,
+        memory_type: str = "note",
+        decision_status: str = "active",
+        confidence: float = 0.5,
+        evidence: str = "",
+        session_id: str = "",
+        agent: str = "",
+        trust_level: str = "local_verified",
+        supersedes_id: str = "",
+        resolved_at: Optional[float] = None,
+        expires_at: Optional[float] = None,
+    ) -> bool:
         """Store a memory. Returns False if duplicate content exists."""
         content_hash = xxhash.xxh64(content.encode()).hexdigest()
 
@@ -761,10 +816,18 @@ class DaemonDB:
             return False
 
         conn.execute(
-            """INSERT INTO memories (id, content, tags, source_type,
-                                     created_at, content_hash, embedding)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (memory_id, content, tags, source_type, time.time(), content_hash, embedding),
+            """INSERT INTO memories (
+                    id, content, tags, source_type, memory_type, decision_status,
+                    confidence, evidence, session_id, agent, trust_level,
+                    supersedes_id, created_at, resolved_at, expires_at,
+                    content_hash, embedding
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                memory_id, content, tags, source_type, memory_type, decision_status,
+                confidence, evidence, session_id, agent, trust_level,
+                supersedes_id, time.time(), resolved_at, expires_at,
+                content_hash, embedding,
+            ),
         )
         self._commit(conn)
         return True
@@ -784,30 +847,110 @@ class DaemonDB:
         self._commit(conn)
         return cursor.rowcount > 0
 
-    def list_memories(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List all memories, optionally filtered by source_type."""
+    def list_memories(
+        self,
+        source: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        decision_status: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List memories with optional structured filters."""
         conn = self._get_conn()
+        where: List[str] = []
+        args: List[Any] = []
         if source:
-            rows = conn.execute(
-                "SELECT * FROM memories WHERE source_type = ? ORDER BY created_at DESC",
-                (source,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM memories ORDER BY created_at DESC"
-            ).fetchall()
+            where.append("source_type = ?")
+            args.append(source)
+        if memory_type:
+            where.append("memory_type = ?")
+            args.append(memory_type)
+        if decision_status:
+            where.append("decision_status = ?")
+            args.append(decision_status)
+        if session_id:
+            where.append("session_id = ?")
+            args.append(session_id)
+
+        sql = "SELECT * FROM memories"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC"
+        rows = conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
 
-    def count_memories(self, source: Optional[str] = None) -> int:
-        """Count memories, optionally filtered by source_type."""
+    def count_memories(
+        self,
+        source: Optional[str] = None,
+        memory_type: Optional[str] = None,
+    ) -> int:
+        """Count memories with optional filters."""
         conn = self._get_conn()
+        where: List[str] = []
+        args: List[Any] = []
         if source:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE source_type = ?", (source,)
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) FROM memories").fetchone()
+            where.append("source_type = ?")
+            args.append(source)
+        if memory_type:
+            where.append("memory_type = ?")
+            args.append(memory_type)
+
+        sql = "SELECT COUNT(*) FROM memories"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        row = conn.execute(sql, args).fetchone()
         return row[0] if row else 0
+
+    def touch_memories(self, memory_ids: List[str]) -> None:
+        """Increment access_count and update last_accessed_at for recalled memories."""
+        if not memory_ids:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        conn.executemany(
+            "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
+            [(now, mid) for mid in memory_ids],
+        )
+        self._commit(conn)
+
+    def update_memory(
+        self,
+        memory_id: str,
+        *,
+        decision_status: Optional[str] = None,
+        resolved_at: Optional[float] = None,
+        trust_level: Optional[str] = None,
+        quality_score: Optional[float] = None,
+        expires_at: Optional[float] = None,
+    ) -> bool:
+        """Update mutable memory fields. Returns True if a row changed."""
+        sets: List[str] = []
+        args: List[Any] = []
+        if decision_status is not None:
+            sets.append("decision_status = ?")
+            args.append(decision_status)
+        if resolved_at is not None:
+            sets.append("resolved_at = ?")
+            args.append(resolved_at)
+        if trust_level is not None:
+            sets.append("trust_level = ?")
+            args.append(trust_level)
+        if quality_score is not None:
+            sets.append("quality_score = ?")
+            args.append(quality_score)
+        if expires_at is not None:
+            sets.append("expires_at = ?")
+            args.append(expires_at)
+        if not sets:
+            return False
+
+        conn = self._get_conn()
+        args.append(memory_id)
+        cursor = conn.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?",
+            args,
+        )
+        self._commit(conn)
+        return cursor.rowcount > 0
 
     def recall_memories_semantic(self, query_embedding: bytes, limit: int = 10) -> List[Dict[str, Any]]:
         """Search memories by cosine similarity against stored embeddings."""

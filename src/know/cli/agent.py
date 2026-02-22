@@ -598,6 +598,21 @@ def workflow(
         finally:
             db.close()
 
+    # Auto-capture key workflow decision for cross-session recall.
+    try:
+        from know.memory_capture import capture_workflow_decision
+
+        capture_workflow_decision(
+            config,
+            query,
+            result,
+            session_id=resolved_session_id,
+            source="auto-workflow",
+            agent="know-cli",
+        )
+    except Exception as e:
+        logger.debug(f"Workflow decision capture failed: {e}")
+
     is_json = ctx.obj.get("json")
     if is_json:
         click.echo(json.dumps(result))

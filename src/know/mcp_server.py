@@ -157,7 +157,17 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @server.tool()
-    async def remember(text: str, tags: str = "") -> str:
+    async def remember(
+        text: str,
+        tags: str = "",
+        memory_type: str = "note",
+        decision_status: str = "active",
+        confidence: float = 0.5,
+        evidence: str = "",
+        session_id: str = "",
+        agent: str = "mcp",
+        trust_level: str = "local_verified",
+    ) -> str:
         """Store a piece of knowledge about the codebase for future sessions.
 
         Use this when you discover something important about the codebase
@@ -173,7 +183,18 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         from know.knowledge_base import KnowledgeBase
 
         kb = KnowledgeBase(config)
-        mem_id = kb.remember(text, source="mcp", tags=tags)
+        mem_id = kb.remember(
+            text,
+            source="mcp",
+            tags=tags,
+            memory_type=memory_type,
+            decision_status=decision_status,
+            confidence=confidence,
+            evidence=evidence,
+            session_id=session_id,
+            agent=agent,
+            trust_level=trust_level,
+        )
 
         # Track stats
         try:
@@ -182,10 +203,23 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         except Exception:
             pass
 
-        return json.dumps({"id": mem_id, "stored": True, "text": text})
+        return json.dumps({
+            "id": mem_id,
+            "stored": True,
+            "text": text,
+            "memory_type": memory_type,
+            "decision_status": decision_status,
+        })
 
     @server.tool()
-    async def recall(query: str) -> str:
+    async def recall(
+        query: str,
+        top_k: int = 5,
+        memory_type: str = "",
+        decision_status: str = "",
+        include_blocked: bool = False,
+        include_expired: bool = False,
+    ) -> str:
         """Recall stored knowledge about the codebase.
 
         Searches memories semantically — you don't need exact wording.
@@ -198,7 +232,14 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         from know.knowledge_base import KnowledgeBase
 
         kb = KnowledgeBase(config)
-        memories = kb.recall(query, top_k=5)
+        memories = kb.recall(
+            query,
+            top_k=top_k,
+            memory_type=memory_type or None,
+            decision_status=decision_status or None,
+            include_blocked=include_blocked,
+            include_expired=include_expired,
+        )
 
         results = [m.to_dict() for m in memories]
 
@@ -210,6 +251,30 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
             pass
 
         return json.dumps({"query": query, "results": results}, indent=2)
+
+    @server.tool()
+    async def resolve_memory(memory_id: int, status: str = "resolved") -> str:
+        """Resolve/supersede/reject a stored memory."""
+        config = _get_config()
+        from know.knowledge_base import KnowledgeBase
+
+        kb = KnowledgeBase(config)
+        updated = kb.resolve(memory_id, status=status)
+        return json.dumps({"id": memory_id, "updated": updated, "status": status})
+
+    @server.tool()
+    async def export_memories() -> str:
+        """Export all memories as canonical JSON for cross-agent sync."""
+        config = _get_config()
+        from know.knowledge_base import KnowledgeBase
+
+        kb = KnowledgeBase(config)
+        payload = {
+            "schema_version": 1,
+            "project_root": str(config.root),
+            "memories": [m.to_dict() for m in kb.list_all()],
+        }
+        return json.dumps(payload, indent=2)
 
     @server.tool()
     async def explain_component(component: str, detailed: bool = False) -> str:
@@ -394,11 +459,41 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         ]
 
         for m in memories:
-            lines.append(f"- **#{m.id}** [{m.source}] {m.text}")
+            lines.append(
+                f"- **#{m.id}** [{m.source}] [{m.memory_type}/{m.decision_status}/{m.trust_level}] {m.text}"
+            )
             if m.tags:
                 lines.append(f"  Tags: {m.tags}")
 
         return "\n".join(lines)
+
+    @server.resource("memory://schema")
+    async def get_memory_schema() -> str:
+        """Canonical memory object schema for cross-agent interoperability."""
+        schema = {
+            "schema_version": 1,
+            "type": "object",
+            "required": ["id", "text", "source", "memory_type", "decision_status", "confidence", "trust_level"],
+            "properties": {
+                "id": {"type": "integer"},
+                "text": {"type": "string"},
+                "source": {"type": "string"},
+                "memory_type": {"type": "string"},
+                "decision_status": {"type": "string"},
+                "confidence": {"type": "number"},
+                "evidence": {"type": "string"},
+                "session_id": {"type": "string"},
+                "agent": {"type": "string"},
+                "trust_level": {"type": "string"},
+                "supersedes_id": {"type": "string"},
+                "tags": {"type": "string"},
+                "created_at": {"type": "string"},
+                "resolved_at": {"type": "string"},
+                "expires_at": {"type": "string"},
+                "project_root": {"type": "string"},
+            },
+        }
+        return json.dumps(schema, indent=2)
 
     return server
 
