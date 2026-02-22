@@ -1,84 +1,86 @@
-# know-cli Integration
+# know-cli Skill (Agent-Optimized)
 
-This project uses [know-cli](https://github.com/vic/know-cli) for intelligent context management. It gives you exactly the code you need — no more, no less.
+Use [know-cli](https://github.com/sushilk1991/know-cli) as the default code-retrieval layer for agents.
+Goal: minimize token waste, pick the right edit target quickly, and keep context quality high.
 
-## Before starting a task
+## Non-Negotiable Defaults
 
-Get smart, token-budgeted context:
+- Prefer a single-call retrieval first: `know workflow`.
+- Prefer machine output for agents: `--json --quiet`.
+- Use small budgets first, then escalate only if needed.
+- Use session dedup across follow-ups (`--session auto` or persisted session id).
+- Use fallback ladder when confidence is low.
 
-```bash
-know context "<task description>" --budget 8000 --quiet
-```
+## Primary Flow (Default)
 
-This returns the most relevant code, imports, tests, and project knowledge — all packed within your token budget.
-
-**Examples:**
-```bash
-know context "fix the authentication middleware" --budget 8000 --quiet
-know context "add pagination to the users API" --budget 4000 --json
-know context "refactor the database connection pool" --budget 6000 --quiet
-```
-
-## When you learn something about the codebase
-
-Store it as a memory so future sessions benefit:
+Run this first for most coding tasks:
 
 ```bash
-know remember "<insight>"
+know --json workflow "<task or bug description>" \
+  --map-limit 20 \
+  --context-budget 4000 \
+  --deep-budget 3000 \
+  --session auto
 ```
 
-**Examples:**
-```bash
-know remember "The auth system uses JWT tokens stored in Redis"
-know remember "Never modify migration files directly — use the migration CLI"
-know remember "The config system falls back to env vars when YAML is missing"
-```
+This gives map + context + deep in one call with fewer tool round trips.
 
-## To search for specific code
+## Fallback Ladder (When Workflow Is Not Enough)
 
-Semantic search — understands meaning, not just keywords:
+Use this exact fallback order:
+
+1. `know map "<query>" --json --limit 30`
+2. `know next-file "<query>" --json`
+3. `know context "<query>" --budget 4000 --session auto --json --quiet`
+4. `know deep "<symbol or file:symbol>" --budget 3000 --json`
+5. `know related <file_path> --json`
+
+If still ambiguous, increase budget in small steps: `4000 -> 6000 -> 8000`.
+
+## Edit-Targeting Rules
+
+- Start edits only after `workflow` or `context` returns concrete file paths and symbols.
+- Prefer deep targets using `file:symbol` when names collide.
+- If `deep` is ambiguous, retry with the candidate file hint from map/context.
+- For dependency-sensitive changes, run `know graph <file_path>` before editing.
+
+## Search and Recall
+
+Use semantic search only when map/context misses:
 
 ```bash
 know search "<query>" --json
+know search "<query>" --chunk --json
 ```
 
-**Examples:**
-```bash
-know search "error handling" --json
-know search "database connection" --chunk --json
-```
-
-## To understand dependencies
-
-See what imports what:
-
-```bash
-know graph <file_path>
-```
-
-**Examples:**
-```bash
-know graph src/auth/middleware.py
-know graph src/api/routes.py
-```
-
-## To recall stored knowledge
+Recall and persist project-specific knowledge:
 
 ```bash
 know recall "<query>"
+know remember "<insight>"
 ```
 
-**Examples:**
+Examples:
+
 ```bash
-know recall "how does auth work?"
-know recall "database patterns"
+know remember "Auth middleware validates JWT then hydrates request.user"
+know recall "where is token validation and refresh logic"
 ```
 
-## Tips
+## Context Commands (Direct Use)
 
-- Use `--budget` to control context size (default 8000 tokens)
-- Use `--json` for machine-readable output
-- Use `--quiet` to suppress decorative output
-- Use `--time` to see execution timing
-- Memories are automatically included in `know context` results
-- Run `know reindex` after major refactors to update the search index
+```bash
+know context "<task>" --budget 4000 --session auto --json --quiet
+know context "<task>" --budget 8000 --session auto --json --quiet
+know map "<feature area>" --type function --json
+know deep "service.py:process_payment" --budget 3000 --json
+know graph src/auth/middleware.py
+```
+
+## Token Discipline
+
+- Use `map`/`next-file` before broad context when task is narrow.
+- Keep `context-budget` near 4000 for first pass.
+- Reuse session ids to enforce dedup and avoid re-sending the same chunks.
+- Only escalate to wider context after specific gaps are identified.
+- Run `know reindex` only after major refactors or when stale-index symptoms appear.
