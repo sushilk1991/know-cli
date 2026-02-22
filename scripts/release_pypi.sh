@@ -72,7 +72,11 @@ export TWINE_PASSWORD="${TWINE_PASSWORD:-${PYPI_API_TOKEN:-}}"
 
 "$TOOL_PY" -m twine upload --non-interactive --skip-existing dist/*
 
-python3 - <<'PY'
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-12}"
+VERIFY_DELAY_SECONDS="${VERIFY_DELAY_SECONDS:-5}"
+
+for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
+  if python3 - <<'PY'
 import json, pathlib, tomllib, urllib.request, sys
 
 name = "know-cli"
@@ -82,8 +86,17 @@ url = f"https://pypi.org/pypi/{name}/json"
 with urllib.request.urlopen(url, timeout=20) as r:
     payload = json.load(r)
 exists = version in payload.get("releases", {}) and len(payload["releases"][version]) > 0
-if not exists:
-    print(f"Publish verification failed: {name} {version} not visible on PyPI yet.")
-    sys.exit(1)
-print(f"Published and verified: {name}=={version}")
+sys.exit(0 if exists else 1)
 PY
+  then
+    echo "Published and verified: know-cli==$VERSION"
+    exit 0
+  fi
+
+  if [[ "$attempt" -lt "$VERIFY_ATTEMPTS" ]]; then
+    sleep "$VERIFY_DELAY_SECONDS"
+  fi
+done
+
+echo "Publish verification failed after ${VERIFY_ATTEMPTS} attempts." >&2
+exit 1
