@@ -55,16 +55,22 @@ if [[ -z "${PYPI_API_TOKEN:-}" && -z "${TWINE_PASSWORD:-}" ]]; then
   exit 1
 fi
 
-python3 -m pip install --upgrade build twine >/dev/null
+TOOL_PY="python3"
+if ! python3 -m build --version >/dev/null 2>&1 || ! python3 -m twine --version >/dev/null 2>&1; then
+  TOOL_VENV="${TOOL_VENV:-.venv-release}"
+  python3 -m venv "$TOOL_VENV"
+  "$TOOL_VENV/bin/python" -m pip install --upgrade pip build twine >/dev/null
+  TOOL_PY="$TOOL_VENV/bin/python"
+fi
 
 rm -rf dist
-python3 -m build
-python3 -m twine check dist/*
+"$TOOL_PY" -m build
+"$TOOL_PY" -m twine check dist/*
 
 export TWINE_USERNAME="__token__"
 export TWINE_PASSWORD="${TWINE_PASSWORD:-${PYPI_API_TOKEN:-}}"
 
-python3 -m twine upload --non-interactive --skip-existing dist/*
+"$TOOL_PY" -m twine upload --non-interactive --skip-existing dist/*
 
 python3 - <<'PY'
 import json, pathlib, tomllib, urllib.request, sys
