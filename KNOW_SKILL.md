@@ -11,6 +11,27 @@ Goal: minimize token waste, pick the right edit target quickly, and keep context
 - Use session dedup across follow-ups (`--session auto` or persisted session id).
 - Use fallback ladder when confidence is low.
 
+## Simplified Command Surface (Backward-Compatible)
+
+Use the tiny human-facing surface:
+
+- `know ask "<query>"` for one-command retrieval (workflow wrapper)
+- `know docs` for one-shot docs refresh
+- `know recall "<query>"` to recover session/project memory
+- `know decide "<decision>" --why "<rationale>"` to store key decisions
+- `know done <id>` as shortcut for `know memories resolve <id> --status resolved`
+- `know commands --all` to discover advanced/legacy commands when needed
+
+Legacy top-level commands remain fully supported for scripts and older agents.
+
+## Background Automation Defaults
+
+- Daemon incremental refresh is enabled by default.
+- Active workflow session is persisted in `.know/current_session`.
+- `know remember` / `know decide` auto-fill `session_id` from current session.
+- Use `know doctor --repair --reindex` when embedding cache/model issues appear.
+- For very large repos, daemon auto-refresh self-suspends by default; force-enable with `KNOW_DAEMON_AUTO_REFRESH=1`.
+
 ## Primary Flow (Default)
 
 Run this first for most coding tasks:

@@ -2,70 +2,63 @@
 
 ```mermaid
 graph TB
-    logger["logger\n(2f, 0c)"]
-    token_counter["token_counter\n(5f, 0c)"]
-    embeddings["embeddings\n(4f, 0c)"]
-    semantic_search["semantic_search\n(0f, 2c)"]
-    ai["ai\n(0f, 4c)"]
-    file_categories["file_categories\n(7f, 0c)"]
     import_graph["import_graph\n(6f, 1c)"]
-    watcher["watcher\n(0f, 2c)"]
-    stats["stats\n(0f, 1c)"]
-    mcp_server["mcp_server\n(6f, 0c)"]
-    ranking["ranking\n(2f, 0c)"]
-    daemon_db["daemon_db\n(2f, 2c)"]
+    scanner["scanner\n(5f, 1c)"]
+    file_categories["file_categories\n(7f, 0c)"]
+    config["config\n(1f, 6c)"]
+    knowledge_base["knowledge_base\n(0f, 2c)"]
+    models["models\n(0f, 4c)"]
     query["query\n(10f, 1c)"]
-    exceptions["exceptions\n(0f, 8c)"]
-    diff["diff\n(0f, 1c)"]
-    generator["generator\n(0f, 1c)"]
-    parsers["parsers\n(1f, 14c)"]
-    quality["quality\n(0f, 2c)"]
-    daemon["daemon\n(19f, 2c)"]
+    index["index\n(1f, 1c)"]
+    token_counter["token_counter\n(5f, 0c)"]
+    ai["ai\n(0f, 4c)"]
+    memory_capture["memory_capture\n(1f, 0c)"]
+    __init__["__init__"]
     git_hooks["git_hooks\n(2f, 1c)"]
+    parsers["parsers\n(1f, 14c)"]
+    daemon_db["daemon_db\n(2f, 2c)"]
+    logger["logger\n(2f, 0c)"]
+    generator["generator\n(0f, 1c)"]
+    embeddings["embeddings\n(8f, 0c)"]
+    stats["stats\n(0f, 1c)"]
+    context_engine["context_engine\n(9f, 2c)"]
 
-    embeddings --> logger
-    semantic_search --> embeddings
-    semantic_search --> context_engine
-    semantic_search --> parsers
-    ai --> config
     import_graph --> logger
     import_graph --> config
     import_graph --> daemon_db
-    watcher --> config
-    watcher --> scanner
-    watcher --> generator
-    watcher --> parsers
-    stats --> logger
-    stats --> config
-    mcp_server --> logger
-    mcp_server --> config
-    mcp_server --> context_engine
-    mcp_server --> semantic_search
-    mcp_server --> knowledge_base
-    mcp_server --> scanner
-    mcp_server --> ai
-    mcp_server --> import_graph
-    mcp_server --> stats
+    scanner --> exceptions
+    scanner --> logger
+    scanner --> parsers
+    scanner --> models
+    scanner --> config
+    scanner --> index
+    knowledge_base --> logger
+    knowledge_base --> config
+    knowledge_base --> daemon_db
+    knowledge_base --> ranking
+    knowledge_base --> token_counter
+    knowledge_base --> embeddings
+    index --> exceptions
+    index --> logger
+    index --> config
+    index --> scanner
+    ai --> config
+    memory_capture --> logger
+    memory_capture --> knowledge_base
+    git_hooks --> config
+    parsers --> exceptions
+    parsers --> models
+    parsers --> logger
     daemon_db --> logger
     daemon_db --> token_counter
     daemon_db --> query
     daemon_db --> ranking
-    diff --> config
-    diff --> scanner
     generator --> config
     generator --> scanner
     generator --> ai
-    parsers --> exceptions
-    parsers --> models
-    parsers --> logger
-    daemon --> config
-    daemon --> daemon_db
-    daemon --> logger
-    daemon --> parsers
-    daemon --> scanner
-    daemon --> context_engine
-    daemon --> import_graph
-    git_hooks --> config
+    embeddings --> logger
+    stats --> logger
+    stats --> config
     context_engine --> token_counter
     context_engine --> logger
     context_engine --> embeddings
@@ -77,38 +70,35 @@ graph TB
     context_engine --> daemon
     context_engine --> query
     context_engine --> import_graph
-    scanner --> exceptions
-    scanner --> logger
-    scanner --> parsers
-    scanner --> models
-    scanner --> config
-    scanner --> index
-    knowledge_base --> logger
-    knowledge_base --> config
-    knowledge_base --> daemon_db
-    knowledge_base --> token_counter
-    knowledge_base --> embeddings
-    index --> exceptions
-    index --> logger
-    index --> config
-    index --> scanner
-    agent --> daemon_db
-    agent --> token_counter
-    agent --> daemon
-    agent --> import_graph
-    agent --> scanner
-    agent --> context_engine
-    stats --> scanner
-    stats --> knowledge_base
-    knowledge --> knowledge_base
-    knowledge --> stats
-    search --> scanner
-    search --> agent
-    search --> context_engine
-    search --> import_graph
-    search --> semantic_search
-    search --> stats
-    search --> knowledge_base
+    diff --> config
+    diff --> scanner
+    watcher --> config
+    watcher --> scanner
+    watcher --> generator
+    watcher --> parsers
+    daemon --> config
+    daemon --> daemon_db
+    daemon --> logger
+    daemon --> parsers
+    daemon --> scanner
+    daemon --> context_engine
+    daemon --> token_counter
+    daemon --> knowledge_base
+    daemon --> memory_capture
+    daemon --> import_graph
+    mcp_server --> logger
+    mcp_server --> config
+    mcp_server --> context_engine
+    mcp_server --> semantic_search
+    mcp_server --> knowledge_base
+    mcp_server --> scanner
+    mcp_server --> ai
+    mcp_server --> import_graph
+    mcp_server --> stats
+    semantic_search --> embeddings
+    semantic_search --> context_engine
+    semantic_search --> parsers
+    hooks --> git_hooks
     core --> config
     core --> scanner
     core --> generator
@@ -116,6 +106,25 @@ graph TB
     core --> watcher
     core --> knowledge_base
     mcp --> mcp_server
+    stats --> scanner
+    stats --> knowledge_base
+    agent --> daemon_db
+    agent --> token_counter
+    agent --> daemon
+    agent --> import_graph
+    agent --> scanner
+    agent --> context_engine
+    agent --> memory_capture
+    agent --> knowledge_base
+    search --> scanner
+    search --> agent
+    search --> context_engine
+    search --> import_graph
+    search --> semantic_search
+    search --> stats
+    search --> knowledge_base
+    knowledge --> knowledge_base
+    knowledge --> stats
     __init__ --> config
     __init__ --> logger
     __init__ --> exceptions
@@ -127,7 +136,8 @@ graph TB
     __init__ --> mcp
     __init__ --> agent
     __init__ --> diff
-    hooks --> git_hooks
+    __init__ --> generator
+    __init__ --> scanner
 ```
 
 *Generated by know*

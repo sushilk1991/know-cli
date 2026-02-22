@@ -408,7 +408,10 @@ def generate_context(ctx: click.Context, budget: int) -> None:
         lines.append("## Remembered Context")
         lines.append("")
         for m in memories:
-            lines.append(f"- {m['content'][:200]}")
+            text = (m.get("text") or m.get("content") or "").strip()
+            if not text:
+                continue
+            lines.append(f"- {text[:200]}")
             if count_tokens("\n".join(lines)) > budget * 0.95:
                 break
 
@@ -508,6 +511,12 @@ def workflow(
     resolved_session_id = session_id
     if session_id in ("auto", "new"):
         resolved_session_id = uuid.uuid4().hex[:8]
+    if resolved_session_id:
+        try:
+            from know.runtime_context import set_active_session_id
+            set_active_session_id(config, resolved_session_id)
+        except Exception as e:
+            logger.debug(f"Failed to persist active session id: {e}")
 
     result = None
     client = _get_daemon_client(config)

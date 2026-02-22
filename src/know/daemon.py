@@ -36,6 +36,45 @@ MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_CHUNK_BODY_CHARS = 5000
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _collect_project_file_mtimes(config: Config) -> Dict[str, int]:
+    """Collect mtime_ns for source files included by scanner filters."""
+    from know.scanner import CodebaseScanner
+
+    scanner = CodebaseScanner(config)
+    mtimes: Dict[str, int] = {}
+    for path, _lang in scanner._discover_files():
+        try:
+            rel = str(path.relative_to(config.root)).replace("\\", "/")
+            mtimes[rel] = path.stat().st_mtime_ns
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+    return mtimes
+
+
+def _diff_file_mtimes(previous: Dict[str, int], current: Dict[str, int]) -> Tuple[List[str], List[str]]:
+    """Return (changed_or_new_files, removed_files)."""
+    changed = sorted([p for p, m in current.items() if previous.get(p) != m])
+    removed = sorted([p for p in previous if p not in current])
+    return changed, removed
+
+
 def _extract_body(
     lines: list | None,
     content: str,
@@ -400,6 +439,13 @@ class KnowDaemon:
         self._started_at = time.time()
         self._last_activity = time.time()
         self._server: Optional[asyncio.AbstractServer] = None
+        self._index_task: Optional[asyncio.Task] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._file_mtime_snapshot: Dict[str, int] = {}
+        self._auto_refresh_explicit = "KNOW_DAEMON_AUTO_REFRESH" in os.environ
+        self._auto_refresh_enabled = _env_bool("KNOW_DAEMON_AUTO_REFRESH", True)
+        self._auto_refresh_interval = _env_int("KNOW_DAEMON_REFRESH_INTERVAL", 60, 15)
+        self._auto_refresh_max_files = _env_int("KNOW_DAEMON_AUTO_REFRESH_MAX_FILES", 2500, 100)
 
     async def serve(self):
         """Main event loop: listen on socket, handle JSON-RPC requests."""
@@ -421,6 +467,8 @@ class KnowDaemon:
 
         # Index in background — queries use stale/cached data until done
         self._index_task = asyncio.create_task(self._full_index())
+        if self._auto_refresh_enabled:
+            self._refresh_task = asyncio.create_task(self._auto_refresh_loop())
 
         # Set up idle timeout check
         try:
@@ -434,11 +482,83 @@ class KnowDaemon:
 
     def _shutdown(self):
         """Clean shutdown."""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        if self._index_task and not self._index_task.done():
+            self._index_task.cancel()
         if self._server:
             self._server.close()
         socket_path(self.root).unlink(missing_ok=True)
         pid_path(self.root).unlink(missing_ok=True)
         self.db.close()
+
+    async def _auto_refresh_loop(self):
+        """Background loop: keep index fresh for changed/deleted files."""
+        try:
+            if self._index_task:
+                try:
+                    await self._index_task
+                except Exception as e:
+                    logger.debug(f"Initial index task failed before auto-refresh: {e}")
+
+            self._file_mtime_snapshot = await asyncio.to_thread(
+                _collect_project_file_mtimes, self.config,
+            )
+            try:
+                files = int(self.db.get_stats().get("files", 0))
+            except Exception:
+                files = 0
+            if (
+                not self._auto_refresh_explicit
+                and files > self._auto_refresh_max_files
+            ):
+                logger.info(
+                    "Auto-refresh suspended for large repo (%s files > %s). "
+                    "Set KNOW_DAEMON_AUTO_REFRESH=1 to force-enable.",
+                    files, self._auto_refresh_max_files,
+                )
+                return
+
+            while True:
+                await asyncio.sleep(self._auto_refresh_interval)
+                summary = await asyncio.to_thread(self._incremental_refresh_once_sync)
+                if summary.get("refreshed", 0) or summary.get("removed", 0):
+                    logger.info(
+                        "Auto-refresh: refreshed=%s removed=%s skipped=%s",
+                        summary.get("refreshed", 0),
+                        summary.get("removed", 0),
+                        summary.get("skipped", 0),
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(f"Auto-refresh loop stopped: {e}")
+
+    def _incremental_refresh_once_sync(self) -> Dict[str, Any]:
+        """Perform one incremental refresh pass."""
+        current = _collect_project_file_mtimes(self.config)
+        changed, removed = _diff_file_mtimes(self._file_mtime_snapshot, current)
+        self._file_mtime_snapshot = current
+
+        if not changed and not removed:
+            return {"refreshed": 0, "removed": 0, "skipped": 0, "results": []}
+
+        paths = changed + removed
+        summary = refresh_files_if_stale(
+            self.root, self.config, self.db, paths, remove_missing=True,
+        )
+
+        # Recomputing full graph importance on every tiny edit is expensive.
+        # Refresh it only for larger batches or file removals.
+        refresh_count = int(summary.get("refreshed", 0) or 0)
+        removed_count = int(summary.get("removed", 0) or 0)
+        if removed_count > 0 or refresh_count >= 10:
+            try:
+                self.db.compute_importance()
+            except Exception as e:
+                logger.debug(f"Importance recompute after auto-refresh failed: {e}")
+
+        return summary
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
@@ -582,6 +702,18 @@ class KnowDaemon:
         chunk_types = params.get("chunk_types")
         session_id = params.get("session_id")
         explicit_deep_name = params.get("deep_name")
+        if not session_id:
+            try:
+                session_id = self.db.create_session()
+            except Exception:
+                session_id = None
+
+        if session_id:
+            try:
+                from know.runtime_context import set_active_session_id
+                set_active_session_id(self.config, session_id)
+            except Exception as e:
+                logger.debug(f"Failed to persist daemon session id: {e}")
 
         map_results = self.db.search_signatures(query, map_limit)
 
@@ -709,6 +841,16 @@ class KnowDaemon:
         else:
             tags = str(tags_val or "")
         source = params.get("source", "manual")
+        session_id = params.get("session_id", "")
+        agent = params.get("agent", "")
+        try:
+            from know.runtime_context import get_active_session_id, infer_agent_name
+            if not session_id:
+                session_id = get_active_session_id(self.config) or ""
+            if not agent:
+                agent = infer_agent_name("daemon")
+        except Exception:
+            pass
 
         try:
             from know.knowledge_base import KnowledgeBase
@@ -722,8 +864,8 @@ class KnowDaemon:
                 decision_status=params.get("decision_status", "active"),
                 confidence=float(params.get("confidence", 0.5) or 0.5),
                 evidence=params.get("evidence", ""),
-                session_id=params.get("session_id", ""),
-                agent=params.get("agent", "daemon"),
+                session_id=session_id,
+                agent=agent or "daemon",
                 trust_level=params.get("trust_level", "local_verified"),
                 supersedes_id=params.get("supersedes_id", ""),
                 expires_at=params.get("expires_at"),

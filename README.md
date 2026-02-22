@@ -112,6 +112,23 @@ know --json context "payment processing" --budget 4000 --session a1b2c3d4
 
 ## Commands Reference
 
+### Simplified Layout (Backward-Compatible)
+
+Use this minimal command set for day-to-day flow:
+
+```bash
+know ask "billing subscription limits"
+know recall "what did we decide about auth?"
+know decide "Use daemon workflow" --why "fewer tool calls"
+know done 12
+know docs
+know status
+```
+
+Legacy top-level commands are unchanged and still supported:
+`know workflow`, `know digest`, `know diagram`, `know memories ...`, etc.
+Use `know commands --all` to list them.
+
 ### Workflow — Single Daemon Call
 
 ```bash
@@ -126,6 +143,21 @@ Runs `map -> context -> deep` in a single daemon request to cut tool-call overhe
 - Recommended default: run docs updates locally via `know watch` or git hooks (`know hooks install`).
 - GitHub workflow examples in this repo are `workflow_dispatch` and **non-mutating by default**.
 - If a downstream repo enables CI docs updates, keep CI read-only (review/comment artifacts) unless explicit auto-commit is required.
+
+### Background Auto-Fill (No Extra Flags)
+
+- Daemon now performs incremental background refresh of changed/deleted files (no manual full reindex loop needed for normal edits).
+- Workflow sessions are persisted to `.know/current_session`.
+- `know remember` and `know decide` auto-fill `session_id` from the active session when not provided.
+- Reliability fallback: `know doctor --repair --reindex` repairs embedding cache issues and rebuilds chunk index.
+
+Daemon auto-refresh controls:
+
+```bash
+KNOW_DAEMON_AUTO_REFRESH=1        # default on
+KNOW_DAEMON_REFRESH_INTERVAL=60   # seconds, min 15
+KNOW_DAEMON_AUTO_REFRESH_MAX_FILES=2500  # auto-suspend over this size unless explicitly forced
+```
 
 ### Map — Orient Before Reading
 
@@ -170,11 +202,16 @@ know memories export > memories.json
 
 Memories are automatically included in `know context` results.
 Structured memory fields now include `memory_type`, `decision_status`, `confidence`, `evidence`, `session_id`, `agent`, and `trust_level`.
+If `session_id` is omitted, `remember/decide` auto-bind to `.know/current_session` when available.
 
 ### All Commands
 
 | Command | Description |
 |---------|-------------|
+| `know ask "query"` | Simple one-command retrieval (workflow wrapper) |
+| `know docs` | One-shot docs refresh (system + digest + api + architecture) |
+| `know done <id>` | Shortcut for `know memories resolve <id> --status resolved` |
+| `know commands --all` | Show advanced and legacy commands |
 | `know workflow "query"` | Single-call daemon workflow (map + context + deep) |
 | `know map "query"` | Lightweight signature search |
 | `know context "query"` | Smart, budgeted code context |

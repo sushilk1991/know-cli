@@ -43,8 +43,13 @@ def remember(
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
     import time as _time
+    from know.runtime_context import get_active_session_id, infer_agent_name
 
     kb = KnowledgeBase(config)
+    if not session_id:
+        session_id = get_active_session_id(config) or ""
+    if not agent:
+        agent = infer_agent_name("know-cli")
     expires_at = None
     if expires_in_hours is not None:
         expires_at = _time.time() + (expires_in_hours * 3600)
@@ -102,10 +107,16 @@ def decide(
     """Store a structured decision memory."""
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
+    from know.runtime_context import get_active_session_id, infer_agent_name
 
     text = decision.strip()
     if why.strip():
         text = f"{text} Why: {why.strip()}"
+
+    if not session_id:
+        session_id = get_active_session_id(config) or ""
+    if not agent:
+        agent = infer_agent_name("know-cli")
 
     kb = KnowledgeBase(config)
     mem_id = kb.remember(
