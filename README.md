@@ -254,6 +254,18 @@ pip install know-cli[search,mcp]
 
 **Requirements:** Python 3.10+
 
+## Releasing
+
+Reliable publish flow (idempotent, verifies version availability, builds, checks, uploads):
+
+```bash
+./scripts/release_pypi.sh
+```
+
+Notes:
+- Requires `PYPI_API_TOKEN` (or `TWINE_PASSWORD`) in environment.
+- GitHub Action `.github/workflows/publish-pypi.yml` supports manual dispatch and `v*` tags.
+
 ---
 
 ## Configuration
