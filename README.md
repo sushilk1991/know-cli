@@ -30,17 +30,18 @@ Session dedup means the second query never re-sends code from the first.
 
 ## Benchmarks
 
-### Dual-Repo Parallel Benchmark (v0.7.6, February 22, 2026)
+### Dual-Repo Parallel Benchmark (v0.8.0, February 22, 2026)
 
 Method:
-- Ran in parallel per query: `grep+read` baseline vs `know map -> context -> deep`.
+- Ran in parallel per query: `grep+read` baseline vs `know workflow` (single daemon RPC).
 - 4 shared architecture questions, on both repos.
 - File coverage in baseline search: `py, ts, tsx, js, jsx, go, rs, swift`.
+- Includes one warm-up workflow call per repo before measured queries (steady-state).
 
 | Repo | Grep Tokens (4 queries) | know Tokens (4 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `know-cli` | 227,592 | 15,646 | **93.1%** | 0.333s | 2.546s | 7.65x | 64 -> 12 |
-| `farfield` | 284,293 | 14,377 | **94.9%** | 0.529s | 2.451s | 4.63x | 64 -> 12 |
+| `know-cli` | 235,329 | 15,295 | **93.5%** | 0.265s | 0.479s | 1.81x | 64 -> 4 |
+| `farfield` | 284,293 | 13,995 | **95.1%** | 0.458s | 0.788s | 1.72x | 64 -> 4 |
 
 Deep call-graph quality snapshot from the same run:
 - `know-cli`: call-graph available in 100% of deep queries, non-empty edges in 100%.
@@ -54,7 +55,8 @@ Artifacts:
 ### What this means
 
 - **Token and tool-call efficiency is strong now.**
-- **Latency is still behind raw grep** for this benchmark setup.
+- **Single-daemon workflow significantly cuts orchestration overhead** (tool calls dropped to 1/query).
+- **Latency is still behind raw grep**, but the gap is much smaller than before.
 - The biggest product gap remains **deep call-graph completeness on large TSX/Python codebases**.
 
 ---
@@ -67,11 +69,24 @@ cd your-project
 know init
 ```
 
-### What's New in 0.7.6 (Phase 2)
+### What's New in 0.8.0
 
+- New `know workflow "query"` command: single-call daemon workflow (`map -> context -> deep`).
+- `know context` now uses daemon-first full v3 context assembly (same ranking/budget pipeline as local fallback).
 - `know deep` now performs opportunistic stale-file refresh for likely candidate files before resolving symbols.
 - `know related` refreshes the target file on demand, reducing stale import/dependency outputs.
 - Incremental refresh path re-indexes chunks + symbol refs for changed files without full reindex.
+- Fixed search lane weighting bug when OR lane is empty (AND/exact weights now remain stable).
+
+### Single-Call Workflow (Recommended for agents)
+
+```bash
+know --json workflow "billing subscription limits" \
+  --map-limit 20 \
+  --context-budget 4000 \
+  --deep-budget 3000 \
+  --session auto
+```
 
 ### The 3-Tier Workflow
 
@@ -94,6 +109,15 @@ know --json context "payment processing" --budget 4000 --session a1b2c3d4
 
 ## Commands
 
+### Workflow — Single Daemon Call
+
+```bash
+know workflow "billing subscription limits"
+know --json workflow "auth token validation" --context-budget 5000 --deep-budget 2500
+```
+
+Runs `map -> context -> deep` in a single daemon request to cut tool-call overhead for coding agents.
+
 ### Map — Orient Before Reading
 
 ```bash
@@ -102,7 +126,7 @@ know --json map "auth" --limit 30            # JSON for agents
 know map "config" --type function            # Filter by type
 ```
 
-Returns signatures + first-line docstrings. No bodies. ~50 tokens per result.
+Returns signatures + first-line docstrings. No bodies. Typically ~10-25 tokens per result.
 
 ### Context — Ranked Code Bodies
 
@@ -137,6 +161,7 @@ Memories are automatically included in `know context` results.
 
 | Command | Description |
 |---------|-------------|
+| `know workflow "query"` | Single-call daemon workflow (map + context + deep) |
 | `know map "query"` | Lightweight signature search |
 | `know context "query"` | Smart, budgeted code context |
 | `know deep "name"` | Function + callers + callees |

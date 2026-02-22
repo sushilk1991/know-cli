@@ -538,6 +538,65 @@ class TestKnowDeep:
         assert "error" not in result
         assert "process_payment" in result["target"]["name"]
 
+    def test_deep_prefers_function_over_constant_for_same_symbol(self, tmp_project, indexed_db):
+        """When a name exists as function+constant, deep should prefer function."""
+        from know.context_engine import ContextEngine
+
+        conn = indexed_db._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/config/constants.py",
+                "bootstrap",
+                "constant",
+                "python",
+                1,
+                1,
+                "bootstrap",
+                "bootstrap = True",
+                "hash_bootstrap_constant",
+                5,
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO chunks "
+            "(file_path, chunk_name, chunk_type, language, start_line, end_line, "
+            "signature, body, body_hash, token_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src/startup/bootstrap.py",
+                "bootstrap",
+                "function",
+                "python",
+                3,
+                8,
+                "def bootstrap():",
+                "def bootstrap():\n    return True",
+                "hash_bootstrap_function",
+                12,
+                now,
+            ),
+        )
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        conn.commit()
+
+        config = MagicMock()
+        config.root = tmp_project
+
+        engine = ContextEngine.__new__(ContextEngine)
+        engine.db = indexed_db
+        engine.root = tmp_project
+        engine.config = config
+
+        result = engine.build_deep_context("bootstrap", budget=1000)
+        assert "error" not in result
+        assert result["target"]["file"] == "src/startup/bootstrap.py"
+
     def test_deep_excludes_tests_by_default(self, tmp_project, indexed_db):
         """build_deep_context filters test files unless --include-tests."""
         from know.context_engine import ContextEngine
@@ -663,6 +722,40 @@ def count_active_sessions(workspace_id):
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "target" in data
+
+    def test_workflow_cli_json_output(self, tmp_project):
+        """CLI `know workflow` with --json produces valid JSON."""
+        runner = CliRunner()
+        from know.cli import cli
+
+        fake_client = MagicMock()
+        fake_client.call_sync.return_value = {
+            "query": "billing",
+            "map": {"results": [], "count": 0, "truncated": False, "tokens": 0},
+            "context": {
+                "query": "billing",
+                "budget": 4000,
+                "used_tokens": 0,
+                "budget_utilization": "0 / 4,000 (0%)",
+                "code": [],
+                "dependencies": [],
+                "tests": [],
+                "summaries": [],
+                "overview": "",
+                "warnings": [],
+            },
+            "deep": {"error": "no_target"},
+            "selected_deep_target": None,
+            "total_tokens": 0,
+        }
+
+        with patch("know.cli.agent._get_daemon_client", return_value=fake_client):
+            result = runner.invoke(cli, ["--json", "workflow", "billing"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["query"] == "billing"
+        assert "context" in data and "deep" in data
 
     def test_deep_no_call_graph(self, tmp_project, indexed_db):
         """build_deep_context with no symbol_refs returns body only."""

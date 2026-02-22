@@ -120,7 +120,9 @@ from know.cli.knowledge import remember, recall, forget, memories
 from know.cli.stats import stats, status
 from know.cli.hooks import hooks
 from know.cli.mcp import mcp
-from know.cli.agent import next_file, signatures, related, generate_context, callers, callees, map_cmd, deep
+from know.cli.agent import (
+    next_file, signatures, related, generate_context, callers, callees, map_cmd, workflow, deep,
+)
 from know.cli.diff import diff
 
 cli.add_command(init)
@@ -150,6 +152,7 @@ cli.add_command(generate_context)
 cli.add_command(callers)
 cli.add_command(callees)
 cli.add_command(map_cmd)
+cli.add_command(workflow)
 cli.add_command(deep)
 cli.add_command(diff)
 

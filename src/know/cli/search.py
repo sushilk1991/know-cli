@@ -1,5 +1,6 @@
 """Search commands: search, context, graph, reindex."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,69 @@ from rich.panel import Panel
 
 from know.cli import console, logger
 from know.scanner import CodebaseScanner
+
+
+def _format_context_payload_markdown(payload: dict) -> str:
+    """Render daemon/agent JSON context payload as markdown."""
+    lines = [
+        f'# Context for: "{payload.get("query", "")}"',
+        f'## Token Budget: {payload.get("budget_utilization", "")}',
+        "",
+    ]
+
+    for warning in payload.get("warnings", []) or []:
+        lines.append(f"> {warning}")
+    if payload.get("warnings"):
+        lines.append("")
+
+    if payload.get("code"):
+        lines.append("### Relevant Code")
+        lines.append("")
+        for chunk in payload["code"]:
+            line_start = (chunk.get("lines") or [0])[0]
+            lines.append(f"#### {chunk.get('file', '')}:{line_start}::{chunk.get('name', '')}")
+            lines.append(f"```python\n{chunk.get('body', '')}\n```")
+            lines.append("")
+
+    if payload.get("dependencies"):
+        lines.append("### Dependencies")
+        lines.append("")
+        for chunk in payload["dependencies"]:
+            lines.append(f"#### {chunk.get('file', '')} (signatures only)")
+            lines.append(f"```python\n{chunk.get('body', '')}\n```")
+            lines.append("")
+
+    if payload.get("tests"):
+        lines.append("### Related Tests")
+        lines.append("")
+        for chunk in payload["tests"]:
+            line_start = (chunk.get("lines") or [0])[0]
+            lines.append(f"#### {chunk.get('file', '')}:{line_start}::{chunk.get('name', '')}")
+            lines.append(f"```python\n{chunk.get('body', '')}\n```")
+            lines.append("")
+
+    if payload.get("summaries"):
+        lines.append("### File Summaries")
+        lines.append("")
+        for chunk in payload["summaries"]:
+            lines.append(chunk.get("body", ""))
+            lines.append("")
+
+    memories = payload.get("memories")
+    if memories:
+        lines.append("### Memories (Cross-Session Knowledge)")
+        lines.append("")
+        lines.append(memories)
+        lines.append("")
+
+    overview = payload.get("overview")
+    if overview:
+        lines.append("### Project Context")
+        lines.append("")
+        lines.append(overview)
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 @click.command()
@@ -259,6 +323,7 @@ def context(
     t0 = _time.monotonic()
 
     from know.context_engine import ContextEngine
+    from know.cli.agent import _get_daemon_client
 
     # Parse chunk types
     parsed_chunk_types = None
@@ -275,27 +340,55 @@ def context(
             resolved_session_id = session_id
 
     engine = ContextEngine(config)
-    result = engine.build_context(
-        query,
-        budget=budget,
-        include_tests=not no_tests,
-        include_imports=not no_imports,
-        legacy=legacy,
-        include_patterns=list(include_patterns) if include_patterns else None,
-        exclude_patterns=list(exclude_patterns) if exclude_patterns else None,
-        chunk_types=parsed_chunk_types,
-        session_id=resolved_session_id,
-    )
+    include_markdown = not (ctx.obj.get("json") or output_format == "agent")
+    payload = None
 
-    # Inject relevant memories into context
-    try:
-        from know.knowledge_base import KnowledgeBase
-        kb = KnowledgeBase(config)
-        memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
-        if memory_ctx:
-            result["memories_context"] = memory_ctx
-    except Exception as e:
-        logger.debug(f"Memory injection into context failed: {e}")
+    # Daemon-first path for lower latency and single-process retrieval.
+    if not legacy:
+        client = _get_daemon_client(config)
+        if client:
+            try:
+                payload = client.call_sync("context", {
+                    "query": query,
+                    "budget": budget,
+                    "include_tests": not no_tests,
+                    "include_imports": not no_imports,
+                    "include_patterns": list(include_patterns) if include_patterns else None,
+                    "exclude_patterns": list(exclude_patterns) if exclude_patterns else None,
+                    "chunk_types": parsed_chunk_types,
+                    "session_id": resolved_session_id,
+                    "include_markdown": include_markdown,
+                })
+            except Exception as e:
+                logger.debug(f"Daemon context failed, falling back: {e}")
+
+    # Local fallback retains existing behavior.
+    if payload is None:
+        result = engine.build_context(
+            query,
+            budget=budget,
+            include_tests=not no_tests,
+            include_imports=not no_imports,
+            legacy=legacy,
+            include_patterns=list(include_patterns) if include_patterns else None,
+            exclude_patterns=list(exclude_patterns) if exclude_patterns else None,
+            chunk_types=parsed_chunk_types,
+            session_id=resolved_session_id,
+        )
+
+        # Inject relevant memories into context
+        try:
+            from know.knowledge_base import KnowledgeBase
+            kb = KnowledgeBase(config)
+            memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+            if memory_ctx:
+                result["memories_context"] = memory_ctx
+        except Exception as e:
+            logger.debug(f"Memory injection into context failed: {e}")
+
+        payload = json.loads(engine.format_agent_json(result))
+        if include_markdown:
+            payload["markdown"] = engine.format_markdown(result)
 
     duration_ms = int((_time.monotonic() - t0) * 1000)
 
@@ -303,21 +396,21 @@ def context(
     try:
         from know.stats import StatsTracker
         StatsTracker(config).record_context(
-            query, budget, result["used_tokens"], duration_ms,
+            query, budget, int(payload.get("used_tokens", 0)), duration_ms,
         )
     except Exception as e:
         logger.debug(f"Stats tracking (context) failed: {e}")
 
     if ctx.obj.get("json") or output_format == "agent":
-        click.echo(engine.format_agent_json(result))
+        click.echo(json.dumps(payload))
     elif ctx.obj.get("quiet"):
-        click.echo(engine.format_markdown(result))
+        click.echo(payload.get("markdown") or _format_context_payload_markdown(payload))
     else:
-        md = engine.format_markdown(result)
+        md = payload.get("markdown") or _format_context_payload_markdown(payload)
         from rich.markup import escape
         console.print(Panel(
             escape(md),
-            title=f"🧠 Context ({result['budget_display']})",
+            title=f"🧠 Context ({payload.get('budget_utilization', '')})",
             border_style="blue",
         ))
 

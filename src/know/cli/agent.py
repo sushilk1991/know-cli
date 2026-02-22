@@ -1,5 +1,6 @@
 """Agent commands: next-file, signatures, related, generate-context."""
 
+import json
 import os
 from typing import Optional
 
@@ -77,6 +78,23 @@ def _file_intent_boost(file_path: str, intent: str) -> float:
             boost -= 1.0
         return boost
     return 0.0
+
+
+def _pick_deep_target_from_context_payload(context_payload: dict, map_results: list) -> tuple[Optional[str], Optional[str]]:
+    """Pick best deep target from context code first, map fallback second."""
+    for preferred_type in ("function", "method", "class"):
+        for chunk in context_payload.get("code", []) or []:
+            if (chunk.get("type") or "").lower() == preferred_type and chunk.get("name"):
+                return str(chunk["name"]), chunk.get("file")
+
+    for preferred_type in ("function", "method", "class", "constant", "module"):
+        for row in map_results:
+            if (row.get("chunk_type") or "").lower() == preferred_type:
+                name = row.get("chunk_name") or row.get("signature")
+                if name:
+                    return str(name), row.get("file_path")
+
+    return None, None
 
 
 @click.command("next-file")
@@ -460,6 +478,158 @@ def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str
                 console.print(line)
         else:
             console.print(f"[dim]No matches for '{query}'.[/dim]")
+
+
+@click.command("workflow")
+@click.argument("query")
+@click.option("--map-limit", type=int, default=20, help="Max map results (default 20)")
+@click.option("--context-budget", type=int, default=4000, help="Context budget (default 4000)")
+@click.option("--deep-budget", type=int, default=3000, help="Deep budget (default 3000)")
+@click.option("--session", "session_id", default="auto", help="Session ID for dedup ('auto' generates)")
+@click.option("--include-tests", is_flag=True, help="Include test files")
+@click.pass_context
+def workflow(
+    ctx: click.Context,
+    query: str,
+    map_limit: int,
+    context_budget: int,
+    deep_budget: int,
+    session_id: Optional[str],
+    include_tests: bool,
+) -> None:
+    """Single-call daemon workflow: map -> context -> deep."""
+    import uuid
+
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run: know init[/red]")
+        return
+
+    resolved_session_id = session_id
+    if session_id in ("auto", "new"):
+        resolved_session_id = uuid.uuid4().hex[:8]
+
+    result = None
+    client = _get_daemon_client(config)
+    if client:
+        try:
+            result = client.call_sync("workflow", {
+                "query": query,
+                "map_limit": map_limit,
+                "context_budget": context_budget,
+                "deep_budget": deep_budget,
+                "session_id": resolved_session_id,
+                "include_tests": include_tests,
+            })
+        except Exception as e:
+            logger.debug(f"Daemon workflow failed, falling back: {e}")
+            client = None
+
+    if result is None:
+        from know.context_engine import ContextEngine
+
+        engine = ContextEngine(config)
+        db = _get_db_fallback(config)
+        try:
+            map_results = db.search_signatures(query, map_limit)
+            context_result = engine.build_context(
+                query,
+                budget=context_budget,
+                include_tests=include_tests,
+                include_imports=True,
+                session_id=resolved_session_id,
+                db=db,
+            )
+
+            # Memory injection parity with context command.
+            try:
+                from know.knowledge_base import KnowledgeBase
+                kb = KnowledgeBase(config)
+                memory_ctx = kb.get_relevant_context(
+                    query, max_tokens=min(500, context_budget // 10),
+                )
+                if memory_ctx:
+                    context_result["memories_context"] = memory_ctx
+            except Exception as e:
+                logger.debug(f"Workflow memory injection failed: {e}")
+
+            context_payload = json.loads(engine.format_agent_json(context_result))
+            target_name, target_file = _pick_deep_target_from_context_payload(
+                context_payload, map_results,
+            )
+
+            if target_name:
+                deep_query = f"{target_file}:{target_name}" if target_file else target_name
+                deep_result = engine.build_deep_context(
+                    deep_query,
+                    budget=deep_budget,
+                    include_tests=include_tests,
+                    session_id=resolved_session_id,
+                    db=db,
+                )
+                if deep_result.get("error") == "ambiguous":
+                    deep_result = engine.build_deep_context(
+                        target_name,
+                        budget=deep_budget,
+                        include_tests=include_tests,
+                        session_id=resolved_session_id,
+                        db=db,
+                    )
+            else:
+                deep_result = {"error": "no_target", "reason": "no_context_or_map_target"}
+
+            result = {
+                "query": query,
+                "session_id": resolved_session_id,
+                "budgets": {
+                    "map_limit": map_limit,
+                    "context_budget": context_budget,
+                    "deep_budget": deep_budget,
+                },
+                "selected_deep_target": target_name,
+                "map": {
+                    "results": map_results,
+                    "count": len(map_results),
+                    "truncated": len(map_results) >= map_limit,
+                },
+                "context": context_payload,
+                "deep": deep_result,
+            }
+        finally:
+            db.close()
+
+    is_json = ctx.obj.get("json")
+    if is_json:
+        click.echo(json.dumps(result))
+        return
+
+    map_count = (result.get("map") or {}).get("count", 0)
+    ctx_payload = result.get("context") or {}
+    deep_result = result.get("deep") or {}
+    console.print(f"[bold]Workflow:[/bold] [cyan]{query}[/cyan]")
+    console.print(
+        f"[dim]map={map_count} results | context={ctx_payload.get('used_tokens', 0)} tokens | "
+        f"deep={deep_result.get('budget_used', deep_result.get('used_tokens', 0))} tokens[/dim]"
+    )
+
+    map_rows = (result.get("map") or {}).get("results", [])[:8]
+    if map_rows:
+        console.print("\n[bold]Map (top):[/bold]")
+        for row in map_rows:
+            sig = row.get("signature") or row.get("chunk_name", "")
+            console.print(f"  [green]{row.get('file_path', '')}[/green]:{row.get('start_line', 0)}  {sig}")
+
+    target = deep_result.get("target", {})
+    if target:
+        console.print(
+            f"\n[bold]Deep target:[/bold] [cyan]{target.get('name', '')}[/cyan] "
+            f"[dim]({target.get('file', '')}:{target.get('line_start', 0)})[/dim]"
+        )
+        callers = len(deep_result.get("callers", []) or [])
+        callees = len(deep_result.get("callees", []) or [])
+        console.print(f"[dim]callers={callers}, callees={callees}[/dim]")
+    elif deep_result.get("error"):
+        console.print(f"\n[yellow]Deep skipped:[/yellow] {deep_result.get('error')}")
 
 
 @click.command("deep")

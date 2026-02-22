@@ -407,6 +407,7 @@ class ContextEngine:
         exclude_patterns: Optional[List[str]] = None,
         chunk_types: Optional[List[str]] = None,
         session_id: Optional[str] = None,
+        db=None,
     ) -> Dict[str, Any]:
         """Build context bundle for *query* within *budget* tokens.
 
@@ -423,9 +424,19 @@ class ContextEngine:
             code_chunks, dependency_chunks, test_chunks,
             summary_chunks, overview, warnings, indexing_status,
             index_stats, confidence, session_id (if provided)
+
+        Args:
+            db: Optional pre-existing DaemonDB instance (avoids creating a new one).
         """
         if legacy:
             return self._build_context_legacy(query, budget, include_tests, include_imports)
+
+        if db is not None:
+            return self._build_context_v3_inner(
+                db, query, budget, include_tests, include_imports,
+                include_patterns, exclude_patterns, chunk_types,
+                session_id,
+            )
 
         return self._build_context_v3(
             query, budget, include_tests, include_imports,
@@ -1681,7 +1692,23 @@ class ContextEngine:
             if source_only:
                 candidates = source_only
 
-        # 5. If still ambiguous (>1), return all for disambiguation
+        # 5. Prefer executable symbols over constants/modules when mixed.
+        type_priority = {
+            "function": 0,
+            "method": 0,
+            "class": 1,
+            "constant": 2,
+            "module": 2,
+        }
+        best = min(type_priority.get(c.get("chunk_type", "function"), 3) for c in candidates)
+        narrowed = [
+            c for c in candidates
+            if type_priority.get(c.get("chunk_type", "function"), 3) == best
+        ]
+        if narrowed:
+            candidates = narrowed
+
+        # 6. If still ambiguous (>1), return all for disambiguation
         return candidates
 
     def _fill_related_chunks(

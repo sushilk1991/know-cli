@@ -4,10 +4,8 @@
 name: Documentation & Architecture Review
 
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  # Keep disabled by default in this repo. Copy/rename to enable in your repo.
+  workflow_dispatch:
 
 jobs:
   docs:

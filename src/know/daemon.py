@@ -18,7 +18,7 @@ import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Iterable
+from typing import Any, Dict, Optional, Iterable, List, Tuple
 
 import xxhash
 
@@ -476,6 +476,7 @@ class KnowDaemon:
         handlers = {
             "search": self._handle_search,
             "context": self._handle_context,
+            "workflow": self._handle_workflow,
             "signatures": self._handle_signatures,
             "related": self._handle_related,
             "remember": self._handle_remember,
@@ -503,31 +504,170 @@ class KnowDaemon:
         return {"results": results, "count": len(results)}
 
     async def _handle_context(self, params: dict) -> dict:
-        """Build context for a query within a token budget."""
+        """Build full v3 context for a query within a token budget."""
         query = params.get("query", "")
-        budget = params.get("budget", 10000)
-        results = self.db.search_chunks(query, limit=50)
+        budget = int(params.get("budget", 8000))
+        include_tests = bool(params.get("include_tests", True))
+        include_imports = bool(params.get("include_imports", True))
+        include_patterns = params.get("include_patterns")
+        exclude_patterns = params.get("exclude_patterns")
+        chunk_types = params.get("chunk_types")
+        session_id = params.get("session_id")
+        include_markdown = bool(params.get("include_markdown", False))
 
-        context_parts = []
-        used = 0
-        for chunk in results:
-            tokens = chunk["token_count"]
-            if used + tokens > budget:
-                continue
-            context_parts.append({
-                "file": chunk["file_path"],
-                "name": chunk["chunk_name"],
-                "type": chunk["chunk_type"],
-                "signature": chunk["signature"],
-                "body": chunk["body"],
-                "tokens": tokens,
-            })
-            used += tokens
+        from know.context_engine import ContextEngine
+
+        engine = ContextEngine(self.config)
+        result = engine.build_context(
+            query,
+            budget=budget,
+            include_tests=include_tests,
+            include_imports=include_imports,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            chunk_types=chunk_types,
+            session_id=session_id,
+            db=self.db,
+        )
+
+        # Inject relevant memories into context (same behavior as CLI fallback).
+        try:
+            from know.knowledge_base import KnowledgeBase
+            kb = KnowledgeBase(self.config)
+            memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+            if memory_ctx:
+                result["memories_context"] = memory_ctx
+        except Exception as e:
+            logger.debug(f"Memory injection into daemon context failed: {e}")
+
+        payload = json.loads(engine.format_agent_json(result))
+        if include_markdown:
+            payload["markdown"] = engine.format_markdown(result)
+        return payload
+
+    @staticmethod
+    def _pick_deep_target(
+        context_payload: Dict[str, Any],
+        map_results: List[Dict[str, Any]],
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Pick best deep target from context first, map as fallback.
+
+        Returns (target_name, target_file_path|None).
+        """
+        code = context_payload.get("code", []) if isinstance(context_payload, dict) else []
+        for preferred_type in ("function", "method", "class"):
+            for chunk in code:
+                if (chunk.get("type") or "").lower() == preferred_type and chunk.get("name"):
+                    return str(chunk["name"]), chunk.get("file")
+
+        for preferred_type in ("function", "method", "class", "constant", "module"):
+            for row in map_results:
+                if (row.get("chunk_type") or "").lower() == preferred_type:
+                    name = row.get("chunk_name") or row.get("signature")
+                    if name:
+                        return str(name), row.get("file_path")
+
+        return None
+
+    async def _handle_workflow(self, params: dict) -> dict:
+        """Single-call workflow: map -> context -> deep in one daemon request."""
+        query = params.get("query", "")
+        map_limit = int(params.get("map_limit", 20))
+        context_budget = int(params.get("context_budget", 4000))
+        deep_budget = int(params.get("deep_budget", 3000))
+        include_tests = bool(params.get("include_tests", False))
+        include_imports = bool(params.get("include_imports", True))
+        include_patterns = params.get("include_patterns")
+        exclude_patterns = params.get("exclude_patterns")
+        chunk_types = params.get("chunk_types")
+        session_id = params.get("session_id")
+        explicit_deep_name = params.get("deep_name")
+
+        map_results = self.db.search_signatures(query, map_limit)
+
+        context_payload = await self._handle_context({
+            "query": query,
+            "budget": context_budget,
+            "include_tests": include_tests,
+            "include_imports": include_imports,
+            "include_patterns": include_patterns,
+            "exclude_patterns": exclude_patterns,
+            "chunk_types": chunk_types,
+            "session_id": session_id,
+            "include_markdown": False,
+        })
+
+        selected_target = explicit_deep_name
+        selected_file = None
+        if not selected_target:
+            picked = self._pick_deep_target(context_payload, map_results)
+            if picked:
+                selected_target, selected_file = picked
+
+        deep_result: Dict[str, Any]
+        if selected_target:
+            from know.context_engine import ContextEngine
+            engine = ContextEngine(self.config)
+            deep_query = selected_target
+            if selected_file:
+                deep_query = f"{selected_file}:{selected_target}"
+
+            deep_result = engine.build_deep_context(
+                deep_query,
+                budget=deep_budget,
+                include_tests=include_tests,
+                session_id=session_id,
+                db=self.db,
+            )
+            if deep_result.get("error") == "ambiguous":
+                # Retry with original target if file-qualified lookup was too strict.
+                deep_result = engine.build_deep_context(
+                    selected_target,
+                    budget=deep_budget,
+                    include_tests=include_tests,
+                    session_id=session_id,
+                    db=self.db,
+                )
+        else:
+            deep_result = {"error": "no_target", "reason": "no_context_or_map_target"}
+
+        from know.token_counter import count_tokens
+
+        map_text = "\n".join(
+            filter(
+                None,
+                [
+                    f"{r.get('signature', '')}\n{r.get('docstring', '')}".strip()
+                    for r in map_results
+                ],
+            )
+        )
+        map_tokens = count_tokens(map_text) if map_text else 0
+
+        total_tokens = (
+            map_tokens
+            + int(context_payload.get("used_tokens", 0) or 0)
+            + int(deep_result.get("budget_used", deep_result.get("used_tokens", 0)) or 0)
+        )
 
         return {
-            "context": context_parts,
-            "tokens_used": used,
-            "budget": budget,
+            "query": query,
+            "session_id": session_id,
+            "budgets": {
+                "map_limit": map_limit,
+                "context_budget": context_budget,
+                "deep_budget": deep_budget,
+            },
+            "selected_deep_target": selected_target,
+            "map": {
+                "results": map_results,
+                "count": len(map_results),
+                "truncated": len(map_results) >= map_limit,
+                "tokens": map_tokens,
+            },
+            "context": context_payload,
+            "deep": deep_result,
+            "total_tokens": total_tokens,
         }
 
     async def _handle_signatures(self, params: dict) -> dict:

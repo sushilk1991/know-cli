@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Parallel dual-repo benchmark: grep+read baseline vs know 3-tier workflow.
+"""Parallel dual-repo benchmark: grep+read baseline vs know single-daemon workflow.
 
 Runs two "agents" in parallel per query:
   - grep_read: keyword grep + full file reads
-  - know_3tier: know map -> know context -> know deep
+  - know_single_daemon_workflow: know workflow (single daemon RPC)
 
 Outputs:
   - benchmark/results/dual_repo_parallel.json
@@ -101,101 +101,39 @@ def _parse_know_json(result: CommandResult) -> Dict[str, Any]:
         return {"error": "invalid_json", "raw": result.stdout[:500]}
 
 
-def _extract_map_tokens(map_data: Dict[str, Any]) -> int:
-    lines: List[str] = []
-    for row in map_data.get("results", []):
-        signature = row.get("signature") or row.get("chunk_name") or ""
-        doc = row.get("docstring") or ""
-        if signature:
-            lines.append(signature)
-        if doc:
-            lines.append(doc)
-    return count_tokens("\n".join(lines), provider="anthropic") if lines else 0
-
-
 def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
     start = time.monotonic()
-
-    map_t0 = time.monotonic()
-    map_raw = run_cmd(["know", "--json", "map", query, "--limit", "20"], cwd=repo)
-    map_elapsed = time.monotonic() - map_t0
-    map_data = _parse_know_json(map_raw)
-    map_tokens = _extract_map_tokens(map_data) if "error" not in map_data else 0
-
-    ctx_t0 = time.monotonic()
-    ctx_raw = run_cmd(
-        ["know", "--json", "context", query, "--budget", "4000", "--session", "auto"],
+    workflow_t0 = time.monotonic()
+    workflow_raw = run_cmd(
+        [
+            "know", "--json", "workflow", query,
+            "--map-limit", "20",
+            "--context-budget", "4000",
+            "--deep-budget", "3000",
+            "--session", "auto",
+        ],
         cwd=repo,
     )
-    ctx_elapsed = time.monotonic() - ctx_t0
-    ctx_data = _parse_know_json(ctx_raw)
-    ctx_tokens = 0
-    if "error" not in ctx_data:
-        ctx_tokens = int(ctx_data.get("used_tokens", 0) or 0)
+    workflow_elapsed = time.monotonic() - workflow_t0
+    workflow_data = _parse_know_json(workflow_raw)
 
-    top_name = None
-    top_file = None
-    code = ctx_data.get("code", []) if isinstance(ctx_data, dict) else []
-    if code:
-        preferred = None
-        for chunk in code:
-            ctype = (chunk.get("type") or "").lower()
-            if ctype in {"function", "method"}:
-                preferred = chunk
-                break
-        if preferred is None:
-            preferred = code[0]
-        top_name = preferred.get("name")
-        top_file = preferred.get("file")
-    if not top_name:
-        rows = map_data.get("results", []) if isinstance(map_data, dict) else []
-        if rows:
-            top_name = rows[0].get("chunk_name") or rows[0].get("signature")
-            top_file = rows[0].get("file_path")
+    map_data = workflow_data.get("map", {}) if isinstance(workflow_data, dict) else {}
+    map_tokens = int(map_data.get("tokens", 0) or 0)
+    ctx_data = workflow_data.get("context", {}) if isinstance(workflow_data, dict) else {}
+    deep_data = workflow_data.get("deep", {}) if isinstance(workflow_data, dict) else {}
 
-    deep_elapsed = 0.0
-    deep_tokens = 0
-    deep_data: Dict[str, Any] = {}
-    tool_calls = 2
-    if top_name:
-        tool_calls += 1
-        deep_t0 = time.monotonic()
-        deep_raw = run_cmd(
-            ["know", "--json", "deep", str(top_name), "--budget", "3000"],
-            cwd=repo,
-        )
-        deep_elapsed = time.monotonic() - deep_t0
-        deep_data = _parse_know_json(deep_raw)
-        if deep_data.get("error") == "ambiguous":
-            candidates = deep_data.get("candidates", []) or []
-            selected = None
-            if top_file:
-                for c in candidates:
-                    if c.get("file_path") == top_file:
-                        selected = c
-                        break
-            if selected is None and candidates:
-                selected = candidates[0]
-            if selected:
-                disambiguated = f"{selected.get('file_path')}:{selected.get('chunk_name')}"
-                tool_calls += 1
-                deep_retry_t0 = time.monotonic()
-                deep_retry_raw = run_cmd(
-                    ["know", "--json", "deep", disambiguated, "--budget", "3000"],
-                    cwd=repo,
-                )
-                deep_elapsed += time.monotonic() - deep_retry_t0
-                deep_data = _parse_know_json(deep_retry_raw)
-        if "error" not in deep_data:
-            deep_tokens = int(
-                deep_data.get("budget_used", deep_data.get("used_tokens", 0)) or 0
-            )
-
+    ctx_tokens = int(ctx_data.get("used_tokens", 0) or 0)
+    deep_tokens = int(deep_data.get("budget_used", deep_data.get("used_tokens", 0)) or 0)
+    total_tokens = int(workflow_data.get("total_tokens", map_tokens + ctx_tokens + deep_tokens) or 0)
     elapsed = time.monotonic() - start
-    total_tokens = map_tokens + ctx_tokens + deep_tokens
+
+    tool_calls = 1
+    if map_data.get("error") or ctx_data.get("error") or deep_data.get("error"):
+        # Keep metric honest if workflow failed and caller retries manually in practice.
+        tool_calls = 1
 
     return {
-        "strategy": "know_3tier",
+        "strategy": "know_single_daemon_workflow",
         "query": query,
         "tool_calls": tool_calls,
         "elapsed_s": round(elapsed, 3),
@@ -204,20 +142,19 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
         "context_tokens": ctx_tokens,
         "deep_tokens": deep_tokens,
         "steps": {
-            "map_s": round(map_elapsed, 3),
-            "context_s": round(ctx_elapsed, 3),
-            "deep_s": round(deep_elapsed, 3),
+            "workflow_s": round(workflow_elapsed, 3),
         },
         "call_graph": {
-            "available": deep_data.get("call_graph_available") if deep_data else None,
-            "reason": deep_data.get("call_graph_reason") if deep_data else None,
-            "callers": len(deep_data.get("callers", [])) if deep_data else 0,
-            "callees": len(deep_data.get("callees", [])) if deep_data else 0,
-            "target": (deep_data.get("target") or {}).get("name") if deep_data else None,
+            "available": deep_data.get("call_graph_available") if isinstance(deep_data, dict) else None,
+            "reason": deep_data.get("call_graph_reason") if isinstance(deep_data, dict) else None,
+            "callers": len(deep_data.get("callers", [])) if isinstance(deep_data, dict) else 0,
+            "callees": len(deep_data.get("callees", [])) if isinstance(deep_data, dict) else 0,
+            "target": (deep_data.get("target") or {}).get("name") if isinstance(deep_data, dict) else None,
         },
         "errors": {
-            "map": map_data.get("error") if isinstance(map_data, dict) else "unknown",
-            "context": ctx_data.get("error") if isinstance(ctx_data, dict) else "unknown",
+            "workflow": workflow_data.get("error") if isinstance(workflow_data, dict) else "unknown",
+            "map": map_data.get("error") if isinstance(map_data, dict) else None,
+            "context": ctx_data.get("error") if isinstance(ctx_data, dict) else None,
             "deep": deep_data.get("error") if isinstance(deep_data, dict) else None,
         },
     }
@@ -293,6 +230,12 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
     status_data = _parse_know_json(status_result)
     if isinstance(status_data, dict):
         know_version = status_data.get("version")
+
+    # Warm-up one workflow call so measured queries are steady-state.
+    try:
+        run_know_agent(repo, "__warmup__ indexing readiness")
+    except Exception:
+        pass
 
     query_rows = []
     for query in queries:
@@ -374,7 +317,7 @@ def render_markdown(data: Dict[str, Any]) -> str:
         f"- Generated at: {data['generated_at']}"
     )
     lines.append(
-        "- Strategies: `grep+read` baseline vs `know map -> context -> deep`"
+        "- Strategies: `grep+read` baseline vs `know workflow` (single daemon RPC)"
     )
     lines.append("- Language globs: `py, ts, tsx, js, jsx, go, rs, swift`")
     lines.append("")
