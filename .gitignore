@@ -1,4 +1,7 @@
 venv/
+.venv/
+.venv-release/
+.venv-release-smoke/
 *.pyc
 __pycache__/
 dist/
