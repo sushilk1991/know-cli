@@ -325,6 +325,25 @@ Reliable publish flow (idempotent, verifies version availability, builds, checks
 Notes:
 - Requires `PYPI_API_TOKEN` (or `TWINE_PASSWORD`) in environment.
 - GitHub Action `.github/workflows/publish-pypi.yml` supports manual dispatch and `v*` tags.
+- Release script runs a CLI compatibility smoke test before upload (`workflow/context/deep` command checks).
+
+## Troubleshooting
+
+If you see `Error: No such command 'workflow'`:
+
+```bash
+which know
+know --version
+know commands --all | grep workflow
+python -c "import know,sys; print(know.__version__, know.__file__, sys.executable)"
+```
+
+If the command path/version is wrong, reinstall in the active environment:
+
+```bash
+python -m pip uninstall -y know know-cli
+python -m pip install -U know-cli
+```
 
 ---
 

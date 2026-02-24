@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -73,6 +74,14 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         "ok": True,
         "checks": {},
         "actions": [],
+        "environment": {
+            "python": sys.version.split()[0],
+            "python_executable": sys.executable,
+            "know_executable": sys.argv[0],
+            "workflow_command_available": bool(
+                getattr(ctx.find_root().command, "commands", {}).get("workflow")
+            ),
+        },
     }
 
     report["checks"]["fastembed_cache"] = {

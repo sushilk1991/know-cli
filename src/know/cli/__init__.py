@@ -21,6 +21,7 @@ class KnowCLIGroup(click.Group):
 
     SIMPLE_COMMANDS = (
         "init",
+        "workflow",
         "ask",
         "recall",
         "decide",

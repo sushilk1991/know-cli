@@ -75,6 +75,7 @@ class TestSimplifiedSurface:
         result = runner.invoke(cli, ["commands"])
 
         assert result.exit_code == 0
+        assert "workflow" in result.output
         assert "ask" in result.output
         assert "docs" in result.output
         assert "status" in result.output

@@ -67,6 +67,21 @@ rm -rf dist
 "$TOOL_PY" -m build
 "$TOOL_PY" -m twine check dist/*
 
+if [[ "${SKIP_SMOKE:-0}" != "1" ]]; then
+  SMOKE_VENV="${SMOKE_VENV:-.venv-release-smoke}"
+  rm -rf "$SMOKE_VENV"
+  python3 -m venv "$SMOKE_VENV"
+  "$SMOKE_VENV/bin/python" -m pip install --upgrade pip >/dev/null
+  "$SMOKE_VENV/bin/python" -m pip install dist/*.whl >/dev/null
+
+  "$SMOKE_VENV/bin/know" --version >/dev/null
+  "$SMOKE_VENV/bin/know" workflow --help >/dev/null
+  "$SMOKE_VENV/bin/know" context --help >/dev/null
+  "$SMOKE_VENV/bin/know" deep --help >/dev/null
+  "$SMOKE_VENV/bin/know" commands --all | grep -q "workflow"
+  "$SMOKE_VENV/bin/know" --json doctor >/dev/null
+fi
+
 export TWINE_USERNAME="__token__"
 export TWINE_PASSWORD="${TWINE_PASSWORD:-${PYPI_API_TOKEN:-}}"
 
