@@ -65,6 +65,7 @@ def _run_reindex_silent(config) -> Tuple[bool, Optional[int], Optional[str]]:
 def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
     """Diagnose and repair local cache/model issues."""
     from know.embeddings import DEFAULT_MODEL, _configure_fastembed_cache_dir
+    from know.skill_installer import skill_install_status
 
     config = ctx.obj["config"]
     _configure_fastembed_cache_dir()
@@ -88,6 +89,7 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         "path": str(cache_root),
         "exists": cache_root.exists(),
     }
+    report["checks"]["agent_skill"] = skill_install_status()
 
     model_ok, model_error = _probe_embedding_model(DEFAULT_MODEL)
     report["checks"]["embedding_model"] = {
@@ -126,6 +128,18 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
     color = "green" if report["ok"] else "yellow"
     console.print(f"[{color}]doctor: {status}[/{color}]")
     console.print(f"  fastembed_cache: {report['checks']['fastembed_cache']['path']}")
+    skill_check = report["checks"].get("agent_skill", {})
+    skill_targets = skill_check.get("targets", {})
+    installed_targets = [
+        name for name, meta in skill_targets.items() if meta.get("exists")
+    ]
+    if installed_targets:
+        console.print(
+            "  agent_skill: [green]installed[/green] "
+            + ", ".join(sorted(installed_targets))
+        )
+    else:
+        console.print("  agent_skill: [yellow]not found[/yellow]")
 
     embed_check = report["checks"].get("embedding_model", {})
     if embed_check.get("ok"):

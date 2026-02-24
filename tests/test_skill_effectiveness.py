@@ -28,3 +28,25 @@ def test_skill_has_fallback_playbook():
     assert "know deep" in skill
     assert "know next-file" in skill
 
+
+def test_skill_has_use_case_matrix():
+    skill = _skill_text().lower()
+    assert "use-case" in skill or "use case" in skill
+    assert "workflow" in skill
+    assert "map" in skill
+    assert "context" in skill
+    assert "deep" in skill
+
+
+def test_skill_mentions_cross_agent_memory():
+    skill = _skill_text().lower()
+    assert "cross-agent" in skill or "cross agent" in skill
+    assert "codex" in skill
+    assert "claude" in skill
+    assert "gemini" in skill
+
+
+def test_skill_has_anti_patterns_and_recovery():
+    skill = _skill_text().lower()
+    assert "anti-pattern" in skill or "anti pattern" in skill
+    assert "know doctor --repair --reindex" in skill

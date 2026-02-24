@@ -71,6 +71,9 @@ Repository = "https://github.com/sushilk1991/know-cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/know"]
+include = [
+    "KNOW_SKILL.md",
+]
 exclude = [
     "tests/",
     "tests/**/*",

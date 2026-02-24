@@ -69,6 +69,38 @@ cd your-project
 know init
 ```
 
+### Agent Skill Bootstrap (Codex, Claude, Gemini)
+
+`know-cli` includes a built-in agent skill file and installs it automatically on first CLI run.
+
+```bash
+# Trigger bootstrap once (after install/upgrade)
+know commands
+
+# Verify where skill files were installed
+know --json doctor
+```
+
+Expected install targets:
+
+- `~/.codex/skills/know-cli/SKILL.md` (or `$CODEX_HOME/skills/know-cli/SKILL.md`)
+- `~/.claude/skills/know-cli/SKILL.md`
+- `~/.agents/skills/know-cli/SKILL.md`
+
+If a target is missing:
+
+```bash
+rm -f ~/.cache/know-cli/skill_bootstrap.json
+know commands
+know --json doctor
+```
+
+Disable auto-install if you manage skills manually:
+
+```bash
+KNOW_AUTO_INSTALL_SKILL=0 know --version
+```
+
 ### What's New in 0.8.0
 
 - New `know workflow "query"` command: single-call daemon workflow (`map -> context -> deep`).
@@ -263,6 +295,28 @@ This is the canonical path for Codex/Claude/Gemini memory portability.
 | **Claude Desktop** | MCP server: `know mcp serve` |
 | **Cursor** | MCP server or CLI |
 | **Any CLI agent** | Pipe-friendly: `know --json context "query"` |
+
+## Agent Skill File (Auto-Installed)
+
+`know-cli` ships with an agent skill file (`KNOW_SKILL.md`) and auto-installs it on first CLI run (per version) into common agent homes:
+
+- `~/.codex/skills/know-cli/SKILL.md` (or `$CODEX_HOME/skills/know-cli/SKILL.md`)
+- `~/.claude/skills/know-cli/SKILL.md`
+- `~/.agents/skills/know-cli/SKILL.md`
+
+Verify installation:
+
+```bash
+know --json doctor
+```
+
+In JSON output, check `checks.agent_skill.targets.*.exists`.
+
+Disable auto-install if needed:
+
+```bash
+KNOW_AUTO_INSTALL_SKILL=0 know --version
+```
 
 ---
 

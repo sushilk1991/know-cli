@@ -11,6 +11,7 @@ from rich.console import Console
 from know.config import Config, load_config
 from know.logger import setup_logging, get_logger
 from know.exceptions import KnowError
+from know.skill_installer import auto_bootstrap_skill_install
 
 console = Console()
 logger = get_logger()
@@ -115,6 +116,12 @@ def cli(
     ctx.obj["quiet"] = quiet
     ctx.obj["json"] = json_output
     ctx.obj["show_time"] = show_time
+
+    # Install/update agent skill files once per version on first run.
+    try:
+        auto_bootstrap_skill_install()
+    except Exception as e:
+        logger.debug(f"Skill auto-bootstrap failed: {e}")
 
     # Record start time for --time flag
     if show_time:

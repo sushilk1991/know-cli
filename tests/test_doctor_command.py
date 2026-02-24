@@ -62,6 +62,7 @@ class TestDoctorCommand:
         assert data["ok"] is True
         assert "fastembed_cache" in data["checks"]
         assert "embedding_model" in data["checks"]
+        assert "agent_skill" in data["checks"]
         assert "environment" in data
         assert "workflow_command_available" in data["environment"]
 
