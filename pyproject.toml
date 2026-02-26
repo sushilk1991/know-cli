@@ -77,6 +77,26 @@ include = [
 exclude = [
     "tests/",
     "tests/**/*",
+    ".venv*/",
+    ".venv*/**/*",
+    "venv*/",
+    "venv*/**/*",
+    ".know/",
+    ".know/**/*",
+    "__pycache__/",
+    "**/__pycache__/**",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".venv*/",
+    ".venv*/**/*",
+    "venv*/",
+    "venv*/**/*",
+    ".know/",
+    ".know/**/*",
+    "__pycache__/",
+    "**/__pycache__/**",
 ]
 
 [tool.pytest.ini_options]
