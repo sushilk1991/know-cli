@@ -100,6 +100,22 @@ _IMPORT_NODE_TYPES: Dict[str, set] = {
     "cpp": {"preproc_include"},
 }
 
+# Node types for call expression extraction (used by TreeSitterParser._walk_calls)
+_CALL_EXPRESSION_TYPES: Dict[str, set] = {
+    "python": {"call"},
+    "typescript": {"call_expression", "new_expression"},
+    "tsx": {"call_expression", "new_expression"},
+    "javascript": {"call_expression", "new_expression"},
+    "jsx": {"call_expression", "new_expression"},
+    "go": {"call_expression"},
+    "rust": {"call_expression", "macro_invocation"},
+    "java": {"method_invocation", "object_creation_expression"},
+    "ruby": {"call", "method_call"},
+    "c": {"call_expression"},
+    "cpp": {"call_expression"},
+    "swift": {"call_expression"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Tree-sitter parser cache
@@ -407,7 +423,9 @@ class TreeSitterParser(BaseParser):
 
     def _walk_calls(self, node, content: bytes, chunk_ranges, refs):
         """Recursively walk AST to find call expressions."""
-        if node.type in ("call", "call_expression", "method_invocation"):
+        call_types = _CALL_EXPRESSION_TYPES.get(self.language, {"call", "call_expression", "method_invocation"})
+
+        if node.type in call_types:
             # Extract the function name being called
             func_node = node.children[0] if node.children else None
             if func_node:
@@ -421,6 +439,22 @@ class TreeSitterParser(BaseParser):
                         "line_number": line,
                         "containing_chunk": chunk or "<module>",
                     })
+
+        # Rust method calls: obj.method(args) — tree-sitter node is "method_call_expression"
+        elif self.language == "rust" and node.type == "method_call_expression":
+            for child in node.children:
+                if child.type == "field_identifier":
+                    name = content[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+                    if name and len(name) >= 2 and not name.startswith("__"):
+                        line = node.start_point[0] + 1
+                        chunk = self._find_containing_chunk(line, chunk_ranges)
+                        refs.append({
+                            "ref_name": name,
+                            "ref_type": "call",
+                            "line_number": line,
+                            "containing_chunk": chunk or "<module>",
+                        })
+                    break
 
         elif self.language in ("tsx", "jsx") and node.type in ("jsx_opening_element", "jsx_self_closing_element"):
             comp_name = self._extract_jsx_component_name(node, content)
@@ -439,12 +473,17 @@ class TreeSitterParser(BaseParser):
 
     def _extract_call_name(self, node, content: bytes) -> Optional[str]:
         """Extract the function name from a call target node."""
-        if node.type in ("identifier", "name"):
+        if node.type in ("identifier", "name", "field_identifier"):
             return content[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
-        elif node.type in ("attribute", "member_expression"):
-            # e.g. obj.method — extract just the method name
+        elif node.type in ("attribute", "member_expression", "selector_expression", "field_expression"):
+            # e.g. obj.method, pkg.Func, items.iter — extract just the method/function name
             for child in reversed(node.children):
                 if child.type in ("identifier", "property_identifier", "name", "field_identifier"):
+                    return content[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        elif node.type == "scoped_identifier":
+            # Rust: module::function — extract just the function name
+            for child in reversed(node.children):
+                if child.type in ("identifier", "type_identifier"):
                     return content[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
         return None
 
@@ -678,6 +717,42 @@ class RegexParser(BaseParser):
     _class_pattern: str = ""
     _import_pattern: str = ""
 
+    # Generic call extraction — subclasses can override _CALL_PATTERN and _CALL_SKIP
+    _CALL_PATTERN = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    _CALL_SKIP: set = {
+        "if", "for", "while", "switch", "return", "catch",
+    }
+
+    def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
+        """Extract call refs via regex pattern matching."""
+        refs: List[Dict[str, Any]] = []
+        seen: set = set()
+        chunk_ranges = []
+        for func in module.functions:
+            end = func.end_line if func.end_line >= func.line_number else func.line_number
+            chunk_ranges.append((func.line_number, end, func.name))
+        for cls in module.classes:
+            end = cls.end_line if cls.end_line >= cls.line_number else cls.line_number
+            chunk_ranges.append((cls.line_number, end, cls.name))
+
+        for line_no, line in enumerate(content.split("\n"), 1):
+            for match in self._CALL_PATTERN.finditer(line):
+                ref_name = match.group(1)
+                if ref_name in self._CALL_SKIP or len(ref_name) < 2:
+                    continue
+                containing = TreeSitterParser._find_containing_chunk(line_no, chunk_ranges)
+                key = (ref_name, line_no, containing or "<module>")
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs.append({
+                    "ref_name": ref_name,
+                    "ref_type": "call",
+                    "line_number": line_no,
+                    "containing_chunk": containing or "<module>",
+                })
+        return refs
+
     def parse(self, path: Path, root: Path) -> ModuleInfo:
         content = self._read_file(path)
         relative_path = path.relative_to(root)
@@ -885,6 +960,11 @@ class GoRegexParser(RegexParser):
     _func_pattern = r"func\s+(?:\([^)]+\)\s+)?(\w+)\s*\("
     _class_pattern = r"type\s+(\w+)\s+struct"
     _import_pattern = r"import\s+"
+    _CALL_SKIP = {
+        "if", "for", "range", "switch", "select", "go", "defer", "return",
+        "make", "len", "cap", "append", "copy", "delete", "close",
+        "panic", "recover", "print", "println", "new", "func",
+    }
 
 
 class RustRegexParser(RegexParser):
@@ -893,6 +973,11 @@ class RustRegexParser(RegexParser):
     _func_pattern = r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)"
     _class_pattern = r"(?:pub\s+)?(?:struct|enum|trait)\s+(\w+)"
     _import_pattern = r"use\s+"
+    _CALL_SKIP = {
+        "if", "for", "while", "match", "loop", "return", "unsafe", "async",
+        "move", "fn", "let", "mut", "impl", "use", "mod", "pub", "self",
+        "Some", "None", "Ok", "Err",
+    }
 
 
 class JavaRegexParser(RegexParser):
@@ -901,6 +986,10 @@ class JavaRegexParser(RegexParser):
     _func_pattern = r"(?:public|private|protected)?\s*(?:static\s+)?(?:\w+\s+)+(\w+)\s*\("
     _class_pattern = r"(?:public\s+)?(?:abstract\s+)?class\s+(\w+)"
     _import_pattern = r"import\s+"
+    _CALL_SKIP = {
+        "if", "for", "while", "switch", "catch", "return", "new", "throw",
+        "instanceof", "class", "interface", "extends", "implements",
+    }
 
 
 class RubyRegexParser(RegexParser):
@@ -909,6 +998,11 @@ class RubyRegexParser(RegexParser):
     _func_pattern = r"def\s+(?:self\.)?(\w+)"
     _class_pattern = r"(?:class|module)\s+(\w+)"
     _import_pattern = r"require"
+    _CALL_SKIP = {
+        "if", "unless", "while", "until", "for", "case", "when", "return",
+        "require", "require_relative", "puts", "print", "raise", "def",
+        "end", "do", "class", "module", "attr_reader", "attr_writer", "attr_accessor",
+    }
 
 
 class CRegexParser(RegexParser):
@@ -917,6 +1011,11 @@ class CRegexParser(RegexParser):
     _func_pattern = r"(?:\w+[\s*]+)+(\w+)\s*\([^)]*\)\s*\{"
     _class_pattern = r"(?:struct|class)\s+(\w+)"
     _import_pattern = r"#include"
+    _CALL_SKIP = {
+        "if", "for", "while", "switch", "return", "sizeof", "typeof",
+        "define", "ifdef", "ifndef", "endif", "include", "struct", "enum",
+        "void", "int", "char", "float", "double", "long", "unsigned",
+    }
 
 
 class SwiftRegexParser(RegexParser):
@@ -925,6 +1024,10 @@ class SwiftRegexParser(RegexParser):
     _func_pattern = r"(?:public|private|fileprivate|internal|open)?\s*(?:static\s+)?func\s+([A-Za-z_]\w*)"
     _class_pattern = r"(?:public|private|fileprivate|internal|open)?\s*(?:final\s+)?(?:class|struct|enum|protocol)\s+([A-Za-z_]\w*)"
     _import_pattern = r"import\s+"
+    _CALL_SKIP = {
+        "if", "for", "while", "switch", "guard", "return", "throw", "catch",
+        "func", "class", "struct", "enum", "protocol", "import", "let", "var",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1073,7 @@ class GoParser(GoRegexParser):
     def extract_call_refs(self, content: str, module: ModuleInfo) -> List[Dict[str, Any]]:
         if self._delegate:
             return self._delegate.extract_call_refs(content, module)
-        return []
+        return GoRegexParser.extract_call_refs(self, content, module)
 
 
 # ---------------------------------------------------------------------------

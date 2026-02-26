@@ -76,10 +76,28 @@ if [[ "${SKIP_SMOKE:-0}" != "1" ]]; then
 
   "$SMOKE_VENV/bin/know" --version >/dev/null
   "$SMOKE_VENV/bin/know" workflow --help >/dev/null
+  "$SMOKE_VENV/bin/know" warm --help >/dev/null
   "$SMOKE_VENV/bin/know" context --help >/dev/null
   "$SMOKE_VENV/bin/know" deep --help >/dev/null
   "$SMOKE_VENV/bin/know" commands --all | grep -q "workflow"
   "$SMOKE_VENV/bin/know" --json doctor >/dev/null
+fi
+
+if [[ "${SKIP_BENCHMARK_GATE:-0}" != "1" ]]; then
+  BENCH_OUT="${BENCH_OUT:-${TMPDIR:-/tmp}/know-bench-${VERSION}}"
+  rm -rf "$BENCH_OUT"
+  BENCH_PY="python3"
+  if [[ -n "${SMOKE_VENV:-}" ]] && [[ -x "${SMOKE_VENV}/bin/python" ]]; then
+    BENCH_PY="${SMOKE_VENV}/bin/python"
+  fi
+  if [[ "$BENCH_PY" == "python3" ]]; then
+    export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}src"
+  fi
+  "$BENCH_PY" benchmark/bench_dual_repo_parallel.py \
+    --repo "$ROOT_DIR" \
+    --results-dir "$BENCH_OUT" >/dev/null
+  test -s "$BENCH_OUT/dual_repo_parallel.json"
+  test -s "$BENCH_OUT/DUAL_REPO_BENCHMARK.md"
 fi
 
 export TWINE_USERNAME="__token__"

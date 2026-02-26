@@ -36,6 +36,12 @@ def main():
     from bench_memory_quality import run_suite as run_suite_memory
     run_suite_memory()
 
+    # Suite 2c: Dual-repo parallel benchmark
+    print()
+    print("─" * 60)
+    from bench_dual_repo_parallel import main as run_dual_repo
+    run_dual_repo()
+
     # Suites 3+4: Agent E2E + Quality (requires API key)
     if has_api_key():
         print()

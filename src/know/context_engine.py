@@ -23,11 +23,15 @@ Architecture (v3 — DaemonDB pivot):
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
 import re
 import subprocess
 
 import time
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
@@ -39,6 +43,49 @@ if TYPE_CHECKING:
     from know.config import Config
 
 logger = get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Semantic lane caches (process-local, bounded LRU)
+# ---------------------------------------------------------------------------
+
+_SEMANTIC_CACHE_LOCK = threading.Lock()
+_SEMANTIC_QUERY_EMBED_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_SEMANTIC_CHUNK_EMBED_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read integer env var with lower bound."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _cache_get(cache: "OrderedDict[str, Any]", key: str) -> Any:
+    with _SEMANTIC_CACHE_LOCK:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+
+def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any, max_items: int) -> None:
+    with _SEMANTIC_CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_items:
+            cache.popitem(last=False)
+
+
+def _clear_semantic_embedding_caches() -> None:
+    """Test helper: clear in-process semantic embedding caches."""
+    with _SEMANTIC_CACHE_LOCK:
+        _SEMANTIC_QUERY_EMBED_CACHE.clear()
+        _SEMANTIC_CHUNK_EMBED_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +454,8 @@ class ContextEngine:
         exclude_patterns: Optional[List[str]] = None,
         chunk_types: Optional[List[str]] = None,
         session_id: Optional[str] = None,
+        retrieval_profile: str = "balanced",
+        semantic_max_ms: Optional[int] = None,
         db=None,
     ) -> Dict[str, Any]:
         """Build context bundle for *query* within *budget* tokens.
@@ -435,13 +484,13 @@ class ContextEngine:
             return self._build_context_v3_inner(
                 db, query, budget, include_tests, include_imports,
                 include_patterns, exclude_patterns, chunk_types,
-                session_id,
+                session_id, retrieval_profile, semantic_max_ms,
             )
 
         return self._build_context_v3(
             query, budget, include_tests, include_imports,
             include_patterns, exclude_patterns, chunk_types,
-            session_id,
+            session_id, retrieval_profile, semantic_max_ms,
         )
 
     def _build_context_v3(
@@ -454,6 +503,8 @@ class ContextEngine:
         exclude_patterns: Optional[List[str]] = None,
         chunk_types: Optional[List[str]] = None,
         session_id: Optional[str] = None,
+        retrieval_profile: str = "balanced",
+        semantic_max_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """v3 context building via DaemonDB."""
         # Get DaemonDB (direct connection, no daemon socket needed)
@@ -462,7 +513,7 @@ class ContextEngine:
             return self._build_context_v3_inner(
                 db, query, budget, include_tests, include_imports,
                 include_patterns, exclude_patterns, chunk_types,
-                session_id,
+                session_id, retrieval_profile, semantic_max_ms,
             )
         finally:
             db.close()
@@ -472,6 +523,8 @@ class ContextEngine:
         include_tests: bool, include_imports: bool,
         include_patterns, exclude_patterns, chunk_types,
         session_id: Optional[str] = None,
+        retrieval_profile: str = "balanced",
+        semantic_max_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Inner v3 pipeline (db connection managed by caller)."""
         from know.file_categories import apply_category_demotion
@@ -484,44 +537,27 @@ class ContextEngine:
         indexing_status = "complete" if stats["files"] > 0 else "indexing"
 
         if stats["files"] == 0:
-            # No index yet — populate DB inline (first-use indexing)
-            logger.debug("DaemonDB empty, running inline index population")
-            try:
-                from know.daemon import populate_index
-                indexed, modules = populate_index(self.config.root, self.config, db)
-                logger.debug(f"Inline indexing complete: {indexed} files")
-
-                # Build import graph so dependency budget gets filled
-                try:
-                    from know.import_graph import ImportGraph
-                    ig = ImportGraph(self.config)
-                    ig.build(modules)
-                except Exception as e:
-                    logger.debug(f"Inline import graph build failed: {e}")
-
-                # Compute importance scores (in-degree from import graph)
-                try:
-                    db.compute_importance()
-                except Exception as e:
-                    logger.debug(f"Inline importance computation failed: {e}")
-
-                stats = db.get_stats()
-                indexing_status = "complete" if stats["files"] > 0 else "indexing"
-            except Exception as e:
-                logger.warning(f"Inline indexing failed, falling back to legacy: {e}")
-
-            if stats["files"] == 0:
-                # Still empty after indexing attempt — fall back to legacy
-                logger.debug("DaemonDB still empty, falling back to legacy")
-                result = self._build_context_legacy(
-                    query, budget, include_tests, include_imports,
-                )
-                result["indexing_status"] = indexing_status
-                result["index_stats"] = stats
-                return result
+            # Non-blocking behavior: do not perform full indexing in request thread.
+            # Daemon warmup/background indexing should populate this asynchronously.
+            warnings.append(
+                "Index is warming up in background. Retry shortly or run `know warm`."
+            )
+            result = self._empty_result(query, budget, warnings)
+            result["indexing_status"] = "warming"
+            result["index_stats"] = stats
+            result["retryable"] = True
+            result["retry_after_seconds"] = 2
+            return result
 
         # Step 1: Hybrid retrieval (lexical + graph + semantic lanes, RRF fused)
-        raw_results = self._retrieve_hybrid_candidates(db, query, limit=120)
+        raw_results = self._retrieve_hybrid_candidates(
+            db,
+            query,
+            limit=120,
+            repo_file_count=int(stats.get("files", 0) or 0),
+            retrieval_profile=retrieval_profile,
+            semantic_max_ms=semantic_max_ms,
+        )
 
         if not raw_results:
             # Zero-result intelligence
@@ -779,7 +815,13 @@ class ContextEngine:
         return f"{chunk.get('file_path', '')}:{chunk.get('chunk_name', '')}:{chunk.get('start_line', 0)}"
 
     def _retrieve_hybrid_candidates(
-        self, db, query: str, limit: int = 100,
+        self,
+        db,
+        query: str,
+        limit: int = 100,
+        repo_file_count: Optional[int] = None,
+        retrieval_profile: str = "balanced",
+        semantic_max_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve candidates via lexical + graph + semantic lanes, fused with RRF."""
         lexical = db.search_chunks(query, limit=limit)
@@ -787,7 +829,23 @@ class ContextEngine:
             return []
 
         graph = self._graph_expand_lane(db, lexical, query, limit=max(20, limit // 2))
-        semantic = self._semantic_rerank_lane(query, lexical + graph, limit=max(20, limit // 2))
+        profile = (retrieval_profile or "balanced").strip().lower()
+        semantic_enabled = profile not in {"fast", "explore", "lexical"}
+        semantic_limit = max(20, limit // 2)
+        if profile == "thorough":
+            semantic_limit = max(30, limit)
+        elif profile in {"fast", "explore"}:
+            semantic_limit = max(10, limit // 4)
+
+        semantic: List[Dict[str, Any]] = []
+        if semantic_enabled:
+            semantic = self._semantic_rerank_lane(
+                query,
+                lexical + graph,
+                limit=semantic_limit,
+                repo_file_count=repo_file_count,
+                semantic_max_ms=semantic_max_ms,
+            )
 
         fused = self._fuse_hybrid_lanes(lexical, graph, semantic, limit=limit)
         return fused or lexical[:limit]
@@ -917,6 +975,8 @@ class ContextEngine:
         query: str,
         candidates: List[Dict[str, Any]],
         limit: int = 80,
+        repo_file_count: Optional[int] = None,
+        semantic_max_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Embedding-based rerank lane over lexical+graph candidates."""
         if not candidates:
@@ -926,6 +986,24 @@ class ContextEngine:
         if model is None:
             return []
 
+        # Adaptive semantic settings to balance quality and latency.
+        max_candidates = _env_int("KNOW_SEMANTIC_MAX_CANDIDATES", 120, 5)
+        if repo_file_count and repo_file_count >= 1200:
+            max_candidates = min(max_candidates, 50)
+        max_text_chars = _env_int("KNOW_SEMANTIC_MAX_TEXT_CHARS", 320, 64)
+        max_ms = _env_int("KNOW_SEMANTIC_MAX_MS", 2500, 100)
+        if semantic_max_ms is not None:
+            max_ms = max(100, int(semantic_max_ms))
+        batch_size = _env_int("KNOW_SEMANTIC_BATCH_SIZE", 24, 1)
+        query_cache_max = _env_int("KNOW_SEMANTIC_QUERY_CACHE_SIZE", 2048, 32)
+        chunk_cache_max = _env_int("KNOW_SEMANTIC_CHUNK_CACHE_SIZE", 8000, 256)
+        if semantic_max_ms is not None:
+            # Tighter latency budgets need tighter per-call work bounds.
+            if semantic_max_ms <= 800:
+                batch_size = 1
+            elif semantic_max_ms <= 1500:
+                batch_size = min(batch_size, 4)
+
         # Deduplicate before embedding.
         deduped: Dict[str, Dict[str, Any]] = {}
         for c in candidates:
@@ -933,35 +1011,81 @@ class ContextEngine:
             existing = deduped.get(key)
             if existing is None or float(c.get("score", 0)) > float(existing.get("score", 0)):
                 deduped[key] = c
-        unique = list(deduped.values())[:200]
+        unique = list(deduped.values())[:max_candidates]
         if not unique:
             return []
 
-        texts = [
-            f"{c.get('chunk_name', '')} {c.get('signature', '')}\n{(c.get('body', '') or '')[:500]}"
-            for c in unique
-        ]
-
         try:
             import numpy as np
-            query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
-            chunk_emb = np.array(list(model.embed(texts)), dtype=np.float32)
-            q_norm = np.linalg.norm(query_emb)
-            if q_norm == 0 or chunk_emb.size == 0:
+            start = time.monotonic()
+            deadline = start + (max_ms / 1000.0)
+
+            query_key = f"q::{query.strip().lower()}"
+            query_emb = _cache_get(_SEMANTIC_QUERY_EMBED_CACHE, query_key)
+            if query_emb is None:
+                if time.monotonic() >= deadline:
+                    return []
+                query_emb = np.array(list(model.embed([query]))[0], dtype=np.float32)
+                q_norm = np.linalg.norm(query_emb)
+                if q_norm == 0:
+                    return []
+                query_emb = query_emb / q_norm
+                _cache_set(
+                    _SEMANTIC_QUERY_EMBED_CACHE, query_key, query_emb, query_cache_max,
+                )
+
+            chunk_vectors: List[Optional[Any]] = [None] * len(unique)
+            missing: List[Tuple[int, str, str]] = []
+
+            for idx, chunk in enumerate(unique):
+                text = (
+                    f"{chunk.get('chunk_name', '')} {chunk.get('signature', '')}\n"
+                    f"{(chunk.get('body', '') or '')[:max_text_chars]}"
+                )
+                digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+                ckey = (
+                    f"{chunk.get('file_path', '')}:{chunk.get('chunk_name', '')}:"
+                    f"{chunk.get('start_line', 0)}:{digest}"
+                )
+
+                cached = _cache_get(_SEMANTIC_CHUNK_EMBED_CACHE, ckey)
+                if cached is not None:
+                    chunk_vectors[idx] = cached
+                else:
+                    missing.append((idx, ckey, text))
+
+            if missing:
+                for i in range(0, len(missing), batch_size):
+                    if time.monotonic() >= deadline:
+                        break
+                    batch = missing[i : i + batch_size]
+                    texts = [t for _, _, t in batch]
+                    embs = list(model.embed(texts))
+                    for (idx, ckey, _), emb in zip(batch, embs):
+                        vec = np.array(emb, dtype=np.float32)
+                        norm = np.linalg.norm(vec)
+                        if norm == 0:
+                            continue
+                        vec = vec / norm
+                        chunk_vectors[idx] = vec
+                        _cache_set(
+                            _SEMANTIC_CHUNK_EMBED_CACHE, ckey, vec, chunk_cache_max,
+                        )
+
+            valid_indices = [i for i, vec in enumerate(chunk_vectors) if vec is not None]
+            if not valid_indices:
                 return []
-            query_emb = query_emb / q_norm
-            norms = np.linalg.norm(chunk_emb, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            chunk_emb = chunk_emb / norms
+            chunk_emb = np.array([chunk_vectors[i] for i in valid_indices], dtype=np.float32)
             sims = chunk_emb @ query_emb
         except Exception as e:
             logger.debug(f"Semantic lane skipped: {e}")
             return []
 
         scored = []
-        for i, chunk in enumerate(unique):
+        for sim_idx, chunk_idx in enumerate(valid_indices):
+            chunk = unique[chunk_idx]
             item = dict(chunk)
-            item["score"] = float(sims[i])
+            item["score"] = float(sims[sim_idx])
             scored.append(item)
         scored.sort(key=lambda c: c.get("score", 0), reverse=True)
         return scored[:limit]
@@ -1939,18 +2063,46 @@ class ContextEngine:
         """Resolve function name to chunk(s) with disambiguation."""
         from know.file_categories import categorize_file
 
-        # 1. Try exact chunk_name match
-        candidates = db.get_chunks_by_name(name)
+        def _leaf_symbol(raw: str) -> str:
+            sym = (raw or "").strip()
+            if not sym:
+                return sym
+            # Keep file:name semantics and strip the file hint from the symbol.
+            if ":" in sym:
+                maybe_file, maybe_sym = sym.rsplit(":", 1)
+                if "/" in maybe_file or maybe_file.endswith(
+                    (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".swift")
+                ):
+                    sym = maybe_sym
+            for sep in ("::", "."):
+                if sep in sym:
+                    sym = sym.rsplit(sep, 1)[-1]
+            return sym
 
-        # 2. Try file:name format
+        file_hint = None
+        symbol_name = name
+        if ":" in name:
+            maybe_file, maybe_sym = name.rsplit(":", 1)
+            if "/" in maybe_file or maybe_file.endswith(
+                (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".swift")
+            ):
+                file_hint = maybe_file
+                symbol_name = maybe_sym
+
+        # 1. Try exact chunk_name match.
+        candidates = db.get_chunks_by_name(name)
+        if not candidates and symbol_name != name:
+            candidates = db.get_chunks_by_name(symbol_name)
+
+        # 2. Try file:name format.
         if not candidates and ":" in name:
             file_part, name_part = name.rsplit(":", 1)
             all_matches = db.get_chunks_by_name(name_part)
             candidates = [c for c in all_matches if file_part in c["file_path"]]
 
-        # 3. Try Class.method format
-        if not candidates and "." in name:
-            parts = name.split(".")
+        # 3. Try Class.method format.
+        if not candidates and "." in symbol_name:
+            parts = symbol_name.split(".")
             method_name = parts[-1]
             class_hint = parts[0]
             all_matches = db.get_chunks_by_name(method_name)
@@ -1960,10 +2112,69 @@ class ContextEngine:
                 if class_hint in c.get("chunk_name", "") or class_hint in c.get("file_path", "")
             ]
 
+        # 4. Try leaf-name fallback for fully qualified names.
+        if not candidates:
+            leaf = _leaf_symbol(symbol_name)
+            fallback: List[Dict] = []
+
+            # 4a) Reuse method suffix index when available.
+            if leaf:
+                try:
+                    fallback.extend(db.get_method_chunks_by_suffix(leaf, limit=50))
+                except Exception:
+                    pass
+
+            # 4b) Use lexical chunk search, then hydrate full chunk rows by exact chunk_name.
+            matched_names = set()
+            search_terms = [symbol_name]
+            if leaf and leaf != symbol_name:
+                search_terms.append(leaf)
+            for term in search_terms:
+                if not term:
+                    continue
+                try:
+                    for row in db.search_chunks(term, limit=50):
+                        cname = row.get("chunk_name", "")
+                        if not cname:
+                            continue
+                        cname_leaf = _leaf_symbol(cname)
+                        if (
+                            cname == symbol_name
+                            or cname.endswith(f".{symbol_name}")
+                            or cname.endswith(f"::{symbol_name}")
+                            or (leaf and cname_leaf == leaf)
+                        ):
+                            matched_names.add(cname)
+                except Exception:
+                    continue
+
+            for cname in matched_names:
+                try:
+                    fallback.extend(db.get_chunks_by_name(cname, limit=50))
+                except Exception:
+                    continue
+
+            # Deduplicate hydrated candidates.
+            seen = set()
+            deduped: List[Dict] = []
+            for c in fallback:
+                key = (c.get("file_path"), c.get("chunk_name"), c.get("start_line"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(c)
+            candidates = deduped
+
+        # Prefer file hint when available.
+        if candidates and file_hint:
+            narrowed = [c for c in candidates if file_hint in c.get("file_path", "")]
+            if narrowed:
+                candidates = narrowed
+
         if not candidates:
             return []
 
-        # 4. Filter test files by default
+        # 5. Filter test files by default.
         if not include_tests:
             source_only = [
                 c for c in candidates
@@ -1972,7 +2183,7 @@ class ContextEngine:
             if source_only:
                 candidates = source_only
 
-        # 5. Prefer executable symbols over constants/modules when mixed.
+        # 6. Prefer executable symbols over constants/modules when mixed.
         type_priority = {
             "function": 0,
             "method": 0,
@@ -1988,7 +2199,7 @@ class ContextEngine:
         if narrowed:
             candidates = narrowed
 
-        # 6. If still ambiguous (>1), return all for disambiguation
+        # 7. If still ambiguous (>1), return all for disambiguation.
         return candidates
 
     def _fill_related_chunks(

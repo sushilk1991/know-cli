@@ -27,6 +27,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from know.config import Config
 
+try:
+    from know.mcp_server import _MCP_AVAILABLE
+except Exception:
+    _MCP_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -93,6 +98,7 @@ def _run_async(coro):
 # MCP Server — Creation & Registration
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(not _MCP_AVAILABLE, reason="MCP extra not installed")
 class TestMCPServerCreation:
     """Test that the MCP server is created correctly."""
 
@@ -123,6 +129,7 @@ class TestMCPServerCreation:
 class TestMCPToolGetContext:
     """Test the get_context MCP tool."""
 
+    @pytest.mark.skipif(not _MCP_AVAILABLE, reason="MCP extra not installed")
     def test_get_context_returns_json(self, tmp_project):
         root, config = tmp_project
         from know.mcp_server import create_server
@@ -156,10 +163,10 @@ class TestMCPToolGetContext:
         from know.context_engine import ContextEngine
         engine = ContextEngine(config)
         result = engine.build_context("authentication token", budget=8000)
-        # Should find auth-related code
-        code_names = [c.name for c in result["code_chunks"]]
-        code_files = [c.file_path for c in result["code_chunks"]]
-        # At least some results
+        if result.get("indexing_status") == "warming":
+            assert result["code_chunks"] == []
+            assert result["used_tokens"] == 0
+            return
         assert len(result["code_chunks"]) > 0
 
 
@@ -167,6 +174,7 @@ class TestMCPToolSearchCode:
     """Test the search_code MCP tool."""
 
     def test_search_returns_results(self, tmp_project):
+        pytest.importorskip("numpy")
         root, config = tmp_project
         from know.semantic_search import SemanticSearcher
         searcher = SemanticSearcher(project_root=root)
@@ -174,6 +182,7 @@ class TestMCPToolSearchCode:
         assert isinstance(results, list)
 
     def test_search_results_have_scores(self, tmp_project):
+        pytest.importorskip("numpy")
         root, config = tmp_project
         from know.semantic_search import SemanticSearcher
         searcher = SemanticSearcher(project_root=root)
@@ -396,10 +405,14 @@ class TestPerformance:
 
         # Text fallback should be very fast for small projects
         assert elapsed < 2.0, f"Context build took {elapsed:.2f}s (expected <2s)"
-        assert result["used_tokens"] > 0
+        if result.get("indexing_status") == "warming":
+            assert result["used_tokens"] == 0
+        else:
+            assert result["used_tokens"] > 0
 
     def test_search_under_2s(self, tmp_project):
         """Search should be fast for small projects."""
+        pytest.importorskip("numpy")
         root, config = tmp_project
         from know.semantic_search import SemanticSearcher
 
@@ -627,16 +640,19 @@ class TestMCPConfig:
 # ---------------------------------------------------------------------------
 
 class TestVersion:
-    """Ensure version is bumped to 0.3.0."""
+    """Ensure package and pyproject versions stay in sync."""
 
-    def test_version_is_030(self):
+    def test_version_is_semver_like(self):
         from know import __version__
-        assert __version__ == "0.3.0"
+        parts = __version__.split(".")
+        assert len(parts) == 3
+        assert all(p.isdigit() for p in parts)
 
-    def test_pyproject_version_matches(self):
+    def test_pyproject_version_matches_package(self):
+        from know import __version__
         pyproject = Path(__file__).parent.parent / "pyproject.toml"
         content = pyproject.read_text()
-        assert 'version = "0.3.0"' in content
+        assert f'version = "{__version__}"' in content
 
 
 # ---------------------------------------------------------------------------

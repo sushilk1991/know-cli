@@ -19,19 +19,28 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 ## Non-Negotiable Defaults
 
 - Start with one call: `know workflow`.
-- Use machine mode for agents: `--json --quiet`.
+- Use `--json` for machine mode only when needed.
+- For agent execution, prefer `--json-compact` to avoid oversized payloads.
+- Use `--json-full` only for strict parser compatibility.
+- Use explicit mode for intent:
+  - `--mode explore` for fast discovery
+  - `--mode implement` for balanced coding
+  - `--mode thorough` for deep refactors
+- Keep a strict latency budget with `--max-latency-ms` to avoid long stalls.
 - Start with small budgets, then escalate.
 - Keep a stable session id (`--session auto` or a persisted session id) for dedup.
-- Use fallback ladder only when confidence is low.
+- Use fallback ladder only when confidence is low (<0.55) or deep target is missing.
 
 ## Use-Case Command Matrix
 
 | Use-case | Best first command | Why |
 |---|---|---|
 | Find likely edit file quickly | `know next-file "<query>" --json` | lowest-latency target hint |
-| Get actionable context for coding task | `know --json workflow "<query>" --session auto` | map + context + deep in one call |
+| Get actionable context for coding task | `know --json workflow "<query>" --mode implement --json-compact --session auto` | balanced quality + speed in one call |
+| Get strict full JSON for automation | `know --json workflow "<query>" --json-full --session auto` | stable full schema for scripts/MCP |
+| Fast exploration | `know --json workflow "<query>" --mode explore --max-latency-ms 2500 --json-compact --session auto` | fast target discovery without deep stall |
 | Understand one symbol deeply | `know deep "file.py:function_name" --budget 3000 --json` | callers/callees + focused body |
-| Broad exploration | `know map "<area>" --limit 30 --json` | cheap orientation before bigger context |
+| Broad exploration | `know map "<area>" --limit 30 --json --session auto` | cheap orientation before bigger context |
 | Dependency impact | `know graph <file_path>` then `know related <file_path> --json` | import/dependent blast radius |
 | Capture important decision | `know decide "<decision>" --why "<rationale>"` | structured long-lived memory |
 | Recover prior design choices | `know recall "<query>" --type decision --status active` | stable memory retrieval |
@@ -40,10 +49,19 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 
 ```bash
 know --json workflow "<task or bug description>" \
+  --mode implement \
+  --max-latency-ms 6000 \
+  --json-compact \
   --map-limit 20 \
   --context-budget 4000 \
   --deep-budget 3000 \
   --session auto
+```
+
+When strict machine parsing is required:
+
+```bash
+know --json workflow "<task or bug description>" --json-full --session auto
 ```
 
 Interpretation:
@@ -53,12 +71,13 @@ Interpretation:
 
 ## Fallback Ladder (Strict Order)
 
-1. `know map "<query>" --json --limit 30`
+1. `know map "<query>" --json --limit 30 --session auto`
 2. `know next-file "<query>" --json`
-3. `know context "<query>" --budget 4000 --session auto --json --quiet`
-4. `know deep "<symbol or file:symbol>" --budget 3000 --json`
-5. `know related <file_path> --json`
-6. `know graph <file_path>`
+3. `know --json workflow "<query>" --mode explore --max-latency-ms 2500 --json-compact --session auto`
+4. `know context "<query>" --budget 4000 --session auto --json`
+5. `know deep "<symbol or file:symbol>" --budget 3000 --json`
+6. `know related <file_path> --json`
+7. `know graph <file_path>`
 
 Budget escalation:
 - `4000 -> 6000 -> 8000` only if specific missing context remains.
@@ -68,7 +87,7 @@ Budget escalation:
 ### 1) Multi-file refactor
 
 ```bash
-know --json workflow "replace legacy auth adapter with service token provider" --session auto
+know --json workflow "replace legacy auth adapter with service token provider" --mode thorough --max-latency-ms 15000 --json-compact --session auto
 know related src/auth/adapter.py --json
 know graph src/auth/adapter.py
 ```
@@ -76,7 +95,7 @@ know graph src/auth/adapter.py
 ### 2) Production bug trace
 
 ```bash
-know --json workflow "500 on checkout after coupon apply" --session auto
+know --json workflow "500 on checkout after coupon apply" --mode implement --max-latency-ms 6000 --json-compact --session auto
 know deep "payments.py:apply_coupon" --budget 3000 --json
 know callers "apply_coupon" --json
 ```
@@ -122,6 +141,7 @@ Legacy commands remain supported (`know context`, `know deep`, `know map`, `know
 ## Background Automation Defaults
 
 - Daemon incremental refresh is enabled by default.
+- Use `know warm` after install/upgrade or when first-call latency is high.
 - Active workflow session is persisted at `.know/current_session`.
 - `know remember` and `know decide` auto-fill `session_id` from current session when available.
 - For very large repos, daemon auto-refresh may self-suspend; force-enable with:
@@ -152,8 +172,8 @@ If command surface seems missing:
 ## Context Commands (Direct Use)
 
 ```bash
-know context "<task>" --budget 4000 --session auto --json --quiet
-know context "<task>" --budget 8000 --session auto --json --quiet
+know context "<task>" --budget 4000 --session auto --json
+know context "<task>" --budget 8000 --session auto --json
 know map "<feature area>" --type function --json
 know deep "service.py:process_payment" --budget 3000 --json
 know graph src/auth/middleware.py
@@ -170,7 +190,7 @@ know search "token rotation" --json
 Examples:
 
 ```bash
-know --json workflow "fix task creation validation regression" --session auto
+know --json workflow "fix task creation validation regression" --mode implement --max-latency-ms 6000 --json-compact --session auto
 know ask "where is task creation validation"
 know decide "Validate task payload in service layer only" \
   --why "single source of truth" \

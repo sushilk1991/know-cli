@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
@@ -27,8 +28,6 @@ from know.token_counter import count_tokens
 
 
 RESULTS_DIR = Path(__file__).parent / "results"
-RESULTS_JSON = RESULTS_DIR / "dual_repo_parallel.json"
-RESULTS_MD = RESULTS_DIR / "DUAL_REPO_BENCHMARK.md"
 
 DEFAULT_REPOS = [
     Path("/Users/sushil/Code/Github/know-cli"),
@@ -40,6 +39,12 @@ COMMON_QUERIES = [
     "database schema and persistence layer",
     "module dependency graph and call graph tracking",
     "error handling and retry logic",
+    "workflow command availability and command registration",
+    "memory recall and decision capture flow",
+    "background daemon indexing and cache refresh behavior",
+    "api route validation and schema handling",
+    "session deduplication and token budget reuse",
+    "retry/backoff behavior in external service integrations",
 ]
 
 CODE_GLOBS = [
@@ -75,6 +80,38 @@ def run_cmd(cmd: List[str], cwd: Path, timeout: int = 90) -> CommandResult:
         timeout=timeout,
     )
     return CommandResult(result.returncode, result.stdout, result.stderr)
+
+
+def percentile(values: List[float], p: float) -> float:
+    """Compute percentile with linear interpolation."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = (len(ordered) - 1) * p
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    frac = rank - low
+    return float(ordered[low] * (1 - frac) + ordered[high] * frac)
+
+
+def stop_project_daemon(repo: Path) -> None:
+    """Best-effort: stop know daemon for repo to measure cold-start latency."""
+    try:
+        from know.daemon import pid_path
+
+        pf = pid_path(repo)
+        if not pf.exists():
+            return
+        pid = int(pf.read_text().strip())
+        os.kill(pid, 15)
+        for _ in range(80):
+            if not pf.exists():
+                return
+            time.sleep(0.05)
+    except Exception:
+        return
 
 
 def tokenize_query(query: str, max_terms: int = 4) -> List[str]:
@@ -125,6 +162,7 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
     ctx_tokens = int(ctx_data.get("used_tokens", 0) or 0)
     deep_tokens = int(deep_data.get("budget_used", deep_data.get("used_tokens", 0)) or 0)
     total_tokens = int(workflow_data.get("total_tokens", map_tokens + ctx_tokens + deep_tokens) or 0)
+    payload_bytes = len((workflow_raw.stdout or "").encode("utf-8"))
     elapsed = time.monotonic() - start
 
     tool_calls = 1
@@ -132,12 +170,22 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
         # Keep metric honest if workflow failed and caller retries manually in practice.
         tool_calls = 1
 
+    deep_error = deep_data.get("error") if isinstance(deep_data, dict) else None
+    fallback_triggered = bool(
+        workflow_data.get("error")
+        or map_data.get("error")
+        or ctx_data.get("error")
+        or deep_error
+    )
+
     return {
         "strategy": "know_single_daemon_workflow",
         "query": query,
         "tool_calls": tool_calls,
         "elapsed_s": round(elapsed, 3),
         "tokens": total_tokens,
+        "payload_bytes": payload_bytes,
+        "fallback_triggered": fallback_triggered,
         "map_tokens": map_tokens,
         "context_tokens": ctx_tokens,
         "deep_tokens": deep_tokens,
@@ -155,7 +203,7 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
             "workflow": workflow_data.get("error") if isinstance(workflow_data, dict) else "unknown",
             "map": map_data.get("error") if isinstance(map_data, dict) else None,
             "context": ctx_data.get("error") if isinstance(ctx_data, dict) else None,
-            "deep": deep_data.get("error") if isinstance(deep_data, dict) else None,
+            "deep": deep_error,
         },
     }
 
@@ -222,6 +270,14 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
             "summary": {},
         }
 
+    # Cold-start probe (daemon stopped) to quantify first-hit penalty.
+    cold_probe = None
+    try:
+        stop_project_daemon(repo)
+        cold_probe = run_know_agent(repo, queries[0])
+    except Exception:
+        cold_probe = None
+
     # Warm know index/cache so measured query latency is steady-state.
     _ = run_cmd(["know", "--json", "status"], cwd=repo, timeout=120)
 
@@ -271,19 +327,28 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
     grep_time = sum(q["grep"]["elapsed_s"] for q in query_rows)
     know_calls = sum(q["know"]["tool_calls"] for q in query_rows)
     grep_calls = sum(q["grep"]["tool_calls"] for q in query_rows)
+    know_payload_bytes = sum(q["know"].get("payload_bytes", 0) for q in query_rows)
+    fallback_count = sum(1 for q in query_rows if q["know"].get("fallback_triggered"))
     deep_rows = [q["know"]["call_graph"] for q in query_rows]
     deep_available = [d for d in deep_rows if d.get("available") is True]
     non_empty_deep = [
         d for d in deep_rows if (d.get("callers", 0) + d.get("callees", 0)) > 0
     ]
+    know_warm_latencies = [q["know"]["elapsed_s"] for q in query_rows]
 
     summary = {
         "know_tokens_total": know_tokens,
         "grep_tokens_total": grep_tokens,
+        "know_payload_bytes_total": know_payload_bytes,
         "know_time_total_s": round(know_time, 3),
         "grep_time_total_s": round(grep_time, 3),
+        "know_warm_p50_s": round(percentile(know_warm_latencies, 0.5), 3),
+        "know_warm_p95_s": round(percentile(know_warm_latencies, 0.95), 3),
+        "know_cold_start_s": round(float(cold_probe["elapsed_s"]), 3) if cold_probe else None,
         "know_tool_calls_total": know_calls,
         "grep_tool_calls_total": grep_calls,
+        "fallback_count": fallback_count,
+        "fallback_rate_pct": round((fallback_count / len(query_rows)) * 100, 1) if query_rows else 0.0,
         "token_reduction_pct": round(
             ((grep_tokens - know_tokens) / grep_tokens) * 100, 1
         ) if grep_tokens else None,
@@ -341,17 +406,27 @@ def render_markdown(data: Dict[str, Any]) -> str:
             f"Tool-call reduction: `{summary.get('tool_call_reduction_pct')}%`"
         )
         lines.append(
+            f"- Warm p50/p95: `{summary.get('know_warm_p50_s')}s / {summary.get('know_warm_p95_s')}s` | "
+            f"Cold start: `{summary.get('know_cold_start_s')}s` | "
+            f"Fallback rate: `{summary.get('fallback_rate_pct')}%`"
+        )
+        lines.append(
             f"- Deep call-graph available: `{summary.get('deep_call_graph_available_rate')}%` "
             f"| non-empty edges: `{summary.get('deep_non_empty_edges_rate')}%`"
         )
         lines.append("")
-        lines.append("| Query | Grep Tokens | know Tokens | Token Savings | Grep Time (s) | know Time (s) |")
-        lines.append("|---|---:|---:|---:|---:|---:|")
+        lines.append(
+            "| Query | Grep Tokens | know Tokens | Token Savings | Grep Time (s) | "
+            "know Time (s) | know Payload (bytes) | Fallback |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
         for row in repo_row["queries"]:
             delta = row["delta"]
             lines.append(
                 f"| {row['query']} | {row['grep']['tokens']:,} | {row['know']['tokens']:,} | "
-                f"{delta['token_savings_pct']}% | {row['grep']['elapsed_s']} | {row['know']['elapsed_s']} |"
+                f"{delta['token_savings_pct']}% | {row['grep']['elapsed_s']} | {row['know']['elapsed_s']} | "
+                f"{row['know'].get('payload_bytes', 0):,} | "
+                f"{'yes' if row['know'].get('fallback_triggered') else 'no'} |"
             )
         lines.append("")
 
@@ -370,14 +445,23 @@ def main():
         "--query",
         action="append",
         dest="queries",
-        help="Query to benchmark (repeatable). Defaults to 4 shared architecture queries.",
+        help="Query to benchmark (repeatable). Defaults to 10 shared architecture queries.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        dest="results_dir",
+        default=str(RESULTS_DIR),
+        help="Directory for benchmark artifacts (default: benchmark/results)",
     )
     args = parser.parse_args()
 
     repos = [Path(p).expanduser().resolve() for p in (args.repos or DEFAULT_REPOS)]
     queries = args.queries or COMMON_QUERIES
+    results_dir = Path(args.results_dir).expanduser().resolve()
+    results_json = results_dir / "dual_repo_parallel.json"
+    results_md = results_dir / "DUAL_REPO_BENCHMARK.md"
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.monotonic()
     repo_rows = [benchmark_repo(repo, queries) for repo in repos]
@@ -390,11 +474,11 @@ def main():
         "repos": repo_rows,
     }
 
-    RESULTS_JSON.write_text(json.dumps(out, indent=2))
-    RESULTS_MD.write_text(render_markdown(out))
+    results_json.write_text(json.dumps(out, indent=2))
+    results_md.write_text(render_markdown(out))
 
-    print(f"Saved JSON: {RESULTS_JSON}")
-    print(f"Saved report: {RESULTS_MD}")
+    print(f"Saved JSON: {results_json}")
+    print(f"Saved report: {results_md}")
     print(f"Total elapsed: {elapsed}s")
 
 

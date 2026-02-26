@@ -34,6 +34,7 @@ SOCKET_DIR = Path.home() / ".know" / "sockets"
 PID_DIR = Path.home() / ".know" / "pids"
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_CHUNK_BODY_CHARS = 5000
+DAEMON_API_VERSION = 2
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -634,6 +635,10 @@ class KnowDaemon:
         chunk_types = params.get("chunk_types")
         session_id = params.get("session_id")
         include_markdown = bool(params.get("include_markdown", False))
+        retrieval_profile = str(params.get("retrieval_profile", "balanced") or "balanced")
+        semantic_max_ms = params.get("semantic_max_ms")
+        if semantic_max_ms is not None:
+            semantic_max_ms = int(semantic_max_ms)
 
         from know.context_engine import ContextEngine
 
@@ -647,6 +652,8 @@ class KnowDaemon:
             exclude_patterns=exclude_patterns,
             chunk_types=chunk_types,
             session_id=session_id,
+            retrieval_profile=retrieval_profile,
+            semantic_max_ms=semantic_max_ms,
             db=self.db,
         )
 
@@ -691,17 +698,60 @@ class KnowDaemon:
 
     async def _handle_workflow(self, params: dict) -> dict:
         """Single-call workflow: map -> context -> deep in one daemon request."""
+        workflow_started = time.monotonic()
         query = params.get("query", "")
-        map_limit = int(params.get("map_limit", 20))
-        context_budget = int(params.get("context_budget", 4000))
-        deep_budget = int(params.get("deep_budget", 3000))
+        mode = str(params.get("mode", "implement") or "implement").strip().lower()
+        if mode not in {"explore", "implement", "thorough"}:
+            mode = "implement"
+        defaults = {
+            "explore": {
+                "map_limit": 30,
+                "context_budget": 3500,
+                "deep_budget": 0,
+                "retrieval_profile": "fast",
+                "max_latency_ms": 2500,
+            },
+            "implement": {
+                "map_limit": 20,
+                "context_budget": 4000,
+                "deep_budget": 3000,
+                "retrieval_profile": "balanced",
+                "max_latency_ms": 6000,
+            },
+            "thorough": {
+                "map_limit": 30,
+                "context_budget": 6000,
+                "deep_budget": 4500,
+                "retrieval_profile": "thorough",
+                "max_latency_ms": 15000,
+            },
+        }[mode]
+
+        map_limit = int(params.get("map_limit", defaults["map_limit"]))
+        context_budget = int(params.get("context_budget", defaults["context_budget"]))
+        deep_budget = int(params.get("deep_budget", defaults["deep_budget"]))
         include_tests = bool(params.get("include_tests", False))
         include_imports = bool(params.get("include_imports", True))
         include_patterns = params.get("include_patterns")
         exclude_patterns = params.get("exclude_patterns")
         chunk_types = params.get("chunk_types")
+        retrieval_profile = str(
+            params.get("retrieval_profile", defaults["retrieval_profile"]) or defaults["retrieval_profile"]
+        ).strip().lower()
+        max_latency_ms = params.get("max_latency_ms", defaults["max_latency_ms"])
+        max_latency_ms = int(max_latency_ms) if max_latency_ms is not None else 0
+        if max_latency_ms <= 0:
+            max_latency_ms = 0
         session_id = params.get("session_id")
         explicit_deep_name = params.get("deep_name")
+
+        deadline = workflow_started + (max_latency_ms / 1000.0) if max_latency_ms > 0 else None
+
+        def _remaining_ms() -> int:
+            if deadline is None:
+                return 10**9
+            return max(0, int((deadline - time.monotonic()) * 1000))
+
         if not session_id:
             try:
                 session_id = self.db.create_session()
@@ -715,19 +765,50 @@ class KnowDaemon:
             except Exception as e:
                 logger.debug(f"Failed to persist daemon session id: {e}")
 
+        map_t0 = time.monotonic()
         map_results = self.db.search_signatures(query, map_limit)
+        map_elapsed_ms = int((time.monotonic() - map_t0) * 1000)
 
-        context_payload = await self._handle_context({
-            "query": query,
-            "budget": context_budget,
-            "include_tests": include_tests,
-            "include_imports": include_imports,
-            "include_patterns": include_patterns,
-            "exclude_patterns": exclude_patterns,
-            "chunk_types": chunk_types,
-            "session_id": session_id,
-            "include_markdown": False,
-        })
+        context_t0 = time.monotonic()
+        if _remaining_ms() <= 120:
+            context_payload = {
+                "query": query,
+                "budget": context_budget,
+                "used_tokens": 0,
+                "budget_utilization": "0 / 0 (0%)",
+                "indexing_status": "complete",
+                "confidence": 0,
+                "warnings": [
+                    f"workflow latency budget exhausted before context (max_latency_ms={max_latency_ms})",
+                ],
+                "code": [],
+                "dependencies": [],
+                "tests": [],
+                "summaries": [],
+                "overview": "",
+                "source_files": [],
+                "error": "skipped_latency_budget",
+            }
+        else:
+            semantic_max_ms = params.get("semantic_max_ms")
+            if semantic_max_ms is None and deadline is not None:
+                semantic_max_ms = max(200, int(_remaining_ms() * 0.75))
+            if semantic_max_ms is not None:
+                semantic_max_ms = int(semantic_max_ms)
+            context_payload = await self._handle_context({
+                "query": query,
+                "budget": context_budget,
+                "include_tests": include_tests,
+                "include_imports": include_imports,
+                "include_patterns": include_patterns,
+                "exclude_patterns": exclude_patterns,
+                "chunk_types": chunk_types,
+                "session_id": session_id,
+                "include_markdown": False,
+                "retrieval_profile": retrieval_profile,
+                "semantic_max_ms": semantic_max_ms,
+            })
+        context_elapsed_ms = int((time.monotonic() - context_t0) * 1000)
 
         selected_target = explicit_deep_name
         selected_file = None
@@ -736,8 +817,19 @@ class KnowDaemon:
             if picked:
                 selected_target, selected_file = picked
 
+        deep_t0 = time.monotonic()
         deep_result: Dict[str, Any]
-        if selected_target:
+        if mode == "explore" or deep_budget <= 0:
+            deep_result = {
+                "error": "skipped_by_mode",
+                "reason": f"mode_{mode}",
+            }
+        elif _remaining_ms() <= 150:
+            deep_result = {
+                "error": "skipped_latency_budget",
+                "reason": f"max_latency_ms={max_latency_ms}",
+            }
+        elif selected_target:
             from know.context_engine import ContextEngine
             engine = ContextEngine(self.config)
             deep_query = selected_target
@@ -762,6 +854,7 @@ class KnowDaemon:
                 )
         else:
             deep_result = {"error": "no_target", "reason": "no_context_or_map_target"}
+        deep_elapsed_ms = int((time.monotonic() - deep_t0) * 1000)
 
         from know.token_counter import count_tokens
 
@@ -781,10 +874,18 @@ class KnowDaemon:
             + int(context_payload.get("used_tokens", 0) or 0)
             + int(deep_result.get("budget_used", deep_result.get("used_tokens", 0)) or 0)
         )
+        total_elapsed_ms = int((time.monotonic() - workflow_started) * 1000)
+        degraded_by_latency = bool(
+            context_payload.get("error") == "skipped_latency_budget"
+            or deep_result.get("error") == "skipped_latency_budget"
+        )
 
         payload = {
             "query": query,
             "session_id": session_id,
+            "daemon_api_version": DAEMON_API_VERSION,
+            "workflow_mode": mode,
+            "latency_budget_ms": max_latency_ms,
             "budgets": {
                 "map_limit": map_limit,
                 "context_budget": context_budget,
@@ -800,6 +901,13 @@ class KnowDaemon:
             "context": context_payload,
             "deep": deep_result,
             "total_tokens": total_tokens,
+            "latency_ms": {
+                "map": map_elapsed_ms,
+                "context": context_elapsed_ms,
+                "deep": deep_elapsed_ms,
+                "total": total_elapsed_ms,
+            },
+            "degraded_by_latency": degraded_by_latency,
         }
 
         # Persist high-signal decision memory for future sessions.
@@ -939,6 +1047,7 @@ class KnowDaemon:
         stats = self.db.get_stats()
         return {
             "running": True,
+            "daemon_api_version": DAEMON_API_VERSION,
             "project": str(self.root),
             "uptime": time.time() - self._started_at,
             "stats": stats,

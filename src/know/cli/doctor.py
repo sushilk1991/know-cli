@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import shutil as _shutil
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -79,11 +80,23 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
             "python": sys.version.split()[0],
             "python_executable": sys.executable,
             "know_executable": sys.argv[0],
+            "know_command": _shutil.which("know") or "",
+            "know_module_file": "",
+            "know_version": "",
             "workflow_command_available": bool(
                 getattr(ctx.find_root().command, "commands", {}).get("workflow")
             ),
         },
+        "repair_command": "python -m pip uninstall -y know know-cli && python -m pip install -U know-cli",
     }
+
+    try:
+        import know
+
+        report["environment"]["know_module_file"] = str(getattr(know, "__file__", "") or "")
+        report["environment"]["know_version"] = str(getattr(know, "__version__", "") or "")
+    except Exception:
+        pass
 
     report["checks"]["fastembed_cache"] = {
         "path": str(cache_root),

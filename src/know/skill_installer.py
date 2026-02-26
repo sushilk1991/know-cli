@@ -39,6 +39,17 @@ def _load_skill_template() -> Tuple[Optional[str], Optional[Path]]:
     return None, None
 
 
+def _is_managed_know_skill(text: str) -> bool:
+    """Heuristic: detect skill files managed by know-cli bootstrap."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        "name: know-cli" in lowered
+        and "know-cli skill" in lowered
+    )
+
+
 def skill_target_paths(home: Optional[Path] = None) -> Dict[str, Path]:
     """Return default target skill file paths for common coding agents."""
     home_dir = _normalize_home(home)
@@ -90,9 +101,21 @@ def install_skill_file(
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if target_path.exists() and not force:
                 current = target_path.read_text(encoding="utf-8")
-                reason = "already_current" if current == template_text else "exists"
+                if current == template_text:
+                    result["skipped"].append(
+                        {"target": target_name, "path": str(target_path), "reason": "already_current"}
+                    )
+                    continue
+
+                if _is_managed_know_skill(current):
+                    target_path.write_text(template_text, encoding="utf-8")
+                    result["installed"].append(
+                        {"target": target_name, "path": str(target_path), "action": "updated"}
+                    )
+                    continue
+
                 result["skipped"].append(
-                    {"target": target_name, "path": str(target_path), "reason": reason}
+                    {"target": target_name, "path": str(target_path), "reason": "exists"}
                 )
                 continue
 

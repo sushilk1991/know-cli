@@ -23,6 +23,7 @@ class KnowCLIGroup(click.Group):
     SIMPLE_COMMANDS = (
         "init",
         "workflow",
+        "warm",
         "ask",
         "recall",
         "decide",
@@ -171,7 +172,7 @@ from know.cli.stats import stats, status
 from know.cli.hooks import hooks
 from know.cli.mcp import mcp
 from know.cli.agent import (
-    next_file, signatures, related, generate_context, callers, callees, map_cmd, workflow, deep,
+    next_file, signatures, related, generate_context, callers, callees, map_cmd, workflow, warm, deep,
 )
 from know.cli.diff import diff
 from know.cli.doctor import doctor
@@ -410,6 +411,7 @@ cli.add_command(callers)
 cli.add_command(callees)
 cli.add_command(map_cmd)
 cli.add_command(workflow)
+cli.add_command(warm)
 cli.add_command(deep)
 cli.add_command(diff)
 cli.add_command(docs)

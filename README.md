@@ -30,22 +30,22 @@ Session dedup means the second query never re-sends code from the first.
 
 ## Benchmarks
 
-### Dual-Repo Parallel Benchmark (v0.8.0, February 22, 2026)
+### Dual-Repo Parallel Benchmark (v0.8.7, February 26, 2026)
 
 Method:
 - Ran in parallel per query: `grep+read` baseline vs `know workflow` (single daemon RPC).
-- 4 shared architecture questions, on both repos.
+- 10 shared architecture questions, on both repos.
 - File coverage in baseline search: `py, ts, tsx, js, jsx, go, rs, swift`.
 - Includes one warm-up workflow call per repo before measured queries (steady-state).
 
-| Repo | Grep Tokens (4 queries) | know Tokens (4 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
+| Repo | Grep Tokens (10 queries) | know Tokens (10 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `know-cli` | 235,329 | 15,295 | **93.5%** | 0.265s | 0.479s | 1.81x | 64 -> 4 |
-| `farfield` | 284,293 | 13,995 | **95.1%** | 0.458s | 0.788s | 1.72x | 64 -> 4 |
+| `know-cli` | 670,957 | 48,687 | **92.7%** | 0.803s | 1.901s | 2.37x | 160 -> 10 |
+| `farfield` | 817,029 | 38,064 | **95.3%** | 1.702s | 2.873s | 1.69x | 160 -> 10 |
 
 Deep call-graph quality snapshot from the same run:
 - `know-cli`: call-graph available in 100% of deep queries, non-empty edges in 100%.
-- `farfield`: call-graph available in 100%, non-empty edges in 25% (major remaining gap).
+- `farfield`: call-graph available in 90%, non-empty edges in 70%.
 
 Artifacts:
 - `benchmark/results/dual_repo_parallel.json`
@@ -67,6 +67,7 @@ Artifacts:
 pip install know-cli
 cd your-project
 know init
+know warm
 ```
 
 ### Agent Skill Bootstrap (Codex, Claude, Gemini)
@@ -101,7 +102,7 @@ Disable auto-install if you manage skills manually:
 KNOW_AUTO_INSTALL_SKILL=0 know --version
 ```
 
-### What's New in 0.8.0
+### What's New in 0.8.7
 
 - New `know workflow "query"` command: single-call daemon workflow (`map -> context -> deep`).
 - `know context` now uses daemon-first full v3 context assembly (same ranking/budget pipeline as local fallback).
@@ -117,17 +118,31 @@ KNOW_AUTO_INSTALL_SKILL=0 know --version
 
 ```bash
 know --json workflow "billing subscription limits" \
+  --json-compact \
+  --mode implement \
+  --max-latency-ms 6000 \
   --map-limit 20 \
   --context-budget 4000 \
   --deep-budget 3000 \
   --session auto
 ```
 
+JSON profile behavior:
+- `--json` on an interactive terminal returns compact JSON.
+- `--json` in non-interactive/piped mode returns full JSON (backward-compatible).
+- Override explicitly with `--json-compact` or `--json-full`.
+
+Workflow mode behavior:
+- `--mode explore`: fastest path (`map + context`), deep step skipped.
+- `--mode implement`: balanced quality/speed for normal coding tasks.
+- `--mode thorough`: larger budgets + deeper analysis.
+- `--max-latency-ms`: hard latency guard; workflow degrades gracefully instead of stalling.
+
 ### The 3-Tier Workflow
 
 ```bash
 # 1. Orient — what functions exist for "billing"?
-know map "billing"
+know map "billing" --session auto
 
 # 2. Investigate — get ranked code bodies (with session tracking)
 know --json context "billing subscription" --budget 4000 --session auto
@@ -165,10 +180,17 @@ Use `know commands --all` to list them.
 
 ```bash
 know workflow "billing subscription limits"
-know --json workflow "auth token validation" --context-budget 5000 --deep-budget 2500
+know --json workflow "auth token validation" --json-compact --context-budget 5000 --deep-budget 2500
+know --json workflow "auth token validation" --mode explore --max-latency-ms 2500 --json-compact
 ```
 
 Runs `map -> context -> deep` in a single daemon request to cut tool-call overhead for coding agents.
+The response now includes `workflow_mode`, `latency_budget_ms`, stage timings (`latency_ms`) and whether it degraded due to latency.
+
+Recommended by task type:
+- Exploration / architecture: `know --json workflow "<query>" --mode explore --json-compact`
+- Implementation task: `know --json workflow "<query>" --mode implement --json-compact`
+- Complex refactor: `know --json workflow "<query>" --mode thorough --max-latency-ms 15000 --json-compact`
 
 ### Docs Update Policy (Local-First)
 
@@ -179,6 +201,7 @@ Runs `map -> context -> deep` in a single daemon request to cut tool-call overhe
 ### Background Auto-Fill (No Extra Flags)
 
 - Daemon now performs incremental background refresh of changed/deleted files (no manual full reindex loop needed for normal edits).
+- `know warm` starts daemon and reports index readiness (`warming` vs `complete`) without request-thread full indexing.
 - Workflow sessions are persisted to `.know/current_session`.
 - `know remember` and `know decide` auto-fill `session_id` from the active session when not provided.
 - Reliability fallback: `know doctor --repair --reindex` repairs embedding cache issues and rebuilds chunk index.
@@ -245,6 +268,7 @@ If `session_id` is omitted, `remember/decide` auto-bind to `.know/current_sessio
 | `know done <id>` | Shortcut for `know memories resolve <id> --status resolved` |
 | `know commands --all` | Show advanced and legacy commands |
 | `know workflow "query"` | Single-call daemon workflow (map + context + deep) |
+| `know warm` | Start daemon + check warmup/index readiness |
 | `know map "query"` | Lightweight signature search |
 | `know context "query"` | Smart, budgeted code context |
 | `know deep "name"` | Function + callers + callees |
@@ -281,9 +305,18 @@ This is the canonical path for Codex/Claude/Gemini memory portability.
 | Flag | Description |
 |------|-------------|
 | `--json` | Machine-readable JSON output |
+| `--json-compact` | Compact workflow JSON profile (`workflow` command) |
+| `--json-full` | Full workflow JSON profile (`workflow` command, strict schema compatibility) |
 | `--quiet` | Minimal output |
 | `--verbose` | Detailed output |
 | `--time` | Show execution time |
+
+### Workflow Flags
+
+| Flag | Description |
+|------|-------------|
+| `--mode explore|implement|thorough` | Choose speed-vs-depth workflow profile |
+| `--max-latency-ms N` | End-to-end budget; workflow skips expensive steps when needed |
 
 ---
 
@@ -379,7 +412,9 @@ Reliable publish flow (idempotent, verifies version availability, builds, checks
 Notes:
 - Requires `PYPI_API_TOKEN` (or `TWINE_PASSWORD`) in environment.
 - GitHub Action `.github/workflows/publish-pypi.yml` supports manual dispatch and `v*` tags.
-- Release script runs a CLI compatibility smoke test before upload (`workflow/context/deep` command checks).
+- Release script runs benchmark and CLI compatibility gates before upload (use `SKIP_BENCHMARK_GATE=1` only for emergency/manual override).
+- Run `know doctor --json` before publish to validate command resolution and environment.
+- A previous failed publish run ([#22278266805](https://github.com/sushilk1991/know-cli/actions/runs/22278266805)) failed because `PYPI_API_TOKEN` was missing in Actions secrets.
 
 ## Troubleshooting
 
@@ -398,6 +433,8 @@ If the command path/version is wrong, reinstall in the active environment:
 python -m pip uninstall -y know know-cli
 python -m pip install -U know-cli
 ```
+
+`know` is the only supported command name.
 
 ---
 

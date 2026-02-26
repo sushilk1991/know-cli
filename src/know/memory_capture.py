@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Optional
 
 from know.logger import get_logger
 
 logger = get_logger()
+AUTO_WORKFLOW_DECISION_TTL_HOURS = 24 * 30  # 30 days
 
 
 def capture_workflow_decision(
@@ -53,6 +55,14 @@ def capture_workflow_decision(
         from know.knowledge_base import KnowledgeBase
 
         kb = KnowledgeBase(config)
+        # Explicit dedup check avoids duplicate auto-memories when workflow is
+        # retried with the same resolved target.
+        active = kb.list_all(source=source, memory_type="decision", decision_status="active")
+        for mem in active:
+            if mem.text == text:
+                return mem.id
+
+        expires_at = time.time() + (AUTO_WORKFLOW_DECISION_TTL_HOURS * 3600)
         return kb.remember(
             text=text,
             source=source,
@@ -64,6 +74,7 @@ def capture_workflow_decision(
             session_id=session_id or workflow_result.get("session_id", "") or "",
             agent=agent,
             trust_level="local_verified",
+            expires_at=expires_at,
         )
     except Exception as e:
         logger.debug(f"Workflow decision capture skipped: {e}")

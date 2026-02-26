@@ -2,9 +2,11 @@
 
 import json
 import os
+import sys
 from typing import Optional
 
 import click
+from click.core import ParameterSource
 
 from know.cli import console, logger
 
@@ -97,6 +99,112 @@ def _pick_deep_target_from_context_payload(context_payload: dict, map_results: l
     return None, None
 
 
+def _stdout_is_tty() -> bool:
+    """Return whether stdout is a TTY."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _build_workflow_compact_payload(result: dict) -> dict:
+    """Build a compact, human-readable JSON payload for workflow output."""
+    map_payload = result.get("map") or {}
+    context_payload = result.get("context") or {}
+    deep_payload = result.get("deep") or {}
+
+    map_rows = map_payload.get("results") or []
+    candidates = []
+    for row in map_rows[:5]:
+        candidates.append(
+            {
+                "file": row.get("file_path"),
+                "symbol": row.get("chunk_name") or row.get("signature"),
+                "type": row.get("chunk_type"),
+                "line": row.get("start_line"),
+                "score": row.get("score"),
+            }
+        )
+
+    snippets = []
+    for chunk in (context_payload.get("code") or [])[:5]:
+        body = str(chunk.get("body") or "")
+        body_lines = [ln.rstrip() for ln in body.splitlines()[:6]]
+        snippets.append(
+            {
+                "file": chunk.get("file"),
+                "symbol": chunk.get("name"),
+                "type": chunk.get("type"),
+                "lines": chunk.get("lines"),
+                "snippet": "\n".join(body_lines),
+            }
+        )
+
+    deep_target = deep_payload.get("target") or {}
+    selected_symbol = result.get("selected_deep_target") or deep_target.get("name")
+    selected_file = deep_target.get("file")
+    if not selected_file and candidates:
+        selected_file = candidates[0].get("file")
+
+    reason = "top-ranked context target"
+    if deep_payload.get("error"):
+        reason = f"deep_error:{deep_payload.get('error')}"
+    next_step = "proceed_with_targeted_edit"
+    if deep_payload.get("error") == "no_target":
+        next_step = "run: know map \"<query>\" --json --limit 30"
+    elif deep_payload.get("error") == "skipped_by_mode":
+        next_step = "run: know --json workflow \"<query>\" --mode implement --session auto"
+    elif deep_payload.get("error") == "skipped_latency_budget":
+        next_step = "rerun with: --max-latency-ms 12000 or --mode thorough"
+    elif deep_payload.get("error") == "ambiguous":
+        next_step = "run: know deep \"file.py:symbol\" --json --budget 3000"
+    elif deep_payload.get("error"):
+        next_step = "run: know related <file_path> --json"
+
+    return {
+        "query": result.get("query"),
+        "session_id": result.get("session_id"),
+        "indexing_status": context_payload.get("indexing_status", "unknown"),
+        "targets": {
+            "selected_symbol": selected_symbol,
+            "selected_file": selected_file,
+            "reason": reason,
+            "next_step": next_step,
+            "candidates": candidates,
+        },
+        "context": {
+            "snippets": snippets,
+            "warnings": context_payload.get("warnings") or [],
+        },
+        "deep": {
+            "target": {
+                "name": deep_target.get("name"),
+                "file": deep_target.get("file"),
+                "line_start": deep_target.get("line_start"),
+                "line_end": deep_target.get("line_end"),
+            },
+            "callers": len(deep_payload.get("callers") or []),
+            "callees": len(deep_payload.get("callees") or []),
+            "call_graph_available": deep_payload.get("call_graph_available"),
+            "call_graph_reason": deep_payload.get("call_graph_reason"),
+            "error": deep_payload.get("error"),
+        },
+        "metrics": {
+            "profile": "compact",
+            "mode": result.get("workflow_mode", "implement"),
+            "latency_budget_ms": result.get("latency_budget_ms"),
+            "latency_ms": result.get("latency_ms", {}),
+            "degraded_by_latency": result.get("degraded_by_latency", False),
+            "map_results": map_payload.get("count", 0),
+            "context_tokens": context_payload.get("used_tokens", 0),
+            "deep_tokens": deep_payload.get(
+                "budget_used", deep_payload.get("used_tokens", 0),
+            ),
+            "total_tokens": result.get("total_tokens"),
+        },
+    }
+
+
 @click.command("next-file")
 @click.argument("query")
 @click.option("--exclude", "-x", multiple=True, help="Files to exclude")
@@ -139,17 +247,21 @@ def next_file(ctx: click.Context, query: str, exclude: tuple, budget: int) -> No
 
     ranked_files = [fp for fp, _ in sorted(file_best.items(), key=lambda kv: kv[1], reverse=True)]
 
+    is_json = bool(ctx.obj.get("json"))
+    is_quiet = bool(ctx.obj.get("quiet"))
+
     # Filter excluded files and find best match
     seen_files = set(exclude)
     for fp in ranked_files:
         if fp not in seen_files:
-            output = ctx.obj.get("output_format", "rich")
-            if output == "json":
-                console.print(_json.dumps({
+            if is_json:
+                click.echo(_json.dumps({
                     "file": fp,
                     "relevance": file_best.get(fp, 0.0),
                     "intent": intent,
                 }))
+            elif is_quiet:
+                click.echo(fp)
             else:
                 console.print(fp)
             return
@@ -182,9 +294,9 @@ def signatures(ctx: click.Context, file_path: Optional[str]) -> None:
         sigs = db.get_signatures(file_path)
         db.close()
 
-    output = ctx.obj.get("output_format", "rich")
-    if output == "json":
-        console.print(_json.dumps(sigs))
+    is_json = bool(ctx.obj.get("json"))
+    if is_json:
+        click.echo(_json.dumps(sigs))
     else:
         for s in sigs:
             console.print(f"[cyan]{s['file_path']}[/cyan]:{s['start_line']} "
@@ -258,9 +370,9 @@ def related(ctx: click.Context, file_path: str) -> None:
     except Exception as e:
         logger.debug(f"Language-agnostic related lookup failed: {e}")
 
-    output = ctx.obj.get("output_format", "rich")
-    if output == "json":
-        console.print(_json.dumps({"imports": imports, "imported_by": imported_by}))
+    is_json = bool(ctx.obj.get("json"))
+    if is_json:
+        click.echo(_json.dumps({"imports": imports, "imported_by": imported_by}))
     else:
         if imports:
             console.print("[bold]Imports (dependencies):[/bold]")
@@ -303,9 +415,9 @@ def callers(ctx: click.Context, function_name: str) -> None:
         results = db.get_callers(function_name)
         db.close()
 
-    output = ctx.obj.get("output_format", "rich")
-    if output == "json":
-        console.print(_json.dumps({"callers": results, "count": len(results)}))
+    is_json = bool(ctx.obj.get("json"))
+    if is_json:
+        click.echo(_json.dumps({"callers": results, "count": len(results)}))
     else:
         if results:
             console.print(f"[bold]Callers of [cyan]{function_name}[/cyan]:[/bold]")
@@ -341,9 +453,9 @@ def callees(ctx: click.Context, chunk_name: str) -> None:
         results = db.get_callees(chunk_name)
         db.close()
 
-    output = ctx.obj.get("output_format", "rich")
-    if output == "json":
-        console.print(_json.dumps({"callees": results, "count": len(results)}))
+    is_json = bool(ctx.obj.get("json"))
+    if is_json:
+        click.echo(_json.dumps({"callees": results, "count": len(results)}))
     else:
         if results:
             console.print(f"[bold]Functions called by [cyan]{chunk_name}[/cyan]:[/bold]")
@@ -428,8 +540,15 @@ def generate_context(ctx: click.Context, budget: int) -> None:
 @click.option("--limit", "-k", type=int, default=20, help="Max results (default 20)")
 @click.option("--type", "chunk_type", type=click.Choice(["function", "class", "module", "method"]),
               default=None, help="Filter by chunk type")
+@click.option("--session", "session_id", default=None, help="Session ID (accepted for workflow compatibility)")
 @click.pass_context
-def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str]) -> None:
+def map_cmd(
+    ctx: click.Context,
+    query: str,
+    limit: int,
+    chunk_type: Optional[str],
+    session_id: Optional[str],
+) -> None:
     """Lightweight signature search — orient before reading.
 
     Returns function/class signatures matching a query with no bodies.
@@ -448,7 +567,10 @@ def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str
     if client:
         try:
             result = client.call_sync("map", {
-                "query": query, "limit": limit, "chunk_type": chunk_type,
+                "query": query,
+                "limit": limit,
+                "chunk_type": chunk_type,
+                "session_id": session_id,
             })
             results = result.get("results", [])
         except Exception as e:
@@ -464,6 +586,7 @@ def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str
     if is_json:
         click.echo(_json.dumps({
             "query": query,
+            "session_id": session_id,
             "results": results,
             "count": len(results),
             "truncated": len(results) >= limit,
@@ -490,6 +613,21 @@ def map_cmd(ctx: click.Context, query: str, limit: int, chunk_type: Optional[str
 @click.option("--deep-budget", type=int, default=3000, help="Deep budget (default 3000)")
 @click.option("--session", "session_id", default="auto", help="Session ID for dedup ('auto' generates)")
 @click.option("--include-tests", is_flag=True, help="Include test files")
+@click.option(
+    "--mode",
+    type=click.Choice(["explore", "implement", "thorough"]),
+    default="implement",
+    show_default=True,
+    help="Workflow mode: explore(fast), implement(balanced), thorough(deep).",
+)
+@click.option(
+    "--max-latency-ms",
+    type=int,
+    default=None,
+    help="End-to-end latency budget; workflow degrades gracefully when exceeded.",
+)
+@click.option("--json-compact", is_flag=True, help="Compact JSON profile (human-readable)")
+@click.option("--json-full", is_flag=True, help="Full JSON profile (backward-compatible)")
 @click.pass_context
 def workflow(
     ctx: click.Context,
@@ -499,14 +637,43 @@ def workflow(
     deep_budget: int,
     session_id: Optional[str],
     include_tests: bool,
+    mode: str,
+    max_latency_ms: Optional[int],
+    json_compact: bool,
+    json_full: bool,
 ) -> None:
     """Single-call daemon workflow: map -> context -> deep."""
     import uuid
+    import time
 
     config = ctx.obj.get("config")
     if not config:
         console.print("[red]Not initialized. Run: know init[/red]")
         return
+
+    if json_compact and json_full:
+        raise click.UsageError("--json-compact and --json-full are mutually exclusive")
+
+    is_json = bool(ctx.obj.get("json"))
+    if (json_compact or json_full) and not is_json:
+        raise click.UsageError("JSON profile flags require global --json")
+
+    mode_defaults = {
+        "explore": {"map_limit": 30, "context_budget": 3500, "deep_budget": 0, "max_latency_ms": 2500},
+        "implement": {"map_limit": 20, "context_budget": 4000, "deep_budget": 3000, "max_latency_ms": 6000},
+        "thorough": {"map_limit": 30, "context_budget": 6000, "deep_budget": 4500, "max_latency_ms": 15000},
+    }[mode]
+    # Respect explicit CLI values; only override defaults by mode when user did not set them.
+    if ctx.get_parameter_source("map_limit") == ParameterSource.DEFAULT:
+        map_limit = mode_defaults["map_limit"]
+    if ctx.get_parameter_source("context_budget") == ParameterSource.DEFAULT:
+        context_budget = mode_defaults["context_budget"]
+    if ctx.get_parameter_source("deep_budget") == ParameterSource.DEFAULT:
+        deep_budget = mode_defaults["deep_budget"]
+    if ctx.get_parameter_source("max_latency_ms") == ParameterSource.DEFAULT:
+        max_latency_ms = mode_defaults["max_latency_ms"]
+    if max_latency_ms is not None and int(max_latency_ms) <= 0:
+        max_latency_ms = None
 
     resolved_session_id = session_id
     if session_id in ("auto", "new"):
@@ -519,6 +686,8 @@ def workflow(
             logger.debug(f"Failed to persist active session id: {e}")
 
     result = None
+    workflow_started = time.monotonic()
+    workflow_from_daemon = False
     client = _get_daemon_client(config)
     if client:
         try:
@@ -529,7 +698,17 @@ def workflow(
                 "deep_budget": deep_budget,
                 "session_id": resolved_session_id,
                 "include_tests": include_tests,
+                "mode": mode,
+                "max_latency_ms": max_latency_ms,
             })
+            # Guard mixed-version upgrades: stale daemon may not support
+            # workflow mode/SLA fields. Fall back to local workflow when missing.
+            if isinstance(result, dict) and "workflow_mode" in result and "latency_ms" in result:
+                workflow_from_daemon = True
+            else:
+                logger.debug("Daemon workflow response missing mode/SLA fields; using local workflow fallback")
+                result = None
+                workflow_from_daemon = False
         except Exception as e:
             logger.debug(f"Daemon workflow failed, falling back: {e}")
             client = None
@@ -540,34 +719,87 @@ def workflow(
         engine = ContextEngine(config)
         db = _get_db_fallback(config)
         try:
-            map_results = db.search_signatures(query, map_limit)
-            context_result = engine.build_context(
-                query,
-                budget=context_budget,
-                include_tests=include_tests,
-                include_imports=True,
-                session_id=resolved_session_id,
-                db=db,
+            deadline = (
+                workflow_started + (int(max_latency_ms) / 1000.0)
+                if max_latency_ms is not None and int(max_latency_ms) > 0
+                else None
             )
 
-            # Memory injection parity with context command.
-            try:
-                from know.knowledge_base import KnowledgeBase
-                kb = KnowledgeBase(config)
-                memory_ctx = kb.get_relevant_context(
-                    query, max_tokens=min(500, context_budget // 10),
-                )
-                if memory_ctx:
-                    context_result["memories_context"] = memory_ctx
-            except Exception as e:
-                logger.debug(f"Workflow memory injection failed: {e}")
+            def _remaining_ms() -> int:
+                if deadline is None:
+                    return 10**9
+                return max(0, int((deadline - time.monotonic()) * 1000))
 
-            context_payload = json.loads(engine.format_agent_json(context_result))
+            map_t0 = time.monotonic()
+            map_results = db.search_signatures(query, map_limit)
+            map_elapsed_ms = int((time.monotonic() - map_t0) * 1000)
+
+            context_t0 = time.monotonic()
+            if _remaining_ms() <= 120:
+                context_payload = {
+                    "query": query,
+                    "budget": context_budget,
+                    "used_tokens": 0,
+                    "budget_utilization": "0 / 0 (0%)",
+                    "indexing_status": "complete",
+                    "confidence": 0,
+                    "warnings": [
+                        f"workflow latency budget exhausted before context (max_latency_ms={max_latency_ms})",
+                    ],
+                    "code": [],
+                    "dependencies": [],
+                    "tests": [],
+                    "summaries": [],
+                    "overview": "",
+                    "source_files": [],
+                    "error": "skipped_latency_budget",
+                }
+            else:
+                semantic_budget_ms = (
+                    max(200, int(_remaining_ms() * 0.75))
+                    if deadline is not None
+                    else None
+                )
+                context_result = engine.build_context(
+                    query,
+                    budget=context_budget,
+                    include_tests=include_tests,
+                    include_imports=True,
+                    session_id=resolved_session_id,
+                    retrieval_profile=(
+                        "fast"
+                        if mode == "explore"
+                        else ("thorough" if mode == "thorough" else "balanced")
+                    ),
+                    semantic_max_ms=semantic_budget_ms,
+                    db=db,
+                )
+
+                # Memory injection parity with context command.
+                try:
+                    from know.knowledge_base import KnowledgeBase
+                    kb = KnowledgeBase(config)
+                    memory_ctx = kb.get_relevant_context(
+                        query, max_tokens=min(500, context_budget // 10),
+                    )
+                    if memory_ctx:
+                        context_result["memories_context"] = memory_ctx
+                except Exception as e:
+                    logger.debug(f"Workflow memory injection failed: {e}")
+
+                context_payload = json.loads(engine.format_agent_json(context_result))
+            context_elapsed_ms = int((time.monotonic() - context_t0) * 1000)
+
             target_name, target_file = _pick_deep_target_from_context_payload(
                 context_payload, map_results,
             )
 
-            if target_name:
+            deep_t0 = time.monotonic()
+            if mode == "explore" or deep_budget <= 0:
+                deep_result = {"error": "skipped_by_mode", "reason": f"mode_{mode}"}
+            elif _remaining_ms() <= 150:
+                deep_result = {"error": "skipped_latency_budget", "reason": f"max_latency_ms={max_latency_ms}"}
+            elif target_name:
                 deep_query = f"{target_file}:{target_name}" if target_file else target_name
                 deep_result = engine.build_deep_context(
                     deep_query,
@@ -586,10 +818,31 @@ def workflow(
                     )
             else:
                 deep_result = {"error": "no_target", "reason": "no_context_or_map_target"}
+            deep_elapsed_ms = int((time.monotonic() - deep_t0) * 1000)
+            total_elapsed_ms = int((time.monotonic() - workflow_started) * 1000)
+            from know.token_counter import count_tokens
+
+            map_text = "\n".join(
+                filter(
+                    None,
+                    [
+                        f"{r.get('signature', '')}\n{r.get('docstring', '')}".strip()
+                        for r in map_results
+                    ],
+                )
+            )
+            map_tokens = count_tokens(map_text) if map_text else 0
+            total_tokens = (
+                map_tokens
+                + int(context_payload.get("used_tokens", 0) or 0)
+                + int(deep_result.get("budget_used", deep_result.get("used_tokens", 0)) or 0)
+            )
 
             result = {
                 "query": query,
                 "session_id": resolved_session_id,
+                "workflow_mode": mode,
+                "latency_budget_ms": max_latency_ms,
                 "budgets": {
                     "map_limit": map_limit,
                     "context_budget": context_budget,
@@ -600,40 +853,66 @@ def workflow(
                     "results": map_results,
                     "count": len(map_results),
                     "truncated": len(map_results) >= map_limit,
+                    "tokens": map_tokens,
                 },
                 "context": context_payload,
                 "deep": deep_result,
+                "total_tokens": total_tokens,
+                "latency_ms": {
+                    "map": map_elapsed_ms,
+                    "context": context_elapsed_ms,
+                    "deep": deep_elapsed_ms,
+                    "total": total_elapsed_ms,
+                },
+                "degraded_by_latency": bool(
+                    context_payload.get("error") == "skipped_latency_budget"
+                    or deep_result.get("error") == "skipped_latency_budget"
+                ),
             }
         finally:
             db.close()
 
     # Auto-capture key workflow decision for cross-session recall.
-    try:
-        from know.memory_capture import capture_workflow_decision
+    # Daemon workflow already captures this; avoid duplicate work/memory rows.
+    if not workflow_from_daemon:
+        try:
+            from know.memory_capture import capture_workflow_decision
 
-        capture_workflow_decision(
-            config,
-            query,
-            result,
-            session_id=resolved_session_id,
-            source="auto-workflow",
-            agent="know-cli",
-        )
-    except Exception as e:
-        logger.debug(f"Workflow decision capture failed: {e}")
+            capture_workflow_decision(
+                config,
+                query,
+                result,
+                session_id=resolved_session_id,
+                source="auto-workflow",
+                agent="know-cli",
+            )
+        except Exception as e:
+            logger.debug(f"Workflow decision capture failed: {e}")
 
-    is_json = ctx.obj.get("json")
     if is_json:
-        click.echo(json.dumps(result))
+        if json_full:
+            profile = "full"
+        elif json_compact:
+            profile = "compact"
+        else:
+            profile = "compact" if _stdout_is_tty() else "full"
+
+        if profile == "compact":
+            click.echo(json.dumps(_build_workflow_compact_payload(result)))
+        else:
+            click.echo(json.dumps(result))
         return
 
     map_count = (result.get("map") or {}).get("count", 0)
     ctx_payload = result.get("context") or {}
     deep_result = result.get("deep") or {}
+    latency = result.get("latency_ms") or {}
     console.print(f"[bold]Workflow:[/bold] [cyan]{query}[/cyan]")
     console.print(
-        f"[dim]map={map_count} results | context={ctx_payload.get('used_tokens', 0)} tokens | "
-        f"deep={deep_result.get('budget_used', deep_result.get('used_tokens', 0))} tokens[/dim]"
+        f"[dim]mode={result.get('workflow_mode', 'implement')} | "
+        f"map={map_count} results | context={ctx_payload.get('used_tokens', 0)} tokens | "
+        f"deep={deep_result.get('budget_used', deep_result.get('used_tokens', 0))} tokens | "
+        f"latency={latency.get('total', 0)}ms[/dim]"
     )
 
     map_rows = (result.get("map") or {}).get("results", [])[:8]
@@ -654,6 +933,55 @@ def workflow(
         console.print(f"[dim]callers={callers}, callees={callees}[/dim]")
     elif deep_result.get("error"):
         console.print(f"\n[yellow]Deep skipped:[/yellow] {deep_result.get('error')}")
+
+
+@click.command("warm")
+@click.pass_context
+def warm(ctx: click.Context) -> None:
+    """Start daemon and report warmup/index readiness."""
+    config = ctx.obj.get("config")
+    if not config:
+        console.print("[red]Not initialized. Run: know init[/red]")
+        return
+
+    client = _get_daemon_client(config)
+    daemon_running = bool(client)
+    stats = {}
+    if client:
+        try:
+            status_result = client.call_sync("status")
+            stats = status_result.get("stats", {}) or {}
+        except Exception as e:
+            logger.debug(f"Daemon status check failed: {e}")
+
+    if not stats:
+        try:
+            db = _get_db_fallback(config)
+            stats = db.get_stats()
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    files = int(stats.get("files", 0) or 0)
+    indexing_status = "complete" if files > 0 else "warming"
+    payload = {
+        "daemon_running": daemon_running,
+        "indexing_status": indexing_status,
+        "stats": stats,
+        "project_root": str(config.root),
+    }
+
+    if ctx.obj.get("json"):
+        click.echo(json.dumps(payload))
+        return
+
+    if daemon_running:
+        console.print("[green]Daemon is running[/green]")
+    else:
+        console.print("[yellow]Daemon unavailable; using direct DB status[/yellow]")
+    console.print(f"Indexing status: [cyan]{indexing_status}[/cyan] (files={files})")
 
 
 @click.command("deep")
