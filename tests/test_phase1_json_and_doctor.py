@@ -183,4 +183,5 @@ class TestDoctorDiagnostics:
         assert "know_command" in env
         assert "know_module_file" in env
         assert "know_version" in env
+        assert "dependency_integrity" in payload["checks"]
         assert "repair_command" in payload

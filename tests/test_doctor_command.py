@@ -45,6 +45,19 @@ class TestDoctorCommand:
 
         doctor_module = importlib.import_module("know.cli.doctor")
         monkeypatch.setattr(doctor_module, "_probe_embedding_model", lambda _m: (True, None))
+        monkeypatch.setattr(
+            doctor_module,
+            "_dependency_integrity",
+            lambda: {
+                "fastembed_installed": True,
+                "onnxruntime_installed": True,
+                "distribution_version": "0.8.7",
+                "module_version": "0.8.7",
+                "editable_install": False,
+                "version_mismatch": False,
+                "declares_fastembed_dependency": True,
+            },
+        )
 
         runner = CliRunner()
         result = runner.invoke(
@@ -63,8 +76,13 @@ class TestDoctorCommand:
         assert "fastembed_cache" in data["checks"]
         assert "embedding_model" in data["checks"]
         assert "agent_skill" in data["checks"]
+        assert "dependency_integrity" in data["checks"]
         assert "environment" in data
         assert "workflow_command_available" in data["environment"]
+        dep = data["checks"]["dependency_integrity"]
+        assert "fastembed_installed" in dep
+        assert "onnxruntime_installed" in dep
+        assert "version_mismatch" in dep
 
     def test_doctor_repair_retries_probe(self, tmp_project, monkeypatch):
         root, _ = tmp_project
@@ -89,6 +107,19 @@ class TestDoctorCommand:
             doctor_module,
             "_run_reindex_silent",
             lambda _config: (True, 42, None),
+        )
+        monkeypatch.setattr(
+            doctor_module,
+            "_dependency_integrity",
+            lambda: {
+                "fastembed_installed": True,
+                "onnxruntime_installed": True,
+                "distribution_version": "0.8.7",
+                "module_version": "0.8.7",
+                "editable_install": False,
+                "version_mismatch": False,
+                "declares_fastembed_dependency": True,
+            },
         )
 
         runner = CliRunner()

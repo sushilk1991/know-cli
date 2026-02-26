@@ -7,6 +7,8 @@ import os
 import shutil
 import shutil as _shutil
 import sys
+import importlib.metadata
+import importlib.util
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -59,6 +61,46 @@ def _run_reindex_silent(config) -> Tuple[bool, Optional[int], Optional[str]]:
         return False, None, str(e)
 
 
+def _dependency_integrity() -> dict:
+    """Collect dependency/runtime diagnostics for embeddings."""
+    result = {
+        "fastembed_installed": bool(importlib.util.find_spec("fastembed")),
+        "onnxruntime_installed": bool(importlib.util.find_spec("onnxruntime")),
+        "distribution_version": None,
+        "module_version": None,
+        "editable_install": False,
+        "version_mismatch": False,
+        "declares_fastembed_dependency": None,
+    }
+
+    try:
+        dist = importlib.metadata.distribution("know-cli")
+        result["distribution_version"] = dist.version
+        requires = dist.requires or []
+        result["declares_fastembed_dependency"] = any(
+            req.lower().startswith("fastembed") for req in requires
+        )
+        direct_url = dist.read_text("direct_url.json")
+        if direct_url and '"editable": true' in direct_url:
+            result["editable_install"] = True
+    except Exception:
+        pass
+
+    try:
+        import know
+
+        result["module_version"] = str(getattr(know, "__version__", "") or "")
+    except Exception:
+        pass
+
+    if result["distribution_version"] and result["module_version"]:
+        result["version_mismatch"] = (
+            result["distribution_version"] != result["module_version"]
+        )
+
+    return result
+
+
 @click.command("doctor")
 @click.option("--repair", is_flag=True, help="Attempt automatic repairs")
 @click.option("--reindex", "run_reindex", is_flag=True, help="Run `know reindex` after successful repair")
@@ -87,7 +129,7 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
                 getattr(ctx.find_root().command, "commands", {}).get("workflow")
             ),
         },
-        "repair_command": "python -m pip uninstall -y know know-cli && python -m pip install -U know-cli",
+        "repair_command": "python -m pip install -U know-cli && know doctor --repair --reindex",
     }
 
     try:
@@ -102,6 +144,7 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         "path": str(cache_root),
         "exists": cache_root.exists(),
     }
+    report["checks"]["dependency_integrity"] = _dependency_integrity()
     report["checks"]["agent_skill"] = skill_install_status()
 
     model_ok, model_error = _probe_embedding_model(DEFAULT_MODEL)
@@ -113,6 +156,19 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
 
     if not model_ok:
         report["ok"] = False
+
+    deps = report["checks"].get("dependency_integrity", {})
+    if (
+        not deps.get("fastembed_installed")
+        or not deps.get("onnxruntime_installed")
+        or deps.get("version_mismatch")
+    ):
+        report["ok"] = False
+
+    if deps.get("editable_install"):
+        report["repair_command"] = (
+            "python -m pip install -e . && know doctor --repair --reindex"
+        )
 
     if repair and not model_ok:
         action = _repair_fastembed_cache(cache_root)
@@ -141,6 +197,29 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
     color = "green" if report["ok"] else "yellow"
     console.print(f"[{color}]doctor: {status}[/{color}]")
     console.print(f"  fastembed_cache: {report['checks']['fastembed_cache']['path']}")
+    deps_check = report["checks"].get("dependency_integrity", {})
+    if deps_check:
+        dep_ok = (
+            deps_check.get("fastembed_installed")
+            and deps_check.get("onnxruntime_installed")
+            and not deps_check.get("version_mismatch")
+        )
+        if dep_ok:
+            console.print("  dependency_integrity: [green]ok[/green]")
+        else:
+            console.print("  dependency_integrity: [yellow]issues[/yellow]")
+            if not deps_check.get("fastembed_installed"):
+                console.print("    - fastembed missing")
+            if not deps_check.get("onnxruntime_installed"):
+                console.print("    - onnxruntime missing")
+            if deps_check.get("version_mismatch"):
+                console.print(
+                    "    - version mismatch: distribution "
+                    f"{deps_check.get('distribution_version')} vs module "
+                    f"{deps_check.get('module_version')}"
+                )
+            if deps_check.get("editable_install"):
+                console.print("    - editable install detected")
     skill_check = report["checks"].get("agent_skill", {})
     skill_targets = skill_check.get("targets", {})
     installed_targets = [
@@ -173,3 +252,6 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         console.print("  actions:")
         for action in report["actions"]:
             console.print(f"    - {action}")
+
+    if not report["ok"]:
+        console.print(f"  repair: [dim]{report['repair_command']}[/dim]")

@@ -70,6 +70,16 @@ know init
 know warm
 ```
 
+Embedding runtime note:
+- `fastembed` + `onnxruntime` are included in the default `know-cli` install.
+- `know-cli[search]` remains accepted for backward compatibility, but is no longer required.
+- If an environment still reports missing fastembed, repair with:
+
+```bash
+python -m pip install -U know-cli
+know doctor --repair --reindex
+```
+
 ### Agent Skill Bootstrap (Codex, Claude, Gemini)
 
 `know-cli` includes a built-in agent skill file and installs it automatically on first CLI run.

@@ -1,5 +1,7 @@
 """Search commands: search, context, graph, reindex."""
 
+import importlib.metadata
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -106,8 +108,8 @@ def search(ctx: click.Context, query: str, top_k: int, index: bool, chunk: bool)
         from know.semantic_search import SemanticSearcher
         searcher = SemanticSearcher(project_root=config.root)
         _search_semantic(ctx, config, searcher, query, top_k, index, chunk)
-    except ImportError:
-        _search_bm25_fallback(ctx, config, query, top_k)
+    except ImportError as e:
+        _search_bm25_fallback(ctx, config, query, top_k, cause=e)
 
 
 def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
@@ -167,12 +169,52 @@ def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
             console.print()
 
 
-def _search_bm25_fallback(ctx, config, query, top_k):
+def _embedding_runtime_diagnostics() -> dict:
+    """Inspect local environment for embedding dependency integrity."""
+    diag = {
+        "fastembed_installed": bool(importlib.util.find_spec("fastembed")),
+        "onnxruntime_installed": bool(importlib.util.find_spec("onnxruntime")),
+        "distribution_version": None,
+        "module_version": None,
+        "editable_install": False,
+        "version_mismatch": False,
+    }
+
+    try:
+        dist = importlib.metadata.distribution("know-cli")
+        diag["distribution_version"] = dist.version
+        direct_url = dist.read_text("direct_url.json")
+        if direct_url and '"editable": true' in direct_url:
+            diag["editable_install"] = True
+    except Exception:
+        pass
+
+    try:
+        import know
+
+        diag["module_version"] = getattr(know, "__version__", None)
+    except Exception:
+        pass
+
+    if diag["distribution_version"] and diag["module_version"]:
+        diag["version_mismatch"] = diag["distribution_version"] != diag["module_version"]
+
+    return diag
+
+
+def _search_bm25_fallback(ctx, config, query, top_k, cause: Optional[Exception] = None):
     """BM25 keyword search fallback when fastembed/numpy not installed."""
     from know.cli.agent import _get_daemon_client, _get_db_fallback
 
+    diag = _embedding_runtime_diagnostics()
+
     if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
-        console.print("[dim]Using BM25 keyword search (fastembed not installed)[/dim]")
+        detail = "semantic embeddings unavailable"
+        if not diag["fastembed_installed"] or not diag["onnxruntime_installed"]:
+            detail = "embedding runtime missing"
+        elif cause:
+            detail = "embedding runtime unavailable"
+        console.print(f"[dim]Using BM25 keyword search ({detail})[/dim]")
 
     import time as _time
     t0 = _time.monotonic()
@@ -207,7 +249,11 @@ def _search_bm25_fallback(ctx, config, query, top_k):
     else:
         if not results:
             console.print("[yellow]No results found[/yellow]")
-            console.print("[dim]Tip: pip install know-cli[search] for semantic search[/dim]")
+            if not diag["fastembed_installed"] or not diag["onnxruntime_installed"]:
+                console.print("[dim]Tip: python -m pip install -U know-cli[/dim]")
+            if diag["editable_install"] or diag["version_mismatch"]:
+                console.print("[dim]Tip: editable install detected; re-run python -m pip install -e .[/dim]")
+            console.print("[dim]Tip: know doctor --repair --reindex[/dim]")
             sys.exit(2)
 
         console.print(f"\n[bold]Top {len(results)} results (BM25):[/bold]\n")
@@ -218,7 +264,11 @@ def _search_bm25_fallback(ctx, config, query, top_k):
                 console.print(f"   [dim]{r['signature'][:200]}[/dim]")
             console.print()
 
-        console.print("[dim]Tip: pip install know-cli[search] for semantic search[/dim]")
+        if not diag["fastembed_installed"] or not diag["onnxruntime_installed"]:
+            console.print("[dim]Tip: python -m pip install -U know-cli[/dim]")
+        if diag["editable_install"] or diag["version_mismatch"]:
+            console.print("[dim]Tip: editable install detected; re-run python -m pip install -e .[/dim]")
+        console.print("[dim]Tip: know doctor --repair --reindex[/dim]")
 
 
 @click.command()

@@ -258,8 +258,8 @@ class SemanticSearcher:
         model = get_model(self.model_name)
         if model is None:
             raise ImportError(
-                "fastembed is required for semantic search. "
-                "Install with: pip install fastembed"
+                "Embedding runtime unavailable for semantic search. "
+                "Repair with: python -m pip install -U know-cli && know doctor --repair --reindex"
             )
         return model
 
