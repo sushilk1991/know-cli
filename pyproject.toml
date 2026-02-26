@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "know-cli"
-version = "0.8.7"
+version = "0.8.8"
 description = "Context Intelligence for AI Coding Agents — smart, token-budgeted code context"
 readme = "README.md"
 license = "MIT"
