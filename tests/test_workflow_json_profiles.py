@@ -114,6 +114,13 @@ class TestWorkflowProfiles:
         assert "map" not in payload
         assert "context" in payload
         assert "deep" in payload
+        assert "targets" in payload
+        candidates = payload["targets"]["candidates"]
+        assert candidates
+        assert "file_path" in candidates[0]
+        assert candidates[0]["file_path"] == "src/billing/service.py"
+        assert payload["targets"]["selected_file_path"] == "src/billing/service.py"
+        assert payload["deep"]["target"]["file_path"] == "src/billing/service.py"
 
     def test_json_default_non_tty_stays_full(self, tmp_project, monkeypatch):
         root, _ = tmp_project

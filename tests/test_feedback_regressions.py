@@ -79,7 +79,8 @@ def test_map_accepts_session_flag_and_emits_json(tmp_path):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["count"] == 1
-    assert payload["session_id"] == "auto"
+    assert payload["session_id"] != "auto"
+    assert len(payload["session_id"]) == 8
 
 
 def test_deep_resolves_leaf_symbol_when_index_stores_fully_qualified_names(tmp_path):

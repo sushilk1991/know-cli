@@ -331,9 +331,19 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
     scanner = CodebaseScanner(config)
     scanner.scan()
     modules = scanner.modules  # List[ModuleInfo] — already parsed
+    allowed_paths = {str(mod.path).replace("\\", "/") for mod in modules}
     count = 0
+    purged = 0
 
     with db.batch():
+        # Purge previously indexed files that are no longer part of scanner scope
+        # (for example old .venv/site-packages entries from prior versions).
+        for existing in db.list_indexed_files():
+            normalized = str(existing).replace("\\", "/")
+            if normalized not in allowed_paths:
+                db.remove_file(existing)
+                purged += 1
+
         for mod_info in modules:
             path_str = str(mod_info.path)
             abs_path = root / path_str
@@ -369,6 +379,9 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
                 logger.debug(f"Call extraction failed for {path_str}: {e}")
 
             count += 1
+
+    if purged:
+        logger.info(f"Purged {purged} out-of-scope indexed files")
 
     return count, modules
 
@@ -505,6 +518,20 @@ class KnowDaemon:
             self._file_mtime_snapshot = await asyncio.to_thread(
                 _collect_project_file_mtimes, self.config,
             )
+            # One-time hygiene: purge indexed files outside current scanner scope
+            # (for example old virtualenv/site-packages artifacts).
+            try:
+                allowed = {str(p).replace("\\", "/") for p in self._file_mtime_snapshot.keys()}
+                indexed = self.db.list_indexed_files()
+                out_of_scope = [fp for fp in indexed if str(fp).replace("\\", "/") not in allowed]
+                if out_of_scope:
+                    with self.db.batch():
+                        for fp in out_of_scope:
+                            self.db.remove_file(fp)
+                    logger.info("Auto-refresh startup purge removed %s out-of-scope files", len(out_of_scope))
+            except Exception as e:
+                logger.debug(f"Startup out-of-scope purge skipped: {e}")
+
             try:
                 files = int(self.db.get_stats().get("files", 0))
             except Exception:

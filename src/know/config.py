@@ -77,7 +77,16 @@ class Config:
         "**/__pycache__/**",
         "**/vendor/**",
         "**/.venv/**",
+        "**/.venv*/**",
         "**/venv/**",
+        "**/venv*/**",
+        "**/site-packages/**",
+        "**/.cache/**",
+        "**/.pytest_cache/**",
+        "**/.mypy_cache/**",
+        "**/.ruff_cache/**",
+        "**/dist/**",
+        "**/build/**",
         "**/.know/**"
     ])
     ai: AIConfig = field(default_factory=AIConfig)

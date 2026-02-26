@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from know.token_counter import count_tokens, truncate_to_budget, format_budget
 from know.logger import get_logger
+from know.path_filters import is_hard_excluded_path
 
 if TYPE_CHECKING:
     from know.config import Config
@@ -413,8 +414,7 @@ def _find_test_files(root: Path, source_path: str) -> List[Path]:
     results = []
     for pattern in [f"**/test_{stem}.py", f"**/{stem}_test.py"]:
         for p in root.rglob(pattern):
-            if not any(part in {"venv", ".git", "node_modules", "__pycache__"}
-                       for part in p.parts):
+            if not is_hard_excluded_path(p):
                 results.append(p)
     return results
 

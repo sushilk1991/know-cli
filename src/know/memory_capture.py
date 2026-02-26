@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import re
 from typing import Any, Dict, Optional
 
 from know.logger import get_logger
 
 logger = get_logger()
 AUTO_WORKFLOW_DECISION_TTL_HOURS = 24 * 30  # 30 days
+
+
+def _normalize_query(query: str) -> str:
+    return " ".join((query or "").strip().lower().split())
+
+
+def _slug(value: str) -> str:
+    token = re.sub(r"[^a-z0-9_.:-]+", "-", (value or "").strip().lower())
+    token = token.strip("-")
+    return token[:64] if token else "na"
 
 
 def capture_workflow_decision(
@@ -33,7 +45,8 @@ def capture_workflow_decision(
 
     context = workflow_result.get("context") or {}
     source_files = context.get("source_files") or []
-    focus = ", ".join(source_files[:3]) if source_files else target.get("file", "")
+    focus_files = sorted({str(p) for p in source_files if p})[:3]
+    focus = ", ".join(focus_files) if focus_files else target.get("file", "")
     if not focus and target.get("file"):
         focus = target["file"]
 
@@ -46,10 +59,11 @@ def capture_workflow_decision(
         f"Workflow decision: query='{query}' -> deep_target='{selected or target.get('name', '')}'. "
         f"Focus files: {focus}"
     )
-    tags = "workflow,decision"
+    normalized_query = _normalize_query(query)
+    query_hash = hashlib.sha1(normalized_query.encode("utf-8")).hexdigest()[:12]
     target_name = selected or target.get("name", "")
-    if target_name:
-        tags = f"{tags},{target_name}"
+    target_slug = _slug(target_name)
+    tags = f"workflow,decision,q:{query_hash},t:{target_slug}"
 
     try:
         from know.knowledge_base import KnowledgeBase
@@ -59,6 +73,9 @@ def capture_workflow_decision(
         # retried with the same resolved target.
         active = kb.list_all(source=source, memory_type="decision", decision_status="active")
         for mem in active:
+            mem_tags = set((mem.tags or "").split(","))
+            if f"q:{query_hash}" in mem_tags and f"t:{target_slug}" in mem_tags:
+                return mem.id
             if mem.text == text:
                 return mem.id
 

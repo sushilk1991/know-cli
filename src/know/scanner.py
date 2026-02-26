@@ -16,6 +16,7 @@ from know.exceptions import ParseError, ScanError
 from know.logger import get_logger
 from know.parsers import EXTENSION_TO_LANGUAGE, ParserFactory
 from know.models import FunctionInfo, ClassInfo, ModuleInfo, APIRoute
+from know.path_filters import is_hard_excluded_path
 
 if TYPE_CHECKING:
     from know.config import Config
@@ -153,21 +154,8 @@ class CodebaseScanner:
 
         relative_str = str(relative)
 
-        # Always skip generated/build/cache directories regardless of user config.
-        hard_excludes = {
-            ".git",
-            ".know",
-            "__pycache__",
-            "node_modules",
-            ".next",
-            ".nuxt",
-            ".turbo",
-            "dist",
-            "build",
-            "target",
-            ".cache",
-        }
-        if any(part in hard_excludes for part in relative.parts):
+        # Always skip generated/build/cache/runtime directories regardless of user config.
+        if is_hard_excluded_path(relative):
             return False
 
         if self._pathspec.match_file(relative_str):

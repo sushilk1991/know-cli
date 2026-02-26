@@ -388,6 +388,13 @@ def context(
             resolved_session_id = uuid.uuid4().hex[:8]
         else:
             resolved_session_id = session_id
+        if resolved_session_id:
+            try:
+                from know.runtime_context import set_active_session_id
+
+                set_active_session_id(config, resolved_session_id)
+            except Exception as e:
+                logger.debug(f"Failed to persist active session id: {e}")
 
     engine = ContextEngine(config)
     include_markdown = not (ctx.obj.get("json") or output_format == "agent")

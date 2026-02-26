@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from know.logger import get_logger
+from know.path_filters import is_hard_excluded_path
 
 if TYPE_CHECKING:
     from know.config import Config
@@ -158,8 +159,7 @@ class ImportGraph:
                 py_files[name] = self.root / path_str
         else:
             for py in self.root.rglob("*.py"):
-                if any(p.startswith(".") or p in {"venv", "node_modules", "__pycache__", ".git"}
-                       for p in py.parts):
+                if is_hard_excluded_path(py):
                     continue
                 try:
                     rel = py.relative_to(self.root)

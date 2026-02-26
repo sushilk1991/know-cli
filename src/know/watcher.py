@@ -8,6 +8,8 @@ from rich.console import Console
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
+from know.path_filters import is_hard_excluded_part
+
 if TYPE_CHECKING:
     from know.config import Config
 
@@ -50,16 +52,7 @@ class DocUpdateHandler(FileSystemEventHandler):
     def _should_ignore(self, path: Path) -> bool:
         """Check if file should be ignored using path component matching."""
         # Directories/files to ignore (matched against individual path components)
-        ignore_dirs = {
-            ".git",
-            ".know",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "node_modules",
-            ".idea",
-            ".vscode",
-        }
+        ignore_dirs = {".idea", ".vscode"}
         
         # File patterns to ignore (matched against filename)
         ignore_suffixes = {
@@ -76,7 +69,7 @@ class DocUpdateHandler(FileSystemEventHandler):
         
         # Check individual path components (prevents "docs" matching "dockerfiles")
         for part in path.parts:
-            if part in ignore_dirs:
+            if part in ignore_dirs or is_hard_excluded_part(part):
                 return True
         
         # Check filename patterns

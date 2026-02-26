@@ -71,6 +71,41 @@ class TestDecisionMemoryPolicy:
         assert len(memories) == 1
         assert memories[0].expires_at != ""
 
+    def test_workflow_decision_dedups_when_focus_order_changes(self, tmp_project):
+        from know.knowledge_base import KnowledgeBase
+        from know.memory_capture import capture_workflow_decision
+
+        first = _workflow_result()
+        second = _workflow_result()
+        second["context"]["source_files"] = [
+            "src/api/router.py",
+            "src/billing/service.py",
+            "src/extra.py",
+        ]
+
+        first_id = capture_workflow_decision(
+            tmp_project,
+            "Billing   routing",
+            first,
+            session_id="sess1234",
+        )
+        second_id = capture_workflow_decision(
+            tmp_project,
+            "billing routing",
+            second,
+            session_id="sess1234",
+        )
+
+        assert first_id is not None
+        assert second_id == first_id
+
+        kb = KnowledgeBase(tmp_project)
+        memories = kb.list_all(source="auto-workflow")
+        assert len(memories) == 1
+        tags = set((memories[0].tags or "").split(","))
+        assert any(tag.startswith("q:") for tag in tags)
+        assert any(tag.startswith("t:") for tag in tags)
+
 
 class TestSkillBootstrapUpdate:
     def test_install_skill_updates_stale_managed_skill(self, tmp_path):

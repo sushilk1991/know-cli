@@ -29,6 +29,7 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 - Keep a strict latency budget with `--max-latency-ms` to avoid long stalls.
 - Start with small budgets, then escalate.
 - Keep a stable session id (`--session auto` or a persisted session id) for dedup.
+- `--session auto` now resolves to a concrete ID across workflow/context/map/deep and is persisted.
 - Use fallback ladder only when confidence is low (<0.55) or deep target is missing.
 
 ## Use-Case Command Matrix
@@ -142,6 +143,7 @@ Legacy commands remain supported (`know context`, `know deep`, `know map`, `know
 
 - Daemon incremental refresh is enabled by default.
 - Use `know warm` after install/upgrade or when first-call latency is high.
+- Full indexing auto-purges out-of-scope noise from older indexes (`.venv*`, `site-packages`, `dist`, `build`, cache trees).
 - Active workflow session is persisted at `.know/current_session`.
 - `know remember` and `know decide` auto-fill `session_id` from current session when available.
 - For very large repos, daemon auto-refresh may self-suspend; force-enable with:

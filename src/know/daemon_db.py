@@ -714,6 +714,12 @@ class DaemonDB:
         conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
         self._commit(conn)
 
+    def list_indexed_files(self) -> List[str]:
+        """Return all file paths currently tracked in file_index."""
+        conn = self._get_conn()
+        rows = conn.execute("SELECT file_path FROM file_index").fetchall()
+        return [str(r[0]) for r in rows]
+
     # ------------------------------------------------------------------
     # Import graph
     # ------------------------------------------------------------------

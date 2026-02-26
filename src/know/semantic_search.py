@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 import numpy as np
 
+from know.path_filters import is_hard_excluded_path
+
 try:
     import pathspec
 except ImportError:
@@ -352,9 +354,8 @@ class SemanticSearcher:
                         except ValueError:
                             pass
                     
-                    # Fallback skip for common dirs if pathspec failed or didn't catch them
-                    if any(part.startswith(".") or part in {"node_modules", "__pycache__", "venv", ".git", "dist", "build"} 
-                           for part in file_path.parts):
+                    # Always skip runtime/build/cache paths even if .gitignore does not.
+                    if is_hard_excluded_path(file_path):
                         continue
                     
                     if self.index_file(file_path):
@@ -447,9 +448,8 @@ class SemanticSearcher:
         with self.cache:
             for ext in extensions:
                 for file_path in root.rglob(f"*{ext}"):
-                    # Skip ignored directories
-                    if any(part.startswith(".") or part in {"node_modules", "__pycache__", "venv", ".git", "dist", "build"}
-                           for part in file_path.parts):
+                    # Always skip runtime/build/cache paths even if .gitignore does not.
+                    if is_hard_excluded_path(file_path):
                         continue
                     if ignore_spec:
                         try:

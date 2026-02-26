@@ -212,8 +212,10 @@ Recommended by task type:
 
 - Daemon now performs incremental background refresh of changed/deleted files (no manual full reindex loop needed for normal edits).
 - `know warm` starts daemon and reports index readiness (`warming` vs `complete`) without request-thread full indexing.
+- Full indexing now purges out-of-scope artifacts from old indexes (for example `.venv*`, `site-packages`, `build`, `dist`, cache trees).
 - Workflow sessions are persisted to `.know/current_session`.
 - `know remember` and `know decide` auto-fill `session_id` from the active session when not provided.
+- `--session auto` / `--session new` now resolve to concrete IDs consistently (workflow/context/map/deep) and persist active session.
 - Reliability fallback: `know doctor --repair --reindex` repairs embedding cache issues and rebuilds chunk index.
 
 Daemon auto-refresh controls:

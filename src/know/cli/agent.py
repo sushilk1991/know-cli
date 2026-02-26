@@ -107,6 +107,25 @@ def _stdout_is_tty() -> bool:
         return False
 
 
+def _resolve_session_id(config, session_id: Optional[str]) -> Optional[str]:
+    """Resolve special session markers and persist active session when present."""
+    resolved = session_id
+    if session_id in ("auto", "new"):
+        import uuid
+
+        resolved = uuid.uuid4().hex[:8]
+
+    if resolved:
+        try:
+            from know.runtime_context import set_active_session_id
+
+            set_active_session_id(config, resolved)
+        except Exception as e:
+            logger.debug(f"Failed to persist active session id: {e}")
+
+    return resolved
+
+
 def _build_workflow_compact_payload(result: dict) -> dict:
     """Build a compact, human-readable JSON payload for workflow output."""
     map_payload = result.get("map") or {}
@@ -118,7 +137,8 @@ def _build_workflow_compact_payload(result: dict) -> dict:
     for row in map_rows[:5]:
         candidates.append(
             {
-                "file": row.get("file_path"),
+                "file_path": row.get("file_path"),
+                "file": row.get("file_path"),  # Backward-compatible alias.
                 "symbol": row.get("chunk_name") or row.get("signature"),
                 "type": row.get("chunk_type"),
                 "line": row.get("start_line"),
@@ -132,7 +152,8 @@ def _build_workflow_compact_payload(result: dict) -> dict:
         body_lines = [ln.rstrip() for ln in body.splitlines()[:6]]
         snippets.append(
             {
-                "file": chunk.get("file"),
+                "file_path": chunk.get("file"),
+                "file": chunk.get("file"),  # Backward-compatible alias.
                 "symbol": chunk.get("name"),
                 "type": chunk.get("type"),
                 "lines": chunk.get("lines"),
@@ -144,7 +165,7 @@ def _build_workflow_compact_payload(result: dict) -> dict:
     selected_symbol = result.get("selected_deep_target") or deep_target.get("name")
     selected_file = deep_target.get("file")
     if not selected_file and candidates:
-        selected_file = candidates[0].get("file")
+        selected_file = candidates[0].get("file_path")
 
     reason = "top-ranked context target"
     if deep_payload.get("error"):
@@ -167,6 +188,7 @@ def _build_workflow_compact_payload(result: dict) -> dict:
         "indexing_status": context_payload.get("indexing_status", "unknown"),
         "targets": {
             "selected_symbol": selected_symbol,
+            "selected_file_path": selected_file,
             "selected_file": selected_file,
             "reason": reason,
             "next_step": next_step,
@@ -179,6 +201,7 @@ def _build_workflow_compact_payload(result: dict) -> dict:
         "deep": {
             "target": {
                 "name": deep_target.get("name"),
+                "file_path": deep_target.get("file"),
                 "file": deep_target.get("file"),
                 "line_start": deep_target.get("line_start"),
                 "line_end": deep_target.get("line_end"),
@@ -540,7 +563,7 @@ def generate_context(ctx: click.Context, budget: int) -> None:
 @click.option("--limit", "-k", type=int, default=20, help="Max results (default 20)")
 @click.option("--type", "chunk_type", type=click.Choice(["function", "class", "module", "method"]),
               default=None, help="Filter by chunk type")
-@click.option("--session", "session_id", default=None, help="Session ID (accepted for workflow compatibility)")
+@click.option("--session", "session_id", default=None, help="Session ID ('auto'/'new' generate)")
 @click.pass_context
 def map_cmd(
     ctx: click.Context,
@@ -562,6 +585,8 @@ def map_cmd(
         console.print("[red]Not initialized. Run: know init[/red]")
         return
 
+    resolved_session_id = _resolve_session_id(config, session_id)
+
     client = _get_daemon_client(config)
     results = None
     if client:
@@ -570,7 +595,7 @@ def map_cmd(
                 "query": query,
                 "limit": limit,
                 "chunk_type": chunk_type,
-                "session_id": session_id,
+                "session_id": resolved_session_id,
             })
             results = result.get("results", [])
         except Exception as e:
@@ -586,7 +611,7 @@ def map_cmd(
     if is_json:
         click.echo(_json.dumps({
             "query": query,
-            "session_id": session_id,
+            "session_id": resolved_session_id,
             "results": results,
             "count": len(results),
             "truncated": len(results) >= limit,
@@ -643,7 +668,6 @@ def workflow(
     json_full: bool,
 ) -> None:
     """Single-call daemon workflow: map -> context -> deep."""
-    import uuid
     import time
 
     config = ctx.obj.get("config")
@@ -675,15 +699,7 @@ def workflow(
     if max_latency_ms is not None and int(max_latency_ms) <= 0:
         max_latency_ms = None
 
-    resolved_session_id = session_id
-    if session_id in ("auto", "new"):
-        resolved_session_id = uuid.uuid4().hex[:8]
-    if resolved_session_id:
-        try:
-            from know.runtime_context import set_active_session_id
-            set_active_session_id(config, resolved_session_id)
-        except Exception as e:
-            logger.debug(f"Failed to persist active session id: {e}")
+    resolved_session_id = _resolve_session_id(config, session_id)
 
     result = None
     workflow_started = time.monotonic()
@@ -987,7 +1003,7 @@ def warm(ctx: click.Context) -> None:
 @click.command("deep")
 @click.argument("name")
 @click.option("--budget", "-b", type=int, default=3000, help="Token budget (default 3000)")
-@click.option("--session", "session_id", default=None, help="Session ID for dedup")
+@click.option("--session", "session_id", default=None, help="Session ID for dedup ('auto'/'new' generate)")
 @click.option("--include-tests", is_flag=True, help="Include test files in results")
 @click.pass_context
 def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
@@ -1008,6 +1024,8 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
         console.print("[red]Not initialized. Run: know init[/red]")
         return
 
+    resolved_session_id = _resolve_session_id(config, session_id)
+
     client = _get_daemon_client(config)
     result = None
     if client:
@@ -1015,7 +1033,7 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
             result = client.call_sync("deep", {
                 "name": name, "budget": budget,
                 "include_tests": include_tests,
-                "session_id": session_id,
+                "session_id": resolved_session_id,
             })
         except Exception as e:
             logger.debug(f"Daemon deep failed, falling back: {e}")
@@ -1026,7 +1044,7 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
         engine = ContextEngine(config)
         result = engine.build_deep_context(
             name, budget=budget, include_tests=include_tests,
-            session_id=session_id,
+            session_id=resolved_session_id,
         )
 
     is_json = ctx.obj.get("json")
