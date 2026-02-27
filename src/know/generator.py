@@ -2,6 +2,8 @@
 
 import ast
 import json
+import os
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -16,6 +18,14 @@ class DocGenerator:
     def __init__(self, config: "Config"):
         self.config = config
         self.output_dir = config.root / config.output.directory
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        """Best-effort numeric conversion for loose structure payloads."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
     
     def generate_all(self) -> None:
         """Generate all documentation."""
@@ -34,26 +44,28 @@ class DocGenerator:
     
     def generate_system_doc(self, structure: Dict[str, Any], output: Optional[str] = None) -> Path:
         """Generate system documentation (arc.md or similar)."""
-        from know.ai import AISummarizer
-        
-        ai = AISummarizer(self.config)
-        intro = ai.generate_readme_intro(structure)
-        
-        # Check if intro already has a title (fallback does)
-        if intro.strip().startswith("# "):
-            lines = [intro, "", "## 📁 Project Structure", ""]
-        else:
-            lines = [
-                f"# {self.config.project.name}",
-                "",
-                intro,
-                "",
-                "## 📁 Project Structure",
-                "",
-            ]
+        lines = [
+            f"# {self.config.project.name}",
+            "",
+            self._build_evidence_intro(structure),
+            "",
+            "## 📁 Project Structure",
+            "",
+        ]
+
+        modules = list(structure.get("modules", []))
+        ranked_modules = sorted(
+            modules,
+            key=lambda m: (
+                self._to_int(m.get("function_count", 0))
+                + self._to_int(m.get("class_count", 0)),
+                str(m.get("name", "")),
+            ),
+            reverse=True,
+        )
         
         # Add module overview
-        for module in structure.get("modules", [])[:15]:
+        for module in ranked_modules[:15]:
             desc = module.get("description", "")
             if desc:
                 desc = desc.split("\n")[0][:100]
@@ -61,8 +73,8 @@ class DocGenerator:
             else:
                 lines.append(f"- **[{module['name']}]({module['path']})**")
         
-        if len(structure.get("modules", [])) > 15:
-            lines.append(f"- ... and {len(structure['modules']) - 15} more modules")
+        if len(modules) > 15:
+            lines.append(f"- ... and {len(modules) - 15} more modules")
         
         lines.extend([
             "",
@@ -91,6 +103,59 @@ class DocGenerator:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         return path
+
+    def _build_evidence_intro(self, structure: Dict[str, Any]) -> str:
+        """Build a deterministic intro grounded in scanned repository evidence."""
+        modules = structure.get("modules", [])
+        file_count = self._to_int(structure.get("file_count"), len(modules))
+        module_count = self._to_int(structure.get("module_count"), len(modules))
+
+        lang_by_suffix = {
+            ".py": "Python",
+            ".ts": "TypeScript",
+            ".tsx": "TSX",
+            ".js": "JavaScript",
+            ".jsx": "JSX",
+            ".go": "Go",
+            ".rs": "Rust",
+            ".swift": "Swift",
+        }
+
+        lang_counts: Counter[str] = Counter()
+        root_dir_counts: Counter[str] = Counter()
+        for module in modules:
+            path_str = str(module.get("path", ""))
+            if not path_str:
+                continue
+
+            suffix = Path(path_str).suffix.lower()
+            lang = lang_by_suffix.get(suffix)
+            if lang:
+                lang_counts[lang] += 1
+
+            root_dir = path_str.split("/", 1)[0]
+            if root_dir:
+                root_dir_counts[root_dir] += 1
+
+        language_summary = ", ".join(
+            f"{lang} ({count})" for lang, count in lang_counts.most_common(4)
+        ) or "unknown"
+        area_summary = ", ".join(
+            f"`{name}/` ({count})" for name, count in root_dir_counts.most_common(5)
+        ) or "unknown"
+        key_files = [f"`{p}`" for p in structure.get("key_files", [])[:5]]
+
+        lines = [
+            "Generated from static code scan (no model inference).",
+            "",
+            f"This repository contains {file_count} source files across {module_count} modules.",
+            f"Primary languages: {language_summary}.",
+            f"Primary source areas: {area_summary}.",
+        ]
+        if key_files:
+            lines.append(f"Likely entry points: {', '.join(key_files)}.")
+
+        return "\n".join(lines)
     
     def generate_readme(self, structure: Dict[str, Any], output: Optional[str] = None) -> Path:
         """Generate enhanced README.md (legacy, kept for backward compatibility)."""
@@ -112,19 +177,22 @@ class DocGenerator:
         
         Returns list of (source_module, target_module) edges.
         """
-        # Build a set of known module names for matching
-        module_names: Dict[str, str] = {}  # short_name -> full_name
+        # Build exact + short-name lookup tables.
+        full_names: Set[str] = set()
+        short_to_full: Dict[str, Set[str]] = defaultdict(set)
         for module in structure.get("modules", []):
-            full_name = module["name"]
+            full_name = str(module.get("name", ""))
+            if not full_name:
+                continue
+            full_names.add(full_name)
             short_name = full_name.split(".")[-1]
-            module_names[short_name] = full_name
-            module_names[full_name] = full_name
+            short_to_full[short_name].add(full_name)
         
-        edges: List[Tuple[str, str]] = []
-        seen: Set[Tuple[str, str]] = set()
+        edges: Set[Tuple[str, str]] = set()
         
         for module in structure.get("modules", []):
-            mod_path = self.config.root / module["path"]
+            source_name = str(module.get("name", ""))
+            mod_path = self.config.root / str(module.get("path", ""))
             if not mod_path.exists() or not str(mod_path).endswith(".py"):
                 continue
             
@@ -134,26 +202,38 @@ class DocGenerator:
             except (SyntaxError, UnicodeDecodeError):
                 continue
             
-            source_name = module["name"].split(".")[-1]
-            
             for node in ast.walk(tree):
                 targets: List[str] = []
                 
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        targets.append(alias.name.split(".")[-1])
+                        if alias.name:
+                            targets.append(alias.name)  # keep fully-qualified module first
+                            targets.append(alias.name.split(".")[-1])
                 elif isinstance(node, ast.ImportFrom):
                     if node.module:
-                        targets.append(node.module.split(".")[-1])
+                        base = node.module
+                        targets.append(base)  # keep fully-qualified module first
+                        for alias in node.names:
+                            if alias.name and alias.name != "*":
+                                # Keep only fully-qualified module candidates to avoid
+                                # symbol-vs-module false positives (e.g., `from x import config`).
+                                targets.append(f"{base}.{alias.name}")
                 
                 for target in targets:
-                    if target in module_names and target != source_name:
-                        edge = (source_name, target)
-                        if edge not in seen:
-                            seen.add(edge)
-                            edges.append(edge)
+                    target_name: Optional[str] = None
+                    if target in full_names:
+                        target_name = target
+                    else:
+                        candidates = short_to_full.get(target, set())
+                        # Avoid wrong links when short names are ambiguous.
+                        if len(candidates) == 1:
+                            target_name = next(iter(candidates))
+
+                    if target_name and target_name != source_name:
+                        edges.add((source_name, target_name))
         
-        return edges
+        return sorted(edges)
 
     def _generate_mermaid_diagram(
         self,
@@ -162,6 +242,39 @@ class DocGenerator:
     ) -> Path:
         """Generate Mermaid diagram with real import-based edges."""
         edges = self._resolve_imports(structure)
+        modules = list(structure.get("modules", []))
+        module_by_name = {str(m.get("name", "")): m for m in modules if m.get("name")}
+
+        score: Counter[str] = Counter()
+        for name, module in module_by_name.items():
+            score[name] += self._to_int(module.get("function_count", 0))
+            score[name] += self._to_int(module.get("class_count", 0))
+        for src, tgt in edges:
+            if src in module_by_name:
+                score[src] += 3
+            if tgt in module_by_name:
+                score[tgt] += 2
+
+        selected_names = sorted(
+            module_by_name.keys(),
+            key=lambda n: (score[n], n),
+            reverse=True,
+        )[:20]
+        selected_set = set(selected_names)
+        node_ids = {name: f"m{i}" for i, name in enumerate(selected_names)}
+        short_name_counts: Counter[str] = Counter(name.split(".")[-1] for name in selected_names)
+
+        def _label_for(name: str) -> str:
+            parts = name.split(".")
+            short = parts[-1]
+            if short_name_counts[short] > 1 and len(parts) >= 2:
+                short = f"{parts[-2]}.{short}"
+            module = module_by_name.get(name, {})
+            func_count = self._to_int(module.get("function_count", 0))
+            class_count = self._to_int(module.get("class_count", 0))
+            if func_count or class_count:
+                return f"{short}\\n({func_count}f, {class_count}c)"
+            return short
         
         lines = [
             "# Architecture Diagram",
@@ -169,28 +282,25 @@ class DocGenerator:
             "```mermaid",
             "graph TB",
         ]
-        
-        # Collect nodes that participate in edges
-        nodes_in_edges: Set[str] = set()
-        for src, tgt in edges:
-            nodes_in_edges.add(src)
-            nodes_in_edges.add(tgt)
-        
-        # Add all modules as nodes
-        for module in structure.get("modules", [])[:20]:
-            name = module['name'].split('.')[-1]
-            func_count = module.get('function_count', 0)
-            class_count = module.get('class_count', 0)
-            label = f"{name}"
-            if func_count or class_count:
-                label += f"\\n({func_count}f, {class_count}c)"
-            lines.append(f'    {name}["{label}"]')
+
+        for name in selected_names:
+            label = _label_for(name).replace('"', "'")
+            lines.append(f'    {node_ids[name]}["{label}"]')
         
         # Add edges
-        if edges:
+        filtered_edges = [
+            (src, tgt)
+            for src, tgt in edges
+            if src in selected_set and tgt in selected_set and src != tgt
+        ]
+        if filtered_edges:
             lines.append("")
-            for src, tgt in edges:
-                lines.append(f"    {src} --> {tgt}")
+            for src, tgt in filtered_edges:
+                lines.append(f"    {node_ids[src]} --> {node_ids[tgt]}")
+
+        if len(module_by_name) > len(selected_names):
+            lines.append("")
+            lines.append(f"    %% Showing top {len(selected_names)} modules by code/import activity")
         
         lines.extend([
             "```",
@@ -267,6 +377,52 @@ class DocGenerator:
     ) -> Path:
         """Generate dependency graph with real import edges."""
         edges = self._resolve_imports(structure)
+        modules = list(structure.get("modules", []))
+        module_by_name = {str(m.get("name", "")): m for m in modules if m.get("name")}
+        max_nodes = 15
+
+        degree: Counter[str] = Counter()
+        valid_edges = [
+            (src, tgt)
+            for src, tgt in edges
+            if src in module_by_name and tgt in module_by_name and src != tgt
+        ]
+        for src, tgt in valid_edges:
+            degree[src] += 1
+            degree[tgt] += 1
+
+        selected_set: Set[str] = set()
+        # Keep edge endpoints first so we don't hide all real links.
+        ranked_edges = sorted(
+            valid_edges,
+            key=lambda e: (degree[e[0]] + degree[e[1]], e[0], e[1]),
+            reverse=True,
+        )
+        for src, tgt in ranked_edges:
+            if len(selected_set) < max_nodes:
+                selected_set.add(src)
+            if len(selected_set) < max_nodes:
+                selected_set.add(tgt)
+            if len(selected_set) >= max_nodes:
+                break
+
+        if len(selected_set) < max_nodes:
+            for name in sorted(module_by_name.keys(), key=lambda n: (degree[n], n), reverse=True):
+                selected_set.add(name)
+                if len(selected_set) >= max_nodes:
+                    break
+
+        selected_names = sorted(selected_set, key=lambda n: (degree[n], n), reverse=True)
+        selected_set = set(selected_names)
+        node_ids = {name: f"d{i}" for i, name in enumerate(selected_names)}
+        short_name_counts: Counter[str] = Counter(name.split(".")[-1] for name in selected_names)
+
+        def _label_for(name: str) -> str:
+            parts = name.split(".")
+            short = parts[-1]
+            if short_name_counts[short] > 1 and len(parts) >= 2:
+                short = f"{parts[-2]}.{short}"
+            return short
         
         lines = [
             "# Dependency Graph",
@@ -276,16 +432,26 @@ class DocGenerator:
         ]
         
         # Add modules as nodes
-        modules = structure.get("modules", [])[:15]
-        for module in modules:
-            name = module['name'].split('.')[-1]
-            lines.append(f'    {name}[{name}]')
+        for name in selected_names:
+            label = _label_for(name).replace('"', "'")
+            lines.append(f'    {node_ids[name]}["{label}"]')
         
         # Add edges
-        if edges:
+        filtered_edges = [
+            (src, tgt)
+            for src, tgt in valid_edges
+            if src in selected_set and tgt in selected_set and src != tgt
+        ]
+        if filtered_edges:
             lines.append("")
-            for src, tgt in edges:
-                lines.append(f"    {src} --> {tgt}")
+            for src, tgt in filtered_edges:
+                lines.append(f"    {node_ids[src]} --> {node_ids[tgt]}")
+
+        if len(module_by_name) > len(selected_names):
+            lines.append("")
+            lines.append(
+                f"    %% Showing {len(selected_names)} of {len(module_by_name)} modules; prioritizing connected nodes"
+            )
         
         lines.extend([
             "```",
@@ -469,9 +635,46 @@ class DocGenerator:
         structure: Dict[str, Any]
     ) -> Path:
         """Generate default onboarding guide."""
-        from know.ai import AISummarizer
-        
-        ai = AISummarizer(self.config)
-        guide = ai.generate_onboarding_guide(structure, "new team members")
+        api_key = os.environ.get(self.config.ai.api_key_env)
+        if not api_key:
+            guide = self._fallback_onboarding_guide(structure)
+        else:
+            from know.ai import AISummarizer
+            ai = AISummarizer(self.config)
+            guide = ai.generate_onboarding_guide(structure, "new team members")
         
         return self.save_onboarding(guide, "new-devs")
+
+    def _fallback_onboarding_guide(self, structure: Dict[str, Any]) -> str:
+        """Deterministic onboarding guide when AI is unavailable."""
+        modules = structure.get("modules", [])
+        key_files = [f"`{p}`" for p in structure.get("key_files", [])[:8]]
+        lines = [
+            "# Onboarding Guide",
+            "",
+            "## 1. What This Repo Contains",
+            "",
+            f"- Source files: {structure.get('file_count', len(modules))}",
+            f"- Modules: {structure.get('module_count', len(modules))}",
+            f"- Functions: {structure.get('function_count', 0)}",
+            f"- Classes: {structure.get('class_count', 0)}",
+            "",
+            "## 2. Start Here",
+            "",
+        ]
+        if key_files:
+            lines.extend([f"- {entry}" for entry in key_files[:5]])
+        else:
+            lines.append("- Inspect `docs/arc.md` and `docs/architecture.md` first.")
+
+        lines.extend(
+            [
+                "",
+                "## 3. Development Workflow",
+                "",
+                "1. Run tests for impacted areas first.",
+                "2. Use `know map` + `know context` to identify edit targets.",
+                "3. Re-run docs with `know update --only system` after structural changes.",
+            ]
+        )
+        return "\n".join(lines) + "\n"

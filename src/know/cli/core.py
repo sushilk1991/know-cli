@@ -424,8 +424,8 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
     "--all",
     "update_all",
     is_flag=True,
-    default=True,
-    help="Update all documentation",
+    default=False,
+    help="Update all documentation (default when --only is omitted)",
 )
 @click.option(
     "--only",
@@ -437,7 +437,12 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
     """Manually trigger documentation update."""
     config = ctx.obj["config"]
 
-    if not ctx.obj.get("quiet"):
+    if update_all and only is not None:
+        raise click.UsageError("Cannot combine --all with --only. Choose one.")
+
+    run_all = update_all or only is None
+
+    if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
         console.print("[bold blue]Updating documentation...[/bold blue]")
 
     scanner = CodebaseScanner(config)
@@ -447,19 +452,19 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
 
     results = []
 
-    if only == "system" or update_all:
+    if only == "system" or run_all:
         path = generator.generate_system_doc(structure)
         results.append({"type": "system", "path": str(path)})
         if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
             console.print(f"[green]✓[/green] System doc: [cyan]{path}[/cyan]")
 
-    if only == "diagrams" or update_all:
+    if only == "diagrams" or run_all:
         path = generator.generate_c4_diagram(structure)
         results.append({"type": "diagram", "path": str(path)})
         if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
             console.print(f"[green]✓[/green] Architecture: [cyan]{path}[/cyan]")
 
-    if only == "api" or update_all:
+    if only == "api" or run_all:
         routes = scanner.extract_api_routes()
         if routes:
             path = generator.generate_openapi(routes)
@@ -467,7 +472,7 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
             if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
                 console.print(f"[green]✓[/green] API docs: [cyan]{path}[/cyan]")
 
-    if only == "onboarding" or update_all:
+    if only == "onboarding" or run_all:
         path = generator.generate_onboarding(structure)
         results.append({"type": "onboarding", "path": str(path)})
         if not ctx.obj.get("quiet") and not ctx.obj.get("json"):

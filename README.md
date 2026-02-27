@@ -208,6 +208,15 @@ Recommended by task type:
 - GitHub workflow examples in this repo are `workflow_dispatch` and **non-mutating by default**.
 - If a downstream repo enables CI docs updates, keep CI read-only (review/comment artifacts) unless explicit auto-commit is required.
 
+Targeted docs refresh:
+
+```bash
+know update --only system    # updates docs/arc.md only
+know update --only diagrams  # updates docs/architecture.md (mermaid) or docs/architecture-c4.md (plantuml)
+```
+
+`docs/arc.md` now uses deterministic scan evidence (file/module/language stats + key paths) instead of free-form project-name inference.
+
 ### Background Auto-Fill (No Extra Flags)
 
 - Daemon now performs incremental background refresh of changed/deleted files (no manual full reindex loop needed for normal edits).
