@@ -19,6 +19,11 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 ## Non-Negotiable Defaults
 
 - Start with one call: `know workflow`.
+- Always begin with a compatibility-safe one-liner:
+  - `know workflow "<query>" --session auto`
+- Before using advanced workflow flags, probe capabilities once:
+  - `know workflow --help`
+  - use `--mode`, `--max-latency-ms`, `--json-compact`, `--json-full` only if they appear in help.
 - Use `--json` for machine mode only when needed.
 - For agent execution, prefer `--json-compact` to avoid oversized payloads.
 - Use `--json-full` only for strict parser compatibility.
@@ -37,7 +42,8 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 | Use-case | Best first command | Why |
 |---|---|---|
 | Find likely edit file quickly | `know next-file "<query>" --json` | lowest-latency target hint |
-| Get actionable context for coding task | `know --json workflow "<query>" --mode implement --json-compact --session auto` | balanced quality + speed in one call |
+| Get actionable context for coding task (works on all versions) | `know workflow "<query>" --session auto` | guaranteed single-call retrieval without flag mismatch |
+| Get actionable context for coding task (newer CLI) | `know --json workflow "<query>" --mode implement --json-compact --session auto` | balanced quality + speed in one call |
 | Get strict full JSON for automation | `know --json workflow "<query>" --json-full --session auto` | stable full schema for scripts/MCP |
 | Fast exploration | `know --json workflow "<query>" --mode explore --max-latency-ms 2500 --json-compact --session auto` | fast target discovery without deep stall |
 | Understand one symbol deeply | `know deep "file.py:function_name" --budget 3000 --json` | callers/callees + focused body |
@@ -47,6 +53,14 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 | Recover prior design choices | `know recall "<query>" --type decision --status active` | stable memory retrieval |
 
 ## Primary Flow (Default)
+
+Compatibility-safe default:
+
+```bash
+know workflow "<task or bug description>" --session auto
+```
+
+Advanced default (newer CLI with workflow flags):
 
 ```bash
 know --json workflow "<task or bug description>" \
@@ -167,9 +181,13 @@ If retrieval quality looks wrong:
 
 If command surface seems missing:
 1. `know --version`
-2. `know commands --all | grep workflow`
-3. `python -m pip uninstall -y know know-cli`
-4. `python -m pip install -U know-cli`
+2. `know workflow --help`
+3. `know commands --all | grep workflow`
+4. If help does not show `--mode`/`--json-compact`, use:
+   - `know workflow "<query>" --session auto`
+   - avoid advanced flags for this run
+5. `python -m pip uninstall -y know know-cli`
+6. `python -m pip install -U know-cli`
 
 ## Context Commands (Direct Use)
 
