@@ -18,7 +18,7 @@ logger = get_logger()
 
 
 class KnowCLIGroup(click.Group):
-    """Top-level CLI group with curated default help output."""
+    """Top-level CLI group with common and exhaustive command help output."""
 
     SIMPLE_COMMANDS = (
         "init",
@@ -34,30 +34,34 @@ class KnowCLIGroup(click.Group):
     )
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        rows = []
+        common_rows = []
         for subcommand in self.SIMPLE_COMMANDS:
             cmd = self.get_command(ctx, subcommand)
             if cmd is None:
                 continue
-            rows.append((subcommand, cmd.get_short_help_str()))
+            common_rows.append((subcommand, cmd.get_short_help_str()))
 
-        if rows:
-            with formatter.section("Commands"):
-                formatter.write_dl(rows)
+        if common_rows:
+            with formatter.section("Common Commands"):
+                formatter.write_dl(common_rows)
             formatter.write_paragraph()
 
-        legacy = sorted(
-            name for name in self.commands.keys() if name not in self.SIMPLE_COMMANDS
-        )
-        if legacy:
-            formatter.write_text(
-                "Legacy/advanced commands (still supported): "
-                + ", ".join(legacy)
-            )
+        all_rows = []
+        for name in sorted(self.commands.keys()):
+            if name in self.SIMPLE_COMMANDS:
+                continue
+            cmd = self.get_command(ctx, name)
+            if cmd is None:
+                continue
+            all_rows.append((name, cmd.get_short_help_str()))
+
+        if all_rows:
+            with formatter.section("Advanced Commands"):
+                formatter.write_dl(all_rows)
             formatter.write_paragraph()
 
         formatter.write_text(
-            "Run `know commands --all` to view advanced and legacy commands."
+            "Run `know commands --all` for exhaustive list, or `know commands` for the curated set."
         )
 
 
@@ -166,7 +170,7 @@ def _print_timing():
 # Register all sub-module commands
 # -----------------------------------------------------------------------
 from know.cli.core import init, explain, diagram, api, onboard, digest, update, watch
-from know.cli.search import search, context, graph, reindex
+from know.cli.search import search, grep_cmd, context, graph, reindex
 from know.cli.knowledge import remember, recall, forget, memories, decide
 from know.cli.stats import stats, status
 from know.cli.hooks import hooks
@@ -302,19 +306,39 @@ def docs(ctx: click.Context, only: str) -> None:
 
 
 @click.command("commands")
-@click.option("--all", "show_all", is_flag=True, help="Show all commands (advanced + legacy)")
+@click.option(
+    "--simple",
+    "show_simple",
+    is_flag=True,
+    help="Show only the curated day-to-day command set.",
+)
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="Show all commands (advanced + legacy).",
+)
 @click.pass_context
-def commands_cmd(ctx: click.Context, show_all: bool) -> None:
+def commands_cmd(ctx: click.Context, show_simple: bool, show_all: bool) -> None:
     """List available commands."""
     import json as _json
 
+    if show_simple and show_all:
+        raise click.UsageError("Use either --simple or --all, not both.")
+
     if show_all:
         names = sorted(cli.commands.keys())
+        selected_all = True
     else:
         names = [name for name in KnowCLIGroup.SIMPLE_COMMANDS if name in cli.commands]
+        selected_all = False
 
     if ctx.obj.get("json"):
-        click.echo(_json.dumps({"commands": names, "all": show_all}))
+        click.echo(_json.dumps({
+            "commands": names,
+            "all": selected_all,
+            "mode": "simple" if not selected_all else "all",
+        }))
     else:
         for name in names:
             cmd = cli.commands.get(name)
@@ -391,6 +415,7 @@ cli.add_command(digest)
 cli.add_command(update)
 cli.add_command(watch)
 cli.add_command(search)
+cli.add_command(grep_cmd)
 cli.add_command(context)
 cli.add_command(graph)
 cli.add_command(reindex)

@@ -41,11 +41,11 @@ Method:
 | Repo | Grep Tokens (10 queries) | know Tokens (10 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `know-cli` | 670,957 | 48,687 | **92.7%** | 0.803s | 1.901s | 2.37x | 160 -> 10 |
-| `farfield` | 817,029 | 38,064 | **95.3%** | 1.702s | 2.873s | 1.69x | 160 -> 10 |
+| `third-party-repo` | 817,029 | 38,064 | **95.3%** | 1.702s | 2.873s | 1.69x | 160 -> 10 |
 
 Deep call-graph quality snapshot from the same run:
 - `know-cli`: call-graph available in 100% of deep queries, non-empty edges in 100%.
-- `farfield`: call-graph available in 90%, non-empty edges in 70%.
+- `third-party-repo`: call-graph available in 90%, non-empty edges in 70%.
 
 Artifacts:
 - `benchmark/results/dual_repo_parallel.json`
@@ -184,7 +184,7 @@ know status
 
 Legacy top-level commands are unchanged and still supported:
 `know workflow`, `know digest`, `know diagram`, `know memories ...`, etc.
-Use `know commands --all` to list them.
+Use `know commands --all` to list everything.
 
 ### Workflow — Single Daemon Call
 
@@ -196,6 +196,7 @@ know --json workflow "auth token validation" --mode explore --max-latency-ms 250
 
 Runs `map -> context -> deep` in a single daemon request to cut tool-call overhead for coding agents.
 The response now includes `workflow_mode`, `latency_budget_ms`, stage timings (`latency_ms`) and whether it degraded due to latency.
+Human-readable output and JSON now also include a `usage` block (`tokens_used` + `elapsed_ms`) to make cost/latency visible after each run.
 
 Recommended by task type:
 - Exploration / architecture: `know --json workflow "<query>" --mode explore --json-compact`
@@ -205,6 +206,10 @@ Recommended by task type:
 ### Docs Update Policy (Local-First)
 
 - Recommended default: run docs updates locally via `know watch` or git hooks (`know hooks install`).
+- For Git-based freshness across commits/checkouts/merges, use:
+  - `know hooks install --index-hooks` (post-commit + post-merge + post-checkout)
+  - `know hooks uninstall --index-hooks` (remove all know-managed index refresh hooks)
+  - `know hooks status` (verify hook state)
 - GitHub workflow examples in this repo are `workflow_dispatch` and **non-mutating by default**.
 - If a downstream repo enables CI docs updates, keep CI read-only (review/comment artifacts) unless explicit auto-commit is required.
 
@@ -287,13 +292,18 @@ If `session_id` is omitted, `remember/decide` auto-bind to `.know/current_sessio
 | `know ask "query"` | Simple one-command retrieval (workflow wrapper) |
 | `know docs` | One-shot docs refresh (system + digest + api + architecture) |
 | `know done <id>` | Shortcut for `know memories resolve <id> --status resolved` |
-| `know commands --all` | Show advanced and legacy commands |
+| `know commands --all` | Show full command list |
 | `know workflow "query"` | Single-call daemon workflow (map + context + deep) |
 | `know warm` | Start daemon + check warmup/index readiness |
+| `know hooks install` | Install post-commit hook (use `--index-hooks` for merge/checkout hooks) |
+| `know hooks uninstall` | Remove know-managed hooks (use `--index-hooks` for merge/checkout hooks) |
+| `know hooks status` | Show hook status for post-commit/merge/checkout |
+| `know watch` | Watch local file edits and refresh docs continuously |
 | `know map "query"` | Lightweight signature search |
 | `know context "query"` | Smart, budgeted code context |
 | `know deep "name"` | Function + callers + callees |
 | `know search "query"` | Semantic code search |
+| `know grep "query"` | Grep+read baseline with token/time telemetry |
 | `know remember "text"` | Store a memory |
 | `know decide "decision"` | Store structured decision memory |
 | `know recall "query"` | Recall memories |
@@ -421,21 +431,6 @@ pip install know-cli[search,mcp]
 
 `know-cli` is free and open-source (MIT). It runs locally and does not add usage-based fees.
 If you enable optional model APIs in your own workflows, those provider costs are separate.
-
-## Releasing
-
-Reliable publish flow (idempotent, verifies version availability, builds, checks, uploads):
-
-```bash
-./scripts/release_pypi.sh
-```
-
-Notes:
-- Requires `PYPI_API_TOKEN` (or `TWINE_PASSWORD`) in environment.
-- GitHub Action `.github/workflows/publish-pypi.yml` supports manual dispatch and `v*` tags.
-- Release script runs benchmark and CLI compatibility gates before upload (use `SKIP_BENCHMARK_GATE=1` only for emergency/manual override).
-- Run `know doctor --json` before publish to validate command resolution and environment.
-- A previous failed publish run ([#22278266805](https://github.com/sushilk1991/know-cli/actions/runs/22278266805)) failed because `PYPI_API_TOKEN` was missing in Actions secrets.
 
 ## Troubleshooting
 

@@ -1,8 +1,10 @@
-"""Search commands: search, context, graph, reindex."""
+"""Search commands: search, grep, context, graph, reindex."""
 
 import importlib.metadata
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -11,7 +13,88 @@ import click
 from rich.panel import Panel
 
 from know.cli import console, logger
+from know.cli.usage import attach_usage, build_usage_payload, render_usage
 from know.scanner import CodebaseScanner
+
+_DEFAULT_GREP_GLOBS = (
+    "*.py",
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.go",
+    "*.rs",
+    "*.java",
+    "*.rb",
+    "*.php",
+    "*.swift",
+    "*.kt",
+)
+
+
+def _estimate_tokens_from_search_results(results: list[dict]) -> int:
+    """Estimate tokens represented by returned search results."""
+    if not results:
+        return 0
+
+    from know.token_counter import count_tokens
+
+    total = 0
+    for row in results:
+        row_tokens = int(row.get("token_count", 0) or 0)
+        if row_tokens > 0:
+            total += row_tokens
+            continue
+
+        preview = str(row.get("preview") or row.get("signature") or "")
+        if preview:
+            total += count_tokens(preview)
+    return total
+
+
+def _extract_grep_terms(query: str, max_terms: int) -> list[str]:
+    """Extract compact search terms from a natural-language query."""
+    terms: list[str] = []
+    try:
+        from know.query import analyze_query
+
+        plan = analyze_query(query)
+        for token in plan.all_search_terms:
+            token = token.strip()
+            if len(token) < 2:
+                continue
+            if token not in terms:
+                terms.append(token)
+            if len(terms) >= max_terms:
+                break
+    except Exception:
+        pass
+
+    if not terms:
+        for token in query.strip().split():
+            token = token.strip()
+            if len(token) < 2:
+                continue
+            if token not in terms:
+                terms.append(token)
+            if len(terms) >= max_terms:
+                break
+
+    return terms or [query.strip()]
+
+
+def _extract_path_from_rg_event(event: dict) -> str:
+    """Extract file path from an `rg --json` event payload."""
+    if not isinstance(event, dict):
+        return ""
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return ""
+    path_obj = data.get("path")
+    if not isinstance(path_obj, dict):
+        return ""
+    text = path_obj.get("text")
+    return text.strip() if isinstance(text, str) else ""
 
 
 def _format_context_payload_markdown(payload: dict) -> str:
@@ -145,15 +228,23 @@ def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
     except Exception as e:
         logger.debug(f"Stats tracking (search) failed: {e}")
 
+    usage = build_usage_payload(
+        source="semantic_search",
+        tokens_used=_estimate_tokens_from_search_results(results),
+        elapsed_ms=duration_ms,
+        details={"results": len(results)},
+    )
+
     if is_json:
-        import json
-        click.echo(json.dumps({"results": results}))
+        payload = {"results": results}
+        click.echo(json.dumps(attach_usage(payload, usage)))
     elif ctx.obj.get("quiet"):
         for r in results:
             click.echo(f"{r['score']:.3f} {r.get('path', r.get('name', ''))}")
     else:
         if not results:
             console.print("[yellow]No results found[/yellow]")
+            render_usage(ctx, usage)
             sys.exit(2)
 
         console.print(f"\n[bold]Top {len(results)} results:[/bold]\n")
@@ -167,6 +258,7 @@ def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
                 preview = r['preview'][:200].replace('\n', ' ')
                 console.print(f"   [dim]{preview}...[/dim]")
             console.print()
+        render_usage(ctx, usage)
 
 
 def _embedding_runtime_diagnostics() -> dict:
@@ -240,9 +332,16 @@ def _search_bm25_fallback(ctx, config, query, top_k, cause: Optional[Exception] 
     except Exception as e:
         logger.debug(f"Stats tracking (search) failed: {e}")
 
+    usage = build_usage_payload(
+        source="bm25_search",
+        tokens_used=_estimate_tokens_from_search_results(results),
+        elapsed_ms=duration_ms,
+        details={"results": len(results)},
+    )
+
     if ctx.obj.get("json"):
-        import json
-        click.echo(json.dumps({"results": results}))
+        payload = {"results": results}
+        click.echo(json.dumps(attach_usage(payload, usage)))
     elif ctx.obj.get("quiet"):
         for r in results:
             click.echo(f"{r.get('file_path', '')}:{r.get('chunk_name', '')}")
@@ -254,6 +353,7 @@ def _search_bm25_fallback(ctx, config, query, top_k, cause: Optional[Exception] 
             if diag["editable_install"] or diag["version_mismatch"]:
                 console.print("[dim]Tip: editable install detected; re-run python -m pip install -e .[/dim]")
             console.print("[dim]Tip: know doctor --repair --reindex[/dim]")
+            render_usage(ctx, usage)
             sys.exit(2)
 
         console.print(f"\n[bold]Top {len(results)} results (BM25):[/bold]\n")
@@ -269,6 +369,180 @@ def _search_bm25_fallback(ctx, config, query, top_k, cause: Optional[Exception] 
         if diag["editable_install"] or diag["version_mismatch"]:
             console.print("[dim]Tip: editable install detected; re-run python -m pip install -e .[/dim]")
         console.print("[dim]Tip: know doctor --repair --reindex[/dim]")
+        render_usage(ctx, usage)
+
+
+@click.command("grep")
+@click.argument("query")
+@click.option(
+    "--max-files",
+    type=click.IntRange(min=1),
+    default=12,
+    show_default=True,
+    help="Maximum matched files to read for token accounting.",
+)
+@click.option(
+    "--max-terms",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="Maximum query terms to probe with ripgrep.",
+)
+@click.option(
+    "--ignore-case/--case-sensitive",
+    default=True,
+    show_default=True,
+    help="Case sensitivity for ripgrep term matching.",
+)
+@click.option(
+    "--include",
+    "include_globs",
+    multiple=True,
+    help="Additional ripgrep include globs (defaults to common code extensions).",
+)
+@click.pass_context
+def grep_cmd(
+    ctx: click.Context,
+    query: str,
+    max_files: int,
+    max_terms: int,
+    ignore_case: bool,
+    include_globs: tuple[str, ...],
+) -> None:
+    """Run a grep+read baseline and report token/time usage."""
+    if shutil.which("rg") is None:
+        raise click.ClickException("ripgrep (rg) is required for `know grep`.")
+
+    config = ctx.obj["config"]
+    import time as _time
+    from know.token_counter import count_tokens
+
+    t0 = _time.monotonic()
+    terms = _extract_grep_terms(query, max_terms=max_terms)
+    globs = list(_DEFAULT_GREP_GLOBS)
+    for glob in include_globs:
+        if glob not in globs:
+            globs.append(glob)
+
+    match_counts: dict[str, int] = {}
+    for term in terms:
+        cmd = [
+            "rg",
+            "--json",
+            "--line-number",
+            "--no-heading",
+            "--color=never",
+            "--fixed-strings",
+        ]
+        if ignore_case:
+            cmd.append("--ignore-case")
+        for glob in globs:
+            cmd.extend(["-g", glob])
+        cmd.extend(["--", term, "."])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(config.root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise click.ClickException(
+                f"ripgrep timed out while searching term '{term}' (timeout={exc.timeout}s).",
+            ) from exc
+
+        if proc.returncode not in (0, 1):
+            err = (proc.stderr or "").strip() or "unknown ripgrep error"
+            raise click.ClickException(f"ripgrep failed for term '{term}': {err}")
+
+        for line in proc.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "match":
+                continue
+            path = _extract_path_from_rg_event(event)
+            if path:
+                match_counts[path] = match_counts.get(path, 0) + 1
+
+    ranked = sorted(match_counts.items(), key=lambda item: item[1], reverse=True)
+    top_paths = ranked[:max_files]
+
+    total_tokens = 0
+    rows: list[dict] = []
+    for rel_path, hits in top_paths:
+        file_path = config.root / rel_path
+        if not file_path.exists() or not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        file_tokens = count_tokens(content, provider="anthropic")
+        total_tokens += file_tokens
+        rows.append(
+            {
+                "file_path": rel_path,
+                "matches": hits,
+                "tokens": file_tokens,
+            },
+        )
+
+    duration_ms = int((_time.monotonic() - t0) * 1000)
+    usage = build_usage_payload(
+        source="grep_read",
+        tokens_used=total_tokens,
+        elapsed_ms=duration_ms,
+        details={
+            "files_matched": len(match_counts),
+            "files_read": len(rows),
+            "terms": ",".join(terms),
+        },
+    )
+
+    # Track in generic search stats for trend visibility.
+    try:
+        from know.stats import StatsTracker
+
+        StatsTracker(config).record_search(query, len(rows), duration_ms)
+    except Exception as e:
+        logger.debug(f"Stats tracking (grep) failed: {e}")
+
+    payload = {
+        "query": query,
+        "strategy": "grep_read",
+        "terms": terms,
+        "files_matched": len(match_counts),
+        "files_read": len(rows),
+        "results": rows,
+    }
+
+    if ctx.obj.get("json"):
+        click.echo(json.dumps(attach_usage(payload, usage)))
+        return
+
+    if ctx.obj.get("quiet"):
+        for row in rows:
+            click.echo(row["file_path"])
+        return
+
+    if not rows:
+        console.print("[yellow]No matches found[/yellow]")
+        render_usage(ctx, usage)
+        sys.exit(2)
+
+    console.print(f"\n[bold]Top {len(rows)} files (grep+read):[/bold]\n")
+    for idx, row in enumerate(rows, 1):
+        console.print(
+            f"{idx}. [green]{row['file_path']}[/green] "
+            f"[dim](matches={row['matches']}, tokens={row['tokens']:,})[/dim]",
+        )
+    render_usage(ctx, usage)
 
 
 @click.command()
@@ -458,8 +732,15 @@ def context(
     except Exception as e:
         logger.debug(f"Stats tracking (context) failed: {e}")
 
+    usage = build_usage_payload(
+        source="context",
+        tokens_used=int(payload.get("used_tokens", 0) or 0),
+        elapsed_ms=duration_ms,
+        details={"budget": budget},
+    )
+
     if ctx.obj.get("json") or output_format == "agent":
-        click.echo(json.dumps(payload))
+        click.echo(json.dumps(attach_usage(payload, usage)))
     elif ctx.obj.get("quiet"):
         click.echo(payload.get("markdown") or _format_context_payload_markdown(payload))
     else:
@@ -470,6 +751,7 @@ def context(
             title=f"🧠 Context ({payload.get('budget_utilization', '')})",
             border_style="blue",
         ))
+        render_usage(ctx, usage)
 
 
 @click.command()

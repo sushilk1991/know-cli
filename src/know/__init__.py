@@ -1,6 +1,6 @@
 """know - Living documentation generator for codebases."""
 
-__version__ = "0.8.11"
+__version__ = "0.8.13"
 __author__ = "Sushil Kumar"
 
 

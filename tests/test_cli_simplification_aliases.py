@@ -36,25 +36,27 @@ def tmp_project(tmp_path):
 
 
 class TestSimplifiedSurface:
-    """Default UX should be easy for humans."""
+    """Default UX should remain easy while keeping full discoverability."""
 
-    def test_default_help_is_curated(self):
+    def test_default_help_shows_common_and_all(self):
         from know.cli import cli
 
         runner = CliRunner()
         result = runner.invoke(cli, ["--help"])
 
         assert result.exit_code == 0
-        # Human-first commands should be visible
+        # Human-first commands should be visible.
         assert "ask" in result.output
         assert "docs" in result.output
         assert "recall" in result.output
         assert "decide" in result.output
         assert "done" in result.output
         assert "status" in result.output
-        # Legacy command names should still be discoverable for compatibility.
-        assert "Legacy/advanced commands" in result.output
+        # Advanced commands should be visible in default help too.
+        assert "Advanced Commands" in result.output
         assert "workflow" in result.output
+        assert "hooks" in result.output
+        assert "watch" in result.output
 
     def test_simple_commands_registered(self):
         from know.cli import cli
@@ -75,10 +77,48 @@ class TestSimplifiedSurface:
         result = runner.invoke(cli, ["commands"])
 
         assert result.exit_code == 0
+        names = [
+            line.split()[0]
+            for line in result.output.splitlines()
+            if line.strip()
+        ]
+        assert "workflow" in names
+        assert "ask" in names
+        assert "docs" in names
+        assert "status" in names
+        assert "context" not in names
+        assert "hooks" not in names
+
+    def test_commands_simple_lists_curated_set(self):
+        from know.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["commands", "--simple"])
+
+        assert result.exit_code == 0
         assert "workflow" in result.output
         assert "ask" in result.output
         assert "docs" in result.output
         assert "status" in result.output
+
+    def test_commands_json_preserves_all_field(self):
+        from know.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--json", "commands"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["all"] is False
+
+        result_simple = runner.invoke(cli, ["--json", "commands", "--simple"])
+        assert result_simple.exit_code == 0
+        payload_simple = json.loads(result_simple.output)
+        assert payload_simple["all"] is False
+
+        result_all = runner.invoke(cli, ["--json", "commands", "--all"])
+        assert result_all.exit_code == 0
+        payload_all = json.loads(result_all.output)
+        assert payload_all["all"] is True
 
     def test_commands_all_lists_legacy(self):
         from know.cli import cli
@@ -91,6 +131,21 @@ class TestSimplifiedSurface:
         assert "context" in result.output
         assert "map" in result.output
         assert "deep" in result.output
+
+    def test_commands_all_is_exhaustive_and_no_duplicates(self):
+        from know.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["commands", "--all"])
+
+        assert result.exit_code == 0
+        listed = [
+            line.split()[0]
+            for line in result.output.splitlines()
+            if line.strip()
+        ]
+        assert len(listed) == len(set(listed))
+        assert set(listed) == set(cli.list_commands(None))
 
     def test_docs_command_json_output(self, tmp_project):
         root, _ = tmp_project

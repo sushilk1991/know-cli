@@ -9,6 +9,7 @@ import click
 from click.core import ParameterSource
 
 from know.cli import console, logger
+from know.cli.usage import attach_usage, build_usage_payload, render_usage
 
 
 def _get_daemon_client(config):
@@ -905,6 +906,16 @@ def workflow(
         except Exception as e:
             logger.debug(f"Workflow decision capture failed: {e}")
 
+    usage = build_usage_payload(
+        source="workflow",
+        tokens_used=int(result.get("total_tokens", 0) or 0),
+        elapsed_ms=int((result.get("latency_ms") or {}).get("total", 0) or 0),
+        details={
+            "mode": result.get("workflow_mode", mode),
+            "session_id": resolved_session_id,
+        },
+    )
+
     if is_json:
         if json_full:
             profile = "full"
@@ -914,9 +925,10 @@ def workflow(
             profile = "compact" if _stdout_is_tty() else "full"
 
         if profile == "compact":
-            click.echo(json.dumps(_build_workflow_compact_payload(result)))
+            payload = _build_workflow_compact_payload(result)
+            click.echo(json.dumps(attach_usage(payload, usage)))
         else:
-            click.echo(json.dumps(result))
+            click.echo(json.dumps(attach_usage(result, usage)))
         return
 
     map_count = (result.get("map") or {}).get("count", 0)
@@ -949,6 +961,7 @@ def workflow(
         console.print(f"[dim]callers={callers}, callees={callees}[/dim]")
     elif deep_result.get("error"):
         console.print(f"\n[yellow]Deep skipped:[/yellow] {deep_result.get('error')}")
+    render_usage(ctx, usage)
 
 
 @click.command("warm")
