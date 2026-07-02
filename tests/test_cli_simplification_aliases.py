@@ -3,6 +3,7 @@
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -166,6 +167,44 @@ class TestSimplifiedSurface:
         data = json.loads(result.output)
         assert "digest" in data
         assert "diagram" in data
+
+    def test_ask_alias_forwards_workflow_sla(self, tmp_project):
+        root, _ = tmp_project
+        from know.cli import cli
+
+        fake_client = MagicMock()
+        fake_client.call_sync.return_value = {
+            "query": "hello",
+            "session_id": "sess1234",
+            "workflow_mode": "implement",
+            "latency_budget_ms": 6000,
+            "map": {"results": [], "count": 0, "truncated": False, "tokens": 0},
+            "context": {"query": "hello", "budget": 4000, "used_tokens": 10, "code": []},
+            "deep": {"error": "no_target"},
+            "latency_ms": {"map": 1, "context": 1, "deep": 0, "total": 2},
+            "degraded_by_latency": False,
+            "total_tokens": 10,
+        }
+
+        runner = CliRunner()
+        with patch("know.cli.agent._get_daemon_client", return_value=fake_client):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(root / ".know" / "config.yaml"),
+                    "--json",
+                    "ask",
+                    "hello",
+                ],
+            )
+
+        assert result.exit_code == 0
+        method, params = fake_client.call_sync.call_args.args
+        assert method == "workflow"
+        assert params["mode"] == "implement"
+        assert params["max_latency_ms"] == 6000
+        assert params["read_only"] is False
 
 
 class TestBackwardCompatibility:

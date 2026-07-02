@@ -31,11 +31,17 @@ def tmp_project(tmp_path):
 def test_search_fallback_missing_runtime_tip(tmp_project, monkeypatch):
     from know.cli import cli
     search_module = importlib.import_module("know.cli.search")
+    semantic_module = importlib.import_module("know.semantic_search")
+
+    class _UnavailableSemanticSearcher:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("embedding runtime unavailable")
 
     class _EmptyDB:
         def search_chunks(self, query, limit):
             return []
 
+    monkeypatch.setattr(semantic_module, "SemanticSearcher", _UnavailableSemanticSearcher)
     monkeypatch.setattr("know.cli.agent._get_daemon_client", lambda _config: None)
     monkeypatch.setattr("know.cli.agent._get_db_fallback", lambda _config: _EmptyDB())
     monkeypatch.setattr(
@@ -71,6 +77,11 @@ def test_search_fallback_missing_runtime_tip(tmp_project, monkeypatch):
 def test_search_fallback_editable_tip(tmp_project, monkeypatch):
     from know.cli import cli
     search_module = importlib.import_module("know.cli.search")
+    semantic_module = importlib.import_module("know.semantic_search")
+
+    class _UnavailableSemanticSearcher:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("embedding runtime unavailable")
 
     class _ResultDB:
         def search_chunks(self, query, limit):
@@ -82,6 +93,7 @@ def test_search_fallback_editable_tip(tmp_project, monkeypatch):
                 }
             ]
 
+    monkeypatch.setattr(semantic_module, "SemanticSearcher", _UnavailableSemanticSearcher)
     monkeypatch.setattr("know.cli.agent._get_daemon_client", lambda _config: None)
     monkeypatch.setattr("know.cli.agent._get_db_fallback", lambda _config: _ResultDB())
     monkeypatch.setattr(

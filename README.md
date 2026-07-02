@@ -178,6 +178,7 @@ know ask "billing subscription limits"
 know recall "what did we decide about auth?"
 know decide "Use daemon workflow" --why "fewer tool calls"
 know done 12
+know hooks suggest --agent claude
 know docs
 know status
 ```
@@ -203,13 +204,28 @@ Recommended by task type:
 - Implementation task: `know --json workflow "<query>" --mode implement --json-compact`
 - Complex refactor: `know --json workflow "<query>" --mode thorough --max-latency-ms 15000 --json-compact`
 
+### Hook-First Adoption (Suggest Mode)
+
+```bash
+know hooks suggest --agent claude
+know --json hooks suggest --agent claude
+know hooks suggest --agent codex
+```
+
+- `hooks suggest` is non-mutating guidance only.
+- Claude output provides PreToolUse suggestion snippets.
+- Codex output provides skill + workflow command guidance.
+- Suggest output intentionally never emits rewrite payloads like `updatedInput`.
+
 ### Docs Update Policy (Local-First)
 
-- Recommended default: run docs updates locally via `know watch` or git hooks (`know hooks install`).
+- Recommended default: run docs updates locally via `know watch` or `know update`.
 - For Git-based freshness across commits/checkouts/merges, use:
-  - `know hooks install --index-hooks` (post-commit + post-merge + post-checkout)
+  - `know hooks install --index-hooks` (post-commit + post-merge + post-checkout index refresh)
   - `know hooks uninstall --index-hooks` (remove all know-managed index refresh hooks)
   - `know hooks status` (verify hook state)
+- `know hooks install` is non-mutating: it never runs `git add`, `git commit`, or `git commit --amend`.
+- Upgrades rewrite stale know-managed hooks in place; run `know hooks install` once after upgrading.
 - GitHub workflow examples in this repo are `workflow_dispatch` and **non-mutating by default**.
 - If a downstream repo enables CI docs updates, keep CI read-only (review/comment artifacts) unless explicit auto-commit is required.
 
@@ -295,9 +311,10 @@ If `session_id` is omitted, `remember/decide` auto-bind to `.know/current_sessio
 | `know commands --all` | Show full command list |
 | `know workflow "query"` | Single-call daemon workflow (map + context + deep) |
 | `know warm` | Start daemon + check warmup/index readiness |
-| `know hooks install` | Install post-commit hook (use `--index-hooks` for merge/checkout hooks) |
+| `know hooks install` | Install non-mutating post-commit index hook (use `--index-hooks` for merge/checkout hooks) |
 | `know hooks uninstall` | Remove know-managed hooks (use `--index-hooks` for merge/checkout hooks) |
 | `know hooks status` | Show hook status for post-commit/merge/checkout |
+| `know hooks suggest --agent <claude\|codex>` | Suggest hook-first retrieval adoption (non-mutating) |
 | `know watch` | Watch local file edits and refresh docs continuously |
 | `know map "query"` | Lightweight signature search |
 | `know context "query"` | Smart, budgeted code context |
@@ -348,6 +365,17 @@ This is the canonical path for Codex/Claude/Gemini memory portability.
 |------|-------------|
 | `--mode explore|implement|thorough` | Choose speed-vs-depth workflow profile |
 | `--max-latency-ms N` | End-to-end budget; workflow skips expensive steps when needed |
+
+### Retrieval Analytics
+
+`know stats` now includes retrieval KPIs for `map`, `context`, `deep`, and `workflow`:
+- per-command call count, p50/p95 latency, average tokens
+- workflow quality rates:
+  - degraded-by-latency percentage
+  - call-graph available percentage
+  - non-empty caller/callee edge percentage
+
+JSON output includes a `retrieval` block while preserving existing stats keys.
 
 ---
 

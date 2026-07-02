@@ -1,5 +1,6 @@
-"""Hooks commands: install/uninstall/status git hooks."""
+"""Hooks commands: install/uninstall/status/suggest."""
 
+import json
 import sys
 
 import click
@@ -10,8 +11,62 @@ from know.git_hooks import GitHookManager
 
 @click.group()
 def hooks() -> None:
-    """Manage git hooks for docs + index freshness."""
+    """Manage git hooks for index freshness and optional docs validation."""
     pass
+
+
+def _suggest_payload(agent: str) -> dict:
+    """Build safe, non-mutating adoption guidance for agent integrations."""
+    if agent == "claude":
+        snippet = (
+            "{\n"
+            "  \"hooks\": {\n"
+            "    \"PreToolUse\": [\n"
+            "      {\n"
+            "        \"matcher\": \"Bash\",\n"
+            "        \"hooks\": [\n"
+            "          {\n"
+            "            \"type\": \"command\",\n"
+            "            \"command\": \"know workflow \\\"$CLAUDE_TOOL_INPUT\\\" --session auto\"\n"
+            "          }\n"
+            "        ]\n"
+            "      }\n"
+            "    ]\n"
+            "  }\n"
+            "}"
+        )
+        instructions = [
+            "Use PreToolUse hook suggestions only; do not mutate tool input automatically.",
+            "Start with know workflow in session mode for retrieval-first context.",
+            "Keep fallback path explicit (map/context/deep) when retrieval signal is sparse.",
+        ]
+        strategy = "claude_pretooluse_suggest_only"
+    else:
+        snippet = (
+            "Use skill + command mode in Codex:\n"
+            "1) Install know-cli skill into CODEX_HOME/skills/know-cli/SKILL.md\n"
+            "2) Use: know workflow \"<task>\" --session auto\n"
+            "3) Escalate only when needed: map -> context -> deep"
+        )
+        instructions = [
+            "Codex path is guidance-only until official hook rewrites are supported.",
+            "Keep know-cli as retrieval layer, not shell command mutation layer.",
+            "Use workflow as default and preserve explicit fallback commands.",
+        ]
+        strategy = "codex_skill_command_guidance_only"
+
+    return {
+        "mode": "suggest",
+        "agent": agent,
+        "strategy": strategy,
+        "mutation_safe": True,
+        "instructions": instructions,
+        "snippet": snippet,
+        "references": [
+            "https://docs.anthropic.com/en/docs/claude-code/hooks",
+            "https://developers.openai.com/codex/config",
+        ],
+    }
 
 
 @hooks.command()
@@ -28,7 +83,7 @@ def hooks() -> None:
 )
 @click.pass_context
 def install(ctx: click.Context, pre_commit: bool, index_hooks: bool) -> None:
-    """Install git hooks for docs refresh and index auto-refresh."""
+    """Install git hooks for index auto-refresh."""
     config = ctx.obj["config"]
     manager = GitHookManager(config)
 
@@ -44,7 +99,9 @@ def install(ctx: click.Context, pre_commit: bool, index_hooks: bool) -> None:
         if any(r.get("status") == "not_git_repo" for r in results):
             raise RuntimeError("Not a git repository")
 
-        installed = [r["hook"] for r in results if r.get("status") == "installed"]
+        installed = [
+            r["hook"] for r in results if r.get("status") in {"installed", "updated"}
+        ]
         command_status = "installed" if installed else "no_change"
 
         if ctx.obj.get("json"):
@@ -174,3 +231,27 @@ def hooks_status(ctx: click.Context) -> None:
         else:
             console.print(f"[red]✗[/red] Error: {e}")
         sys.exit(1)
+
+
+@hooks.command("suggest")
+@click.option(
+    "--agent",
+    type=click.Choice(["claude", "codex"]),
+    required=True,
+    help="Target agent integration.",
+)
+@click.pass_context
+def suggest(ctx: click.Context, agent: str) -> None:
+    """Suggest hook-first retrieval adoption without command mutation."""
+    payload = _suggest_payload(agent)
+
+    if ctx.obj.get("json"):
+        click.echo(json.dumps(payload))
+        return
+
+    console.print(f"[bold]Hook Suggestion ({agent})[/bold]")
+    console.print("[dim]Mode: suggest-only (no automatic command rewrite)[/dim]")
+    for idx, item in enumerate(payload["instructions"], start=1):
+        console.print(f"  {idx}. {item}")
+    console.print("\n[bold]Suggested Snippet:[/bold]")
+    console.print(payload["snippet"], highlight=False)

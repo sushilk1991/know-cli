@@ -108,6 +108,27 @@ def _stdout_is_tty() -> bool:
         return False
 
 
+def _estimate_map_tokens(results: list[dict]) -> int:
+    """Estimate token footprint of map signatures returned to the agent."""
+    if not results:
+        return 0
+    try:
+        from know.token_counter import count_tokens
+    except Exception:
+        return 0
+
+    text = "\n".join(
+        filter(
+            None,
+            [
+                f"{row.get('signature', '')}\n{row.get('docstring', '')}".strip()
+                for row in results
+            ],
+        )
+    )
+    return count_tokens(text) if text else 0
+
+
 def _resolve_session_id(config, session_id: Optional[str]) -> Optional[str]:
     """Resolve special session markers and persist active session when present."""
     resolved = session_id
@@ -132,6 +153,27 @@ def _build_workflow_compact_payload(result: dict) -> dict:
     map_payload = result.get("map") or {}
     context_payload = result.get("context") or {}
     deep_payload = result.get("deep") or {}
+
+    def _bounded_body(value: object, max_lines: int) -> str:
+        body = str(value or "")
+        lines = body.splitlines()
+        if len(lines) <= max_lines:
+            return body
+        return "\n".join(lines[:max_lines] + ["# ... truncated"])
+
+    def _compact_related_chunk(row: dict, max_lines: int = 36) -> dict:
+        file_path = row.get("file") or row.get("file_path")
+        return {
+            "file_path": file_path,
+            "file": file_path,
+            "name": row.get("name") or row.get("chunk_name"),
+            "signature": row.get("signature"),
+            "line_start": row.get("line_start") or row.get("start_line"),
+            "line_end": row.get("line_end") or row.get("end_line"),
+            "call_site_line": row.get("call_site_line"),
+            "tokens": row.get("tokens"),
+            "body": _bounded_body(row.get("body", ""), max_lines=max_lines),
+        }
 
     map_rows = map_payload.get("results") or []
     candidates = []
@@ -198,17 +240,32 @@ def _build_workflow_compact_payload(result: dict) -> dict:
         "context": {
             "snippets": snippets,
             "warnings": context_payload.get("warnings") or [],
+            "source_files": context_payload.get("source_files") or [],
         },
         "deep": {
             "target": {
                 "name": deep_target.get("name"),
                 "file_path": deep_target.get("file"),
                 "file": deep_target.get("file"),
+                "signature": deep_target.get("signature"),
                 "line_start": deep_target.get("line_start"),
                 "line_end": deep_target.get("line_end"),
+                "tokens": deep_target.get("tokens"),
+                "body": _bounded_body(deep_target.get("body", ""), max_lines=120),
             },
             "callers": len(deep_payload.get("callers") or []),
             "callees": len(deep_payload.get("callees") or []),
+            "caller_examples": [
+                _compact_related_chunk(row)
+                for row in (deep_payload.get("callers") or [])[:4]
+                if isinstance(row, dict)
+            ],
+            "callee_examples": [
+                _compact_related_chunk(row)
+                for row in (deep_payload.get("callees") or [])[:4]
+                if isinstance(row, dict)
+            ],
+            "overflow_signatures": (deep_payload.get("overflow_signatures") or [])[:8],
             "call_graph_available": deep_payload.get("call_graph_available"),
             "call_graph_reason": deep_payload.get("call_graph_reason"),
             "error": deep_payload.get("error"),
@@ -220,6 +277,7 @@ def _build_workflow_compact_payload(result: dict) -> dict:
             "latency_ms": result.get("latency_ms", {}),
             "degraded_by_latency": result.get("degraded_by_latency", False),
             "map_results": map_payload.get("count", 0),
+            "map_tokens": map_payload.get("tokens", 0),
             "context_tokens": context_payload.get("used_tokens", 0),
             "deep_tokens": deep_payload.get(
                 "budget_used", deep_payload.get("used_tokens", 0),
@@ -581,11 +639,14 @@ def map_cmd(
     Example: know map "billing subscription"
     """
     import json as _json
+    import time as _time
+
     config = ctx.obj.get("config")
     if not config:
         console.print("[red]Not initialized. Run: know init[/red]")
         return
 
+    started = _time.monotonic()
     resolved_session_id = _resolve_session_id(config, session_id)
 
     client = _get_daemon_client(config)
@@ -608,6 +669,20 @@ def map_cmd(
         results = db.search_signatures(query, limit, chunk_type)
         db.close()
 
+    duration_ms = int((_time.monotonic() - started) * 1000)
+    try:
+        from know.stats import StatsTracker
+
+        StatsTracker(config).record_map(
+            query,
+            results_count=len(results),
+            duration_ms=duration_ms,
+            tokens_used=_estimate_map_tokens(results),
+            session_id=resolved_session_id or "",
+        )
+    except Exception as e:
+        logger.debug(f"Stats tracking (map) failed: {e}")
+
     is_json = ctx.obj.get("json")
     if is_json:
         click.echo(_json.dumps({
@@ -623,7 +698,6 @@ def map_cmd(
             for r in results:
                 sig = r.get("signature", r["chunk_name"])
                 doc = r.get("docstring", "")
-                score = r.get("score", 0)
                 line = f"  [green]{r['file_path']}[/green]:{r['start_line']}  {sig}"
                 if doc:
                     line += f"  [dim]— {doc}[/dim]"
@@ -654,6 +728,11 @@ def map_cmd(
 )
 @click.option("--json-compact", is_flag=True, help="Compact JSON profile (human-readable)")
 @click.option("--json-full", is_flag=True, help="Full JSON profile (backward-compatible)")
+@click.option(
+    "--read-only",
+    is_flag=True,
+    help="Skip session persistence, memory capture, and stats writes.",
+)
 @click.pass_context
 def workflow(
     ctx: click.Context,
@@ -667,6 +746,7 @@ def workflow(
     max_latency_ms: Optional[int],
     json_compact: bool,
     json_full: bool,
+    read_only: bool,
 ) -> None:
     """Single-call daemon workflow: map -> context -> deep."""
     import time
@@ -700,12 +780,12 @@ def workflow(
     if max_latency_ms is not None and int(max_latency_ms) <= 0:
         max_latency_ms = None
 
-    resolved_session_id = _resolve_session_id(config, session_id)
+    resolved_session_id = None if read_only else _resolve_session_id(config, session_id)
 
     result = None
     workflow_started = time.monotonic()
     workflow_from_daemon = False
-    client = _get_daemon_client(config)
+    client = None if read_only else _get_daemon_client(config)
     if client:
         try:
             result = client.call_sync("workflow", {
@@ -717,10 +797,17 @@ def workflow(
                 "include_tests": include_tests,
                 "mode": mode,
                 "max_latency_ms": max_latency_ms,
+                "read_only": read_only,
             })
             # Guard mixed-version upgrades: stale daemon may not support
             # workflow mode/SLA fields. Fall back to local workflow when missing.
-            if isinstance(result, dict) and "workflow_mode" in result and "latency_ms" in result:
+            daemon_supports_request = (
+                isinstance(result, dict)
+                and "workflow_mode" in result
+                and "latency_ms" in result
+                and (not read_only or result.get("read_only") is True)
+            )
+            if daemon_supports_request:
                 workflow_from_daemon = True
             else:
                 logger.debug("Daemon workflow response missing mode/SLA fields; using local workflow fallback")
@@ -858,6 +945,7 @@ def workflow(
             result = {
                 "query": query,
                 "session_id": resolved_session_id,
+                "read_only": read_only,
                 "workflow_mode": mode,
                 "latency_budget_ms": max_latency_ms,
                 "budgets": {
@@ -891,7 +979,7 @@ def workflow(
 
     # Auto-capture key workflow decision for cross-session recall.
     # Daemon workflow already captures this; avoid duplicate work/memory rows.
-    if not workflow_from_daemon:
+    if not workflow_from_daemon and not read_only:
         try:
             from know.memory_capture import capture_workflow_decision
 
@@ -906,6 +994,25 @@ def workflow(
         except Exception as e:
             logger.debug(f"Workflow decision capture failed: {e}")
 
+    deep_payload = result.get("deep") or {}
+    try:
+        from know.stats import StatsTracker
+
+        if not read_only:
+            StatsTracker(config).record_workflow(
+                query=query,
+                duration_ms=int((result.get("latency_ms") or {}).get("total", 0) or 0),
+                tokens_used=int(result.get("total_tokens", 0) or 0),
+                mode=str(result.get("workflow_mode", mode) or mode),
+                degraded_by_latency=bool(result.get("degraded_by_latency", False)),
+                call_graph_available=deep_payload.get("call_graph_available"),
+                callers_count=len(deep_payload.get("callers", []) or []),
+                callees_count=len(deep_payload.get("callees", []) or []),
+                session_id=str(result.get("session_id", resolved_session_id) or ""),
+            )
+    except Exception as e:
+        logger.debug(f"Stats tracking (workflow) failed: {e}")
+
     usage = build_usage_payload(
         source="workflow",
         tokens_used=int(result.get("total_tokens", 0) or 0),
@@ -913,6 +1020,7 @@ def workflow(
         details={
             "mode": result.get("workflow_mode", mode),
             "session_id": resolved_session_id,
+            "read_only": read_only,
         },
     )
 
@@ -1032,11 +1140,14 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
     """
     import json as _json
     import sys
+    import time as _time
+
     config = ctx.obj.get("config")
     if not config:
         console.print("[red]Not initialized. Run: know init[/red]")
         return
 
+    started = _time.monotonic()
     resolved_session_id = _resolve_session_id(config, session_id)
 
     client = _get_daemon_client(config)
@@ -1059,6 +1170,23 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
             name, budget=budget, include_tests=include_tests,
             session_id=resolved_session_id,
         )
+
+    duration_ms = int((_time.monotonic() - started) * 1000)
+    try:
+        from know.stats import StatsTracker
+
+        StatsTracker(config).record_deep(
+            name=name,
+            duration_ms=duration_ms,
+            tokens_used=int(result.get("budget_used", result.get("used_tokens", 0)) or 0),
+            call_graph_available=result.get("call_graph_available"),
+            callers_count=len(result.get("callers", []) or []),
+            callees_count=len(result.get("callees", []) or []),
+            session_id=resolved_session_id or "",
+            error=str(result.get("error", "") or ""),
+        )
+    except Exception as e:
+        logger.debug(f"Stats tracking (deep) failed: {e}")
 
     is_json = ctx.obj.get("json")
 

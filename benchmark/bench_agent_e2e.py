@@ -15,6 +15,7 @@ Requires ANTHROPIC_API_KEY environment variable.
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -28,6 +29,8 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+
+KNOW_CMD = [sys.executable, "-m", "know.cli"]
 
 
 # ── Tool Definitions ───────────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ def execute_tool(name: str, params: dict, session_id: str | None = None) -> str:
     """Execute a tool call by shelling out to real CLI."""
 
     if name == "know_map":
-        cmd = ["know", "--json", "map", params["query"]]
+        cmd = [*KNOW_CMD, "--json", "map", params["query"]]
         if params.get("limit"):
             cmd += ["--limit", str(params["limit"])]
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(FARFIELD_DIR), timeout=60)
@@ -129,7 +132,7 @@ def execute_tool(name: str, params: dict, session_id: str | None = None) -> str:
 
     elif name == "know_context":
         budget = params.get("budget", 8000)
-        cmd = ["know", "--json", "context", params["query"], "--budget", str(budget)]
+        cmd = [*KNOW_CMD, "--json", "context", params["query"], "--budget", str(budget)]
         if session_id:
             cmd += ["--session", session_id]
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(FARFIELD_DIR), timeout=60)
@@ -137,7 +140,7 @@ def execute_tool(name: str, params: dict, session_id: str | None = None) -> str:
 
     elif name == "know_deep":
         budget = params.get("budget", 3000)
-        cmd = ["know", "--json", "deep", params["name"], "--budget", str(budget)]
+        cmd = [*KNOW_CMD, "--json", "deep", params["name"], "--budget", str(budget)]
         if session_id:
             cmd += ["--session", session_id]
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(FARFIELD_DIR), timeout=60)
@@ -187,7 +190,7 @@ def run_agent(
 ) -> dict:
     """Run an agent loop: send question, handle tool calls, collect metrics."""
     system = (
-        "You are investigating the farfield codebase. "
+        f"You are investigating the {FARFIELD_DIR.name} codebase at {FARFIELD_DIR}. "
         "Answer the question using the available tools. Be thorough but concise. "
         "Include specific file paths, function names, and how components connect. "
         "When you have enough information, provide your final answer."
@@ -323,6 +326,10 @@ def run_suite():
     if anthropic is None:
         print("Suite 3+4: Skipped (anthropic package not installed)")
         print("  Install with: pip install anthropic")
+        return None
+    if FARFIELD_DIR.name != "farfield":
+        print("Suite 3+4: Skipped (answer keys are Farfield-specific)")
+        print("  Set KNOW_BENCH_REPO=/Users/sushil/Code/Github/farfield to run this suite.")
         return None
 
     print("=" * 60)

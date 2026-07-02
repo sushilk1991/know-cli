@@ -21,6 +21,7 @@ def stats(ctx: click.Context) -> None:
 
     tracker = StatsTracker(config)
     summary = tracker.get_summary()
+    retrieval = tracker.get_retrieval_summary(days=30)
 
     # Codebase info
     scanner = CodebaseScanner(config)
@@ -47,7 +48,8 @@ def stats(ctx: click.Context) -> None:
         import json
         data = {**summary, "memories_total": total_mem,
                 "memories_manual": manual_mem, "memories_auto": auto_mem,
-                "project_files": py_files, "project_functions": functions}
+                "project_files": py_files, "project_functions": functions,
+                "retrieval": retrieval}
         click.echo(json.dumps(data, indent=2))
         return
 
@@ -76,6 +78,22 @@ def stats(ctx: click.Context) -> None:
     console.print(f"  [bold]Memory Ops:[/bold]")
     console.print(f"    Remember calls: {summary['remember_count']}")
     console.print(f"    Recall calls: {summary['recall_count']}")
+    console.print()
+
+    console.print(f"  [bold]Retrieval KPI (30d):[/bold]")
+    for name in ("map", "context", "deep", "workflow"):
+        row = retrieval["commands"][name]
+        console.print(
+            f"    {name}: {row['count']} calls | p50={row['p50_ms']}ms | "
+            f"p95={row['p95_ms']}ms | avg_tokens={row['avg_tokens']}"
+        )
+    quality = retrieval["workflow_quality"]
+    console.print(
+        "    workflow quality: "
+        f"degraded={quality['degraded_by_latency_rate_pct']}% | "
+        f"call_graph_available={quality['call_graph_available_rate_pct']}% | "
+        f"non_empty_edges={quality['non_empty_edge_rate_pct']}%"
+    )
     console.print()
 
 

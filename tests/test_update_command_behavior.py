@@ -109,3 +109,21 @@ def test_update_rejects_all_and_only_together(tmp_path, monkeypatch):
 
     assert result.exit_code != 0
     assert "Cannot combine --all with --only" in result.output
+
+
+def test_update_accepts_command_level_quiet_flag(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    root = _make_project(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "--config",
+            str(root / ".know" / "config.yaml"),
+            "update",
+            "--quiet",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == ""

@@ -1,5 +1,6 @@
 """Core commands: init, explain, diagram, api, onboard, digest, update, watch."""
 
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -432,17 +433,34 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
     type=click.Choice(["system", "diagrams", "api", "onboarding"]),
     help="Update only specific docs",
 )
+@click.option(
+    "--quiet",
+    "command_quiet",
+    is_flag=True,
+    help="Suppress update progress output (supports `know update --quiet`).",
+)
 @click.pass_context
-def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
+def update(
+    ctx: click.Context,
+    update_all: bool,
+    only: Optional[str],
+    command_quiet: bool,
+) -> None:
     """Manually trigger documentation update."""
     config = ctx.obj["config"]
+    quiet_mode = bool(ctx.obj.get("quiet") or command_quiet)
+
+    if command_quiet and not ctx.obj.get("quiet"):
+        logger.setLevel(logging.ERROR)
+        for handler in logger.handlers:
+            handler.setLevel(logging.ERROR)
 
     if update_all and only is not None:
         raise click.UsageError("Cannot combine --all with --only. Choose one.")
 
     run_all = update_all or only is None
 
-    if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+    if not quiet_mode and not ctx.obj.get("json"):
         console.print("[bold blue]Updating documentation...[/bold blue]")
 
     scanner = CodebaseScanner(config)
@@ -455,13 +473,13 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
     if only == "system" or run_all:
         path = generator.generate_system_doc(structure)
         results.append({"type": "system", "path": str(path)})
-        if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+        if not quiet_mode and not ctx.obj.get("json"):
             console.print(f"[green]✓[/green] System doc: [cyan]{path}[/cyan]")
 
     if only == "diagrams" or run_all:
         path = generator.generate_c4_diagram(structure)
         results.append({"type": "diagram", "path": str(path)})
-        if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+        if not quiet_mode and not ctx.obj.get("json"):
             console.print(f"[green]✓[/green] Architecture: [cyan]{path}[/cyan]")
 
     if only == "api" or run_all:
@@ -469,19 +487,19 @@ def update(ctx: click.Context, update_all: bool, only: Optional[str]) -> None:
         if routes:
             path = generator.generate_openapi(routes)
             results.append({"type": "api", "path": str(path), "routes": len(routes)})
-            if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+            if not quiet_mode and not ctx.obj.get("json"):
                 console.print(f"[green]✓[/green] API docs: [cyan]{path}[/cyan]")
 
     if only == "onboarding" or run_all:
         path = generator.generate_onboarding(structure)
         results.append({"type": "onboarding", "path": str(path)})
-        if not ctx.obj.get("quiet") and not ctx.obj.get("json"):
+        if not quiet_mode and not ctx.obj.get("json"):
             console.print(f"[green]✓[/green] Onboarding: [cyan]{path}[/cyan]")
 
     if ctx.obj.get("json"):
         import json
         click.echo(json.dumps({"updated": results}))
-    elif not ctx.obj.get("quiet"):
+    elif not quiet_mode:
         console.print("\n[bold green]Documentation updated![/bold green]")
 
 

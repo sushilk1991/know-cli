@@ -35,7 +35,8 @@ This skill is designed for Codex, Claude, and Gemini style coding loops.
 - Start with small budgets, then escalate.
 - Keep a stable session id (`--session auto` or a persisted session id) for dedup.
 - `--session auto` now resolves to a concrete ID across workflow/context/map/deep and is persisted.
-- Use fallback ladder only when confidence is low (<0.55) or deep target is missing.
+- Use fallback ladder only when context signal is sparse or deep target is missing.
+- For hook-first setup guidance, use `know hooks suggest --agent claude` or `know hooks suggest --agent codex`.
 
 ## Use-Case Command Matrix
 

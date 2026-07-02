@@ -727,7 +727,16 @@ def context(
     try:
         from know.stats import StatsTracker
         StatsTracker(config).record_context(
-            query, budget, int(payload.get("used_tokens", 0)), duration_ms,
+            query,
+            budget,
+            int(payload.get("used_tokens", 0)),
+            duration_ms,
+            metadata={
+                "session_id": resolved_session_id or "",
+                "confidence": payload.get("confidence"),
+                "indexing_status": payload.get("indexing_status"),
+                "warnings_count": len(payload.get("warnings", []) or []),
+            },
         )
     except Exception as e:
         logger.debug(f"Stats tracking (context) failed: {e}")

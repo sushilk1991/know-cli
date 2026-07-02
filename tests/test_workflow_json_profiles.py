@@ -75,11 +75,32 @@ def _full_workflow_payload():
             "target": {
                 "file": "src/billing/service.py",
                 "name": "check_cloud_access",
+                "signature": "def check_cloud_access(workspace):",
+                "body": "def check_cloud_access(workspace):\n    return count_active_sessions(workspace) < 3",
                 "line_start": 10,
                 "line_end": 40,
+                "tokens": 12,
             },
-            "callers": [{"name": "handle_request", "file": "src/api/router.py"}],
-            "callees": [{"name": "count_active_sessions", "file": "src/billing/service.py"}],
+            "callers": [
+                {
+                    "name": "handle_request",
+                    "file": "src/api/router.py",
+                    "line_start": 20,
+                    "line_end": 32,
+                    "call_site_line": 24,
+                    "body": "def handle_request():\n    return check_cloud_access(workspace)",
+                }
+            ],
+            "callees": [
+                {
+                    "name": "count_active_sessions",
+                    "file": "src/billing/service.py",
+                    "line_start": 50,
+                    "line_end": 55,
+                    "call_site_line": 12,
+                    "body": "def count_active_sessions(workspace):\n    return 1",
+                }
+            ],
             "call_graph_available": True,
             "call_graph_reason": None,
             "budget_used": 700,
@@ -121,6 +142,12 @@ class TestWorkflowProfiles:
         assert candidates[0]["file_path"] == "src/billing/service.py"
         assert payload["targets"]["selected_file_path"] == "src/billing/service.py"
         assert payload["deep"]["target"]["file_path"] == "src/billing/service.py"
+        assert "check_cloud_access" in payload["deep"]["target"]["body"]
+        assert payload["deep"]["callers"] == 1
+        assert payload["deep"]["callees"] == 1
+        assert payload["deep"]["caller_examples"][0]["file_path"] == "src/api/router.py"
+        assert "handle_request" in payload["deep"]["caller_examples"][0]["body"]
+        assert payload["deep"]["callee_examples"][0]["file_path"] == "src/billing/service.py"
 
     def test_json_default_non_tty_stays_full(self, tmp_project, monkeypatch):
         root, _ = tmp_project
@@ -197,6 +224,74 @@ class TestWorkflowProfiles:
         payload = json.loads(result.output)
         assert payload["metrics"]["profile"] == "compact"
         assert "map" not in payload
+        assert payload["metrics"]["map_tokens"] == 40
+
+    def test_read_only_workflow_suppresses_side_effects(self, tmp_project, monkeypatch):
+        root, _ = tmp_project
+        from know.cli import cli
+
+        class _FakeDB:
+            def search_signatures(self, query, limit):
+                return _full_workflow_payload()["map"]["results"]
+
+            def close(self):
+                pass
+
+        class _FakeEngine:
+            def __init__(self, config):
+                self.config = config
+
+            def build_context(self, *args, **kwargs):
+                assert kwargs["session_id"] is None
+                return _full_workflow_payload()["context"]
+
+            def format_agent_json(self, result):
+                return json.dumps(result)
+
+            def build_deep_context(self, *args, **kwargs):
+                assert kwargs["session_id"] is None
+                return _full_workflow_payload()["deep"]
+
+        class _FakeKnowledgeBase:
+            def __init__(self, config):
+                self.config = config
+
+            def get_relevant_context(self, *args, **kwargs):
+                return ""
+
+        get_daemon_client = MagicMock()
+
+        monkeypatch.setattr("know.cli.agent._stdout_is_tty", lambda: False, raising=False)
+        monkeypatch.setattr("know.context_engine.ContextEngine", _FakeEngine)
+        monkeypatch.setattr("know.knowledge_base.KnowledgeBase", _FakeKnowledgeBase)
+
+        runner = CliRunner()
+        with (
+            patch("know.cli.agent._get_daemon_client", get_daemon_client),
+            patch("know.cli.agent._get_db_fallback", return_value=_FakeDB()),
+            patch("know.memory_capture.capture_workflow_decision") as capture,
+            patch("know.stats.StatsTracker.record_workflow") as record_workflow,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(root / ".know" / "config.yaml"),
+                    "--json",
+                    "workflow",
+                    "billing",
+                    "--json-compact",
+                    "--read-only",
+                ],
+            )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["session_id"] is None
+        assert payload["usage"]["details"]["read_only"] is True
+        get_daemon_client.assert_not_called()
+        capture.assert_not_called()
+        record_workflow.assert_not_called()
 
     def test_profile_flags_are_mutually_exclusive(self, tmp_project):
         root, _ = tmp_project

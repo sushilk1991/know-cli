@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-from conftest import RESULTS_DIR, get_know_version
+from conftest import BENCHMARK_REPO, RESULTS_DIR, get_know_version
 
 
 def load_json(filename: str) -> dict | None:
@@ -18,7 +18,7 @@ def generate_report() -> str:
     version = get_know_version()
     lines = [
         f"# know-cli v{version} Benchmark Report",
-        f"Codebase: farfield (764 files, 2487 functions, TypeScript+Python monorepo)",
+        f"Codebase: {BENCHMARK_REPO}",
         "",
     ]
 

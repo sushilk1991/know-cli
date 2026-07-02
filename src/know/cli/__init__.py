@@ -383,6 +383,11 @@ def ask(
         deep_budget=deep_budget,
         session_id=session_id,
         include_tests=include_tests,
+        mode="implement",
+        max_latency_ms=6000,
+        json_compact=False,
+        json_full=False,
+        read_only=False,
     )
 
 

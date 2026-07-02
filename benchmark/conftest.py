@@ -3,12 +3,16 @@
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-FARFIELD_DIR = Path("/Users/sushil/Code/Github/farfield")
 BENCHMARK_DIR = Path(__file__).parent
+ROOT = BENCHMARK_DIR.parent
+BENCHMARK_REPO = Path(os.environ.get("KNOW_BENCH_REPO", str(ROOT))).expanduser().resolve()
+# Backward-compatible alias for older benchmark modules.
+FARFIELD_DIR = BENCHMARK_REPO
 RESULTS_DIR = BENCHMARK_DIR / "results"
 ANSWER_KEYS_DIR = BENCHMARK_DIR / "answer_keys"
 
@@ -71,7 +75,7 @@ V7_DEEP_BUDGET = 3000        # v0.7.0 tier-3 budget
 MAP_LIMIT = 20               # v0.7.0 tier-1 map results
 
 # Agent config
-AGENT_MODEL = "claude-sonnet-4-5-20250929"
+AGENT_MODEL = os.environ.get("KNOW_BENCH_MODEL", "claude-opus-4-8")
 AGENT_MAX_TURNS = 20
 AGENT_TEMPERATURE = 0
 
@@ -79,7 +83,7 @@ AGENT_TEMPERATURE = 0
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def run_know(args: list[str], cwd: Path = FARFIELD_DIR) -> dict:
     """Run a know CLI command with --json and return parsed output."""
-    cmd = ["know", "--json"] + args
+    cmd = [sys.executable, "-m", "know.cli", "--json"] + args
     result = subprocess.run(
         cmd, capture_output=True, text=True, cwd=str(cwd), timeout=60,
     )
@@ -93,7 +97,7 @@ def run_know(args: list[str], cwd: Path = FARFIELD_DIR) -> dict:
 
 def run_know_text(args: list[str], cwd: Path = FARFIELD_DIR) -> str:
     """Run a know CLI command and return raw text output."""
-    cmd = ["know"] + args
+    cmd = [sys.executable, "-m", "know.cli"] + args
     result = subprocess.run(
         cmd, capture_output=True, text=True, cwd=str(cwd), timeout=60,
     )

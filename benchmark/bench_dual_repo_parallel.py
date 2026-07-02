@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Parallel dual-repo benchmark: grep+read baseline vs know single-daemon workflow.
+"""Parallel dual-repo benchmark: grep+read baseline vs know workflow.
 
 Runs two "agents" in parallel per query:
   - grep_read: keyword grep + full file reads
-  - know_single_daemon_workflow: know workflow (single daemon RPC)
+  - know_single_workflow: know workflow (single CLI call)
 
 Outputs:
   - benchmark/results/dual_repo_parallel.json
@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -57,6 +58,40 @@ CODE_GLOBS = [
     "*.rs",
     "*.swift",
 ]
+
+KNOW_CMD = [sys.executable, "-m", "know.cli"]
+
+MODE_DEFAULTS = {
+    "explore": {"map_limit": 30, "context_budget": 3500, "deep_budget": 0, "max_latency_ms": 2500},
+    "implement": {"map_limit": 20, "context_budget": 4000, "deep_budget": 3000, "max_latency_ms": 6000},
+    "thorough": {"map_limit": 30, "context_budget": 6000, "deep_budget": 4500, "max_latency_ms": 15000},
+}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+DEFAULT_WORKFLOW_MODE = os.environ.get("KNOW_BENCH_WORKFLOW_MODE", "thorough")
+if DEFAULT_WORKFLOW_MODE not in MODE_DEFAULTS:
+    DEFAULT_WORKFLOW_MODE = "thorough"
+DEFAULT_WORKFLOW_DEFAULTS = MODE_DEFAULTS[DEFAULT_WORKFLOW_MODE]
+DEFAULT_MAX_LATENCY_MS = _env_int(
+    "KNOW_BENCH_MAX_LATENCY_MS",
+    DEFAULT_WORKFLOW_DEFAULTS["max_latency_ms"],
+)
+DEFAULT_MAP_LIMIT = _env_int("KNOW_BENCH_MAP_LIMIT", DEFAULT_WORKFLOW_DEFAULTS["map_limit"])
+DEFAULT_CONTEXT_BUDGET = _env_int(
+    "KNOW_BENCH_CONTEXT_BUDGET",
+    DEFAULT_WORKFLOW_DEFAULTS["context_budget"],
+)
+DEFAULT_DEEP_BUDGET = _env_int("KNOW_BENCH_DEEP_BUDGET", DEFAULT_WORKFLOW_DEFAULTS["deep_budget"])
 
 STOP_WORDS = {
     "and", "or", "the", "how", "what", "where", "when", "why", "with", "from",
@@ -138,31 +173,58 @@ def _parse_know_json(result: CommandResult) -> Dict[str, Any]:
         return {"error": "invalid_json", "raw": result.stdout[:500]}
 
 
-def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
+def run_know_agent(
+    repo: Path,
+    query: str,
+    *,
+    mode: str = DEFAULT_WORKFLOW_MODE,
+    max_latency_ms: int = DEFAULT_MAX_LATENCY_MS,
+    map_limit: int = DEFAULT_MAP_LIMIT,
+    context_budget: int = DEFAULT_CONTEXT_BUDGET,
+    deep_budget: int = DEFAULT_DEEP_BUDGET,
+    read_only: bool = True,
+) -> Dict[str, Any]:
     start = time.monotonic()
     workflow_t0 = time.monotonic()
-    workflow_raw = run_cmd(
-        [
-            "know", "--json", "workflow", query,
-            "--map-limit", "20",
-            "--context-budget", "4000",
-            "--deep-budget", "3000",
-            "--session", "auto",
-        ],
-        cwd=repo,
-    )
+    cmd = [
+        *KNOW_CMD, "--json", "workflow", query,
+        "--json-compact",
+        "--mode", mode,
+        "--max-latency-ms", str(max_latency_ms),
+        "--map-limit", str(map_limit),
+        "--context-budget", str(context_budget),
+        "--deep-budget", str(deep_budget),
+        "--session", "auto",
+    ]
+    if read_only:
+        cmd.append("--read-only")
+    workflow_raw = run_cmd(cmd, cwd=repo)
     workflow_elapsed = time.monotonic() - workflow_t0
     workflow_data = _parse_know_json(workflow_raw)
 
     map_data = workflow_data.get("map", {}) if isinstance(workflow_data, dict) else {}
-    map_tokens = int(map_data.get("tokens", 0) or 0)
     ctx_data = workflow_data.get("context", {}) if isinstance(workflow_data, dict) else {}
     deep_data = workflow_data.get("deep", {}) if isinstance(workflow_data, dict) else {}
+    metrics = workflow_data.get("metrics", {}) if isinstance(workflow_data, dict) else {}
 
-    ctx_tokens = int(ctx_data.get("used_tokens", 0) or 0)
-    deep_tokens = int(deep_data.get("budget_used", deep_data.get("used_tokens", 0)) or 0)
-    total_tokens = int(workflow_data.get("total_tokens", map_tokens + ctx_tokens + deep_tokens) or 0)
+    map_tokens = int(map_data.get("tokens", metrics.get("map_tokens", 0)) or 0)
+    ctx_tokens = int(ctx_data.get("used_tokens", metrics.get("context_tokens", 0)) or 0)
+    deep_tokens = int(
+        deep_data.get(
+            "budget_used",
+            deep_data.get("used_tokens", metrics.get("deep_tokens", 0)),
+        ) or 0
+    )
+    retrieval_tokens = int(
+        workflow_data.get(
+            "total_tokens",
+            metrics.get("total_tokens", map_tokens + ctx_tokens + deep_tokens),
+        ) or 0
+    )
+    if not map_tokens and retrieval_tokens:
+        map_tokens = max(0, retrieval_tokens - ctx_tokens - deep_tokens)
     payload_bytes = len((workflow_raw.stdout or "").encode("utf-8"))
+    payload_tokens = count_tokens(workflow_raw.stdout or "", provider="anthropic")
     elapsed = time.monotonic() - start
 
     tool_calls = 1
@@ -171,6 +233,18 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
         tool_calls = 1
 
     deep_error = deep_data.get("error") if isinstance(deep_data, dict) else None
+    target = deep_data.get("target") if isinstance(deep_data, dict) else {}
+    if not isinstance(target, dict):
+        target = {}
+
+    def _edge_count(value: Any) -> int:
+        if isinstance(value, list):
+            return len(value)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     fallback_triggered = bool(
         workflow_data.get("error")
         or map_data.get("error")
@@ -179,13 +253,21 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
     )
 
     return {
-        "strategy": "know_single_daemon_workflow",
+        "strategy": "know_single_workflow",
         "query": query,
         "tool_calls": tool_calls,
         "elapsed_s": round(elapsed, 3),
-        "tokens": total_tokens,
+        "tokens": payload_tokens,
+        "retrieval_tokens": retrieval_tokens,
         "payload_bytes": payload_bytes,
+        "payload_tokens": payload_tokens,
         "fallback_triggered": fallback_triggered,
+        "workflow_mode": metrics.get("mode", workflow_data.get("workflow_mode", mode)),
+        "latency_budget_ms": metrics.get(
+            "latency_budget_ms",
+            workflow_data.get("latency_budget_ms", max_latency_ms),
+        ),
+        "read_only": read_only,
         "map_tokens": map_tokens,
         "context_tokens": ctx_tokens,
         "deep_tokens": deep_tokens,
@@ -195,9 +277,9 @@ def run_know_agent(repo: Path, query: str) -> Dict[str, Any]:
         "call_graph": {
             "available": deep_data.get("call_graph_available") if isinstance(deep_data, dict) else None,
             "reason": deep_data.get("call_graph_reason") if isinstance(deep_data, dict) else None,
-            "callers": len(deep_data.get("callers", [])) if isinstance(deep_data, dict) else 0,
-            "callees": len(deep_data.get("callees", [])) if isinstance(deep_data, dict) else 0,
-            "target": (deep_data.get("target") or {}).get("name") if isinstance(deep_data, dict) else None,
+            "callers": _edge_count(deep_data.get("callers")) if isinstance(deep_data, dict) else 0,
+            "callees": _edge_count(deep_data.get("callees")) if isinstance(deep_data, dict) else 0,
+            "target": target.get("name"),
         },
         "errors": {
             "workflow": workflow_data.get("error") if isinstance(workflow_data, dict) else "unknown",
@@ -261,7 +343,17 @@ def run_grep_agent(repo: Path, query: str, max_files: int = 12) -> Dict[str, Any
     }
 
 
-def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
+def benchmark_repo(
+    repo: Path,
+    queries: List[str],
+    *,
+    mode: str = DEFAULT_WORKFLOW_MODE,
+    max_latency_ms: int = DEFAULT_MAX_LATENCY_MS,
+    map_limit: int = DEFAULT_MAP_LIMIT,
+    context_budget: int = DEFAULT_CONTEXT_BUDGET,
+    deep_budget: int = DEFAULT_DEEP_BUDGET,
+    read_only: bool = True,
+) -> Dict[str, Any]:
     if not repo.exists():
         return {
             "repo": str(repo),
@@ -274,43 +366,76 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
     cold_probe = None
     try:
         stop_project_daemon(repo)
-        cold_probe = run_know_agent(repo, queries[0])
+        cold_probe = run_know_agent(
+            repo,
+            queries[0],
+            mode=mode,
+            max_latency_ms=max_latency_ms,
+            map_limit=map_limit,
+            context_budget=context_budget,
+            deep_budget=deep_budget,
+            read_only=read_only,
+        )
     except Exception:
         cold_probe = None
 
     # Warm know index/cache so measured query latency is steady-state.
-    _ = run_cmd(["know", "--json", "status"], cwd=repo, timeout=120)
+    _ = run_cmd([*KNOW_CMD, "--json", "status"], cwd=repo, timeout=120)
 
     know_version = None
-    status_result = run_cmd(["know", "--json", "status"], cwd=repo, timeout=120)
+    status_result = run_cmd([*KNOW_CMD, "--json", "status"], cwd=repo, timeout=120)
     status_data = _parse_know_json(status_result)
     if isinstance(status_data, dict):
         know_version = status_data.get("version")
 
     # Warm-up one workflow call so measured queries are steady-state.
     try:
-        run_know_agent(repo, "__warmup__ indexing readiness")
+        run_know_agent(
+            repo,
+            "__warmup__ indexing readiness",
+            mode=mode,
+            max_latency_ms=max_latency_ms,
+            map_limit=map_limit,
+            context_budget=context_budget,
+            deep_budget=deep_budget,
+            read_only=read_only,
+        )
     except Exception:
         pass
 
     query_rows = []
     for query in queries:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            know_future = pool.submit(run_know_agent, repo, query)
+            know_future = pool.submit(
+                run_know_agent,
+                repo,
+                query,
+                mode=mode,
+                max_latency_ms=max_latency_ms,
+                map_limit=map_limit,
+                context_budget=context_budget,
+                deep_budget=deep_budget,
+                read_only=read_only,
+            )
             grep_future = pool.submit(run_grep_agent, repo, query)
             know_row = know_future.result()
             grep_row = grep_future.result()
+
+        know_error = bool((know_row.get("errors") or {}).get("workflow"))
+        token_savings = None if know_error else grep_row["tokens"] - know_row["tokens"]
+        token_savings_pct = (
+            round((token_savings / grep_row["tokens"]) * 100, 1)
+            if token_savings is not None and grep_row["tokens"]
+            else None
+        )
 
         query_rows.append({
             "query": query,
             "know": know_row,
             "grep": grep_row,
             "delta": {
-                "token_savings": grep_row["tokens"] - know_row["tokens"],
-                "token_savings_pct": round(
-                    ((grep_row["tokens"] - know_row["tokens"]) / grep_row["tokens"]) * 100,
-                    1,
-                ) if grep_row["tokens"] else None,
+                "token_savings": token_savings,
+                "token_savings_pct": token_savings_pct,
                 "latency_ratio_know_over_grep": round(
                     know_row["elapsed_s"] / grep_row["elapsed_s"], 2,
                 ) if grep_row["elapsed_s"] else None,
@@ -329,6 +454,15 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
     grep_calls = sum(q["grep"]["tool_calls"] for q in query_rows)
     know_payload_bytes = sum(q["know"].get("payload_bytes", 0) for q in query_rows)
     fallback_count = sum(1 for q in query_rows if q["know"].get("fallback_triggered"))
+    error_count = sum(1 for q in query_rows if (q["know"].get("errors") or {}).get("workflow"))
+    successful_rows = [
+        q for q in query_rows
+        if not (q["know"].get("errors") or {}).get("workflow")
+    ]
+    quality_rows = [
+        q for q in successful_rows
+        if not q["know"].get("fallback_triggered")
+    ]
     deep_rows = [q["know"]["call_graph"] for q in query_rows]
     deep_available = [d for d in deep_rows if d.get("available") is True]
     non_empty_deep = [
@@ -337,6 +471,9 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
     know_warm_latencies = [q["know"]["elapsed_s"] for q in query_rows]
 
     summary = {
+        "workflow_mode": mode,
+        "latency_budget_ms": max_latency_ms,
+        "read_only": read_only,
         "know_tokens_total": know_tokens,
         "grep_tokens_total": grep_tokens,
         "know_payload_bytes_total": know_payload_bytes,
@@ -348,14 +485,34 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
         "know_tool_calls_total": know_calls,
         "grep_tool_calls_total": grep_calls,
         "fallback_count": fallback_count,
+        "error_count": error_count,
+        "quality_gate_passed": error_count == 0 and fallback_count == 0,
+        "success_rate_pct": round(
+            ((len(query_rows) - error_count) / len(query_rows)) * 100,
+            1,
+        ) if query_rows else 0.0,
         "fallback_rate_pct": round((fallback_count / len(query_rows)) * 100, 1) if query_rows else 0.0,
         "token_reduction_pct": round(
             ((grep_tokens - know_tokens) / grep_tokens) * 100, 1
-        ) if grep_tokens else None,
+        ) if grep_tokens and error_count == 0 else None,
+        "quality_adjusted_token_reduction_pct": round(
+            (
+                (
+                    sum(q["grep"]["tokens"] for q in quality_rows)
+                    - sum(q["know"]["tokens"] for q in quality_rows)
+                )
+                / sum(q["grep"]["tokens"] for q in quality_rows)
+            )
+            * 100,
+            1,
+        ) if quality_rows and sum(q["grep"]["tokens"] for q in quality_rows) else None,
         "latency_ratio_know_over_grep": round(
             know_time / grep_time, 2
         ) if grep_time else None,
         "tool_call_reduction_pct": round(
+            ((grep_calls - know_calls) / grep_calls) * 100, 1
+        ) if grep_calls else None,
+        "lookup_call_reduction_pct": round(
             ((grep_calls - know_calls) / grep_calls) * 100, 1
         ) if grep_calls else None,
         "deep_call_graph_available_rate": round(
@@ -376,13 +533,17 @@ def benchmark_repo(repo: Path, queries: List[str]) -> Dict[str, Any]:
 
 def render_markdown(data: Dict[str, Any]) -> str:
     lines: List[str] = []
+
+    def _fmt_pct(value: Any) -> str:
+        return "N/A" if value is None else f"{value}%"
+
     lines.append("# Dual-Repo Parallel Benchmark")
     lines.append("")
     lines.append(
         f"- Generated at: {data['generated_at']}"
     )
     lines.append(
-        "- Strategies: `grep+read` baseline vs `know workflow` (single daemon RPC)"
+        "- Strategies: `grep+read` baseline vs `know workflow` (single CLI call)"
     )
     lines.append("- Language globs: `py, ts, tsx, js, jsx, go, rs, swift`")
     lines.append("")
@@ -400,10 +561,18 @@ def render_markdown(data: Dict[str, Any]) -> str:
         lines.append(
             f"- know version: `{repo_row.get('know_version')}`"
         )
+        gate = "PASS" if summary.get("quality_gate_passed") else "FAIL"
         lines.append(
-            f"- Token reduction: `{summary.get('token_reduction_pct')}%` | "
+            f"- Workflow: `{summary.get('workflow_mode')}` | "
+            f"Latency budget: `{summary.get('latency_budget_ms')}ms` | "
+            f"Read-only: `{summary.get('read_only')}` | "
+            f"Quality gate: `{gate}`"
+        )
+        lines.append(
+            f"- Raw token reduction: `{_fmt_pct(summary.get('token_reduction_pct'))}` | "
+            f"Quality-adjusted: `{_fmt_pct(summary.get('quality_adjusted_token_reduction_pct'))}` | "
             f"Latency ratio (know/grep): `{summary.get('latency_ratio_know_over_grep')}x` | "
-            f"Tool-call reduction: `{summary.get('tool_call_reduction_pct')}%`"
+            f"Lookup-call reduction: `{summary.get('lookup_call_reduction_pct')}%`"
         )
         lines.append(
             f"- Warm p50/p95: `{summary.get('know_warm_p50_s')}s / {summary.get('know_warm_p95_s')}s` | "
@@ -411,20 +580,25 @@ def render_markdown(data: Dict[str, Any]) -> str:
             f"Fallback rate: `{summary.get('fallback_rate_pct')}%`"
         )
         lines.append(
+            f"- Success rate: `{_fmt_pct(summary.get('success_rate_pct'))}` | "
+            f"Errors: `{summary.get('error_count')}`"
+        )
+        lines.append(
             f"- Deep call-graph available: `{summary.get('deep_call_graph_available_rate')}%` "
             f"| non-empty edges: `{summary.get('deep_non_empty_edges_rate')}%`"
         )
         lines.append("")
         lines.append(
-            "| Query | Grep Tokens | know Tokens | Token Savings | Grep Time (s) | "
-            "know Time (s) | know Payload (bytes) | Fallback |"
+            "| Query | Grep Tokens | know Payload Tokens | Retrieval Tokens | Token Savings | "
+            "Grep Time (s) | know Time (s) | know Payload (bytes) | Fallback |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in repo_row["queries"]:
             delta = row["delta"]
             lines.append(
                 f"| {row['query']} | {row['grep']['tokens']:,} | {row['know']['tokens']:,} | "
-                f"{delta['token_savings_pct']}% | {row['grep']['elapsed_s']} | {row['know']['elapsed_s']} | "
+                f"{row['know'].get('retrieval_tokens', 0):,} | {_fmt_pct(delta['token_savings_pct'])} | "
+                f"{row['grep']['elapsed_s']} | {row['know']['elapsed_s']} | "
                 f"{row['know'].get('payload_bytes', 0):,} | "
                 f"{'yes' if row['know'].get('fallback_triggered') else 'no'} |"
             )
@@ -453,6 +627,41 @@ def main():
         default=str(RESULTS_DIR),
         help="Directory for benchmark artifacts (default: benchmark/results)",
     )
+    parser.add_argument(
+        "--workflow-mode",
+        choices=sorted(MODE_DEFAULTS),
+        default=DEFAULT_WORKFLOW_MODE,
+        help="know workflow mode to benchmark (default: thorough)",
+    )
+    parser.add_argument(
+        "--max-latency-ms",
+        type=int,
+        default=DEFAULT_MAX_LATENCY_MS,
+        help="know workflow latency budget in ms",
+    )
+    parser.add_argument(
+        "--map-limit",
+        type=int,
+        default=DEFAULT_MAP_LIMIT,
+        help="know workflow map result limit",
+    )
+    parser.add_argument(
+        "--context-budget",
+        type=int,
+        default=DEFAULT_CONTEXT_BUDGET,
+        help="know workflow context token budget",
+    )
+    parser.add_argument(
+        "--deep-budget",
+        type=int,
+        default=DEFAULT_DEEP_BUDGET,
+        help="know workflow deep token budget",
+    )
+    parser.add_argument(
+        "--allow-side-effects",
+        action="store_true",
+        help="Allow benchmark workflow calls to write sessions, stats, and memories.",
+    )
     args = parser.parse_args()
 
     repos = [Path(p).expanduser().resolve() for p in (args.repos or DEFAULT_REPOS)]
@@ -464,12 +673,27 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.monotonic()
-    repo_rows = [benchmark_repo(repo, queries) for repo in repos]
+    repo_rows = [
+        benchmark_repo(
+            repo,
+            queries,
+            mode=args.workflow_mode,
+            max_latency_ms=args.max_latency_ms,
+            map_limit=args.map_limit,
+            context_budget=args.context_budget,
+            deep_budget=args.deep_budget,
+            read_only=not args.allow_side_effects,
+        )
+        for repo in repos
+    ]
     elapsed = round(time.monotonic() - started, 3)
 
     out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_s": elapsed,
+        "workflow_mode": args.workflow_mode,
+        "latency_budget_ms": args.max_latency_ms,
+        "read_only": not args.allow_side_effects,
         "queries": queries,
         "repos": repo_rows,
     }

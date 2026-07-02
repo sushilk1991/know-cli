@@ -6,9 +6,8 @@ SQLite database (`.know/stats.db`).  Powers the `know stats` command.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-import time
-from pathlib import Path
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from know.logger import get_logger
@@ -79,25 +78,129 @@ class StatsTracker:
         budget: int,
         tokens_used: int,
         duration_ms: int,
+        metadata: Optional[dict[str, Any]] = None,
     ):
         """Record a `know context` call."""
-        self._insert("context", query=query, budget=budget,
-                      tokens_used=tokens_used, duration_ms=duration_ms)
+        payload = dict(metadata or {})
+        self._insert(
+            "context",
+            query=query,
+            budget=budget,
+            tokens_used=tokens_used,
+            duration_ms=duration_ms,
+            metadata=json.dumps(payload, ensure_ascii=True),
+        )
 
     def record_search(self, query: str, results_count: int, duration_ms: int):
         """Record a `know search` call."""
-        self._insert("search", query=query, duration_ms=duration_ms,
-                      metadata=f'{{"results": {results_count}}}')
+        self._insert(
+            "search",
+            query=query,
+            duration_ms=duration_ms,
+            metadata=json.dumps({"results": int(results_count)}, ensure_ascii=True),
+        )
+
+    def record_map(
+        self,
+        query: str,
+        results_count: int,
+        duration_ms: int,
+        tokens_used: int = 0,
+        session_id: str = "",
+    ):
+        """Record a `know map` retrieval call."""
+        self._insert(
+            "map",
+            query=query,
+            tokens_used=tokens_used,
+            duration_ms=duration_ms,
+            metadata=json.dumps(
+                {
+                    "results": int(results_count),
+                    "session_id": session_id or "",
+                },
+                ensure_ascii=True,
+            ),
+        )
+
+    def record_deep(
+        self,
+        name: str,
+        duration_ms: int,
+        tokens_used: int,
+        *,
+        call_graph_available: Optional[bool] = None,
+        callers_count: int = 0,
+        callees_count: int = 0,
+        session_id: str = "",
+        error: str = "",
+    ):
+        """Record a `know deep` retrieval call."""
+        self._insert(
+            "deep",
+            query=name,
+            tokens_used=tokens_used,
+            duration_ms=duration_ms,
+            metadata=json.dumps(
+                {
+                    "call_graph_available": call_graph_available,
+                    "callers_count": int(callers_count),
+                    "callees_count": int(callees_count),
+                    "session_id": session_id or "",
+                    "error": error or "",
+                },
+                ensure_ascii=True,
+            ),
+        )
+
+    def record_workflow(
+        self,
+        query: str,
+        duration_ms: int,
+        tokens_used: int,
+        *,
+        mode: str = "implement",
+        degraded_by_latency: bool = False,
+        call_graph_available: Optional[bool] = None,
+        callers_count: int = 0,
+        callees_count: int = 0,
+        session_id: str = "",
+    ):
+        """Record a `know workflow` retrieval call."""
+        self._insert(
+            "workflow",
+            query=query,
+            tokens_used=tokens_used,
+            duration_ms=duration_ms,
+            metadata=json.dumps(
+                {
+                    "mode": mode,
+                    "degraded_by_latency": bool(degraded_by_latency),
+                    "call_graph_available": call_graph_available,
+                    "callers_count": int(callers_count),
+                    "callees_count": int(callees_count),
+                    "session_id": session_id or "",
+                },
+                ensure_ascii=True,
+            ),
+        )
 
     def record_remember(self, text: str, source: str = "manual"):
         """Record a `know remember` call."""
-        self._insert("remember", query=text,
-                      metadata=f'{{"source": "{source}"}}')
+        self._insert(
+            "remember",
+            query=text,
+            metadata=json.dumps({"source": source}, ensure_ascii=True),
+        )
 
     def record_recall(self, query: str, results_count: int, duration_ms: int):
         """Record a `know recall` call."""
-        self._insert("recall", query=query, duration_ms=duration_ms,
-                      metadata=f'{{"results": {results_count}}}')
+        self._insert(
+            "recall",
+            query=query,
+            duration_ms=duration_ms,
+            metadata=json.dumps({"results": int(results_count)}, ensure_ascii=True),
+        )
 
     def _insert(self, event_type: str, **kwargs):
         conn = self._get_conn()
@@ -160,6 +263,111 @@ class StatsTracker:
             "search_avg_ms": int(srch["avg_ms"]),
             "remember_count": rem[0],
             "recall_count": rec[0],
+        }
+
+    @staticmethod
+    def _percentile(values: list[int], p: float) -> int:
+        if not values:
+            return 0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return int(ordered[0])
+
+        rank = (len(ordered) - 1) * p
+        low = int(rank)
+        high = min(low + 1, len(ordered) - 1)
+        frac = rank - low
+        return int(round(ordered[low] * (1.0 - frac) + ordered[high] * frac))
+
+    @staticmethod
+    def _parse_metadata(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def get_retrieval_summary(self, days: int = 30) -> dict[str, Any]:
+        """Return retrieval-focused analytics for map/context/deep/workflow."""
+        conn = self._get_conn()
+        event_types = ("map", "context", "deep", "workflow")
+
+        rows = conn.execute(
+            """
+            SELECT event_type, tokens_used, duration_ms, metadata
+            FROM events
+            WHERE event_type IN ('map', 'context', 'deep', 'workflow')
+              AND created_at >= DATETIME('now', ?)
+            ORDER BY created_at DESC
+            """,
+            (f"-{int(days)} days",),
+        ).fetchall()
+
+        durations: dict[str, list[int]] = {k: [] for k in event_types}
+        tokens: dict[str, list[int]] = {k: [] for k in event_types}
+        counts: dict[str, int] = {k: 0 for k in event_types}
+
+        workflow_total = 0
+        workflow_degraded = 0
+        workflow_call_graph_true = 0
+        workflow_non_empty_edges = 0
+
+        for row in rows:
+            event_type = str(row["event_type"] or "")
+            if event_type not in counts:
+                continue
+
+            duration_ms = int(row["duration_ms"] or 0)
+            token_count = int(row["tokens_used"] or 0)
+            counts[event_type] += 1
+            durations[event_type].append(duration_ms)
+            tokens[event_type].append(token_count)
+
+            if event_type == "workflow":
+                workflow_total += 1
+                metadata = self._parse_metadata(row["metadata"])
+                if bool(metadata.get("degraded_by_latency")):
+                    workflow_degraded += 1
+                if metadata.get("call_graph_available") is True:
+                    workflow_call_graph_true += 1
+                callers_count = int(metadata.get("callers_count") or 0)
+                callees_count = int(metadata.get("callees_count") or 0)
+                if callers_count + callees_count > 0:
+                    workflow_non_empty_edges += 1
+
+        command_summary: dict[str, dict[str, int]] = {}
+        for event_type in event_types:
+            cnt = counts[event_type]
+            avg_tokens = int(round(sum(tokens[event_type]) / cnt)) if cnt else 0
+            command_summary[event_type] = {
+                "count": cnt,
+                "p50_ms": self._percentile(durations[event_type], 0.50),
+                "p95_ms": self._percentile(durations[event_type], 0.95),
+                "avg_tokens": avg_tokens,
+            }
+
+        def _pct(numerator: int, denominator: int) -> float:
+            if denominator <= 0:
+                return 0.0
+            return round((numerator / denominator) * 100.0, 1)
+
+        return {
+            "window_days": int(days),
+            "commands": command_summary,
+            "workflow_quality": {
+                "degraded_by_latency_rate_pct": _pct(workflow_degraded, workflow_total),
+                "call_graph_available_rate_pct": _pct(workflow_call_graph_true, workflow_total),
+                "non_empty_edge_rate_pct": _pct(workflow_non_empty_edges, workflow_total),
+            },
         }
 
     # ------------------------------------------------------------------

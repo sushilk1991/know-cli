@@ -770,6 +770,9 @@ class KnowDaemon:
         if max_latency_ms <= 0:
             max_latency_ms = 0
         session_id = params.get("session_id")
+        read_only = bool(params.get("read_only", False))
+        if read_only:
+            session_id = None
         explicit_deep_name = params.get("deep_name")
 
         deadline = workflow_started + (max_latency_ms / 1000.0) if max_latency_ms > 0 else None
@@ -779,13 +782,13 @@ class KnowDaemon:
                 return 10**9
             return max(0, int((deadline - time.monotonic()) * 1000))
 
-        if not session_id:
+        if not read_only and not session_id:
             try:
                 session_id = self.db.create_session()
             except Exception:
                 session_id = None
 
-        if session_id:
+        if not read_only and session_id:
             try:
                 from know.runtime_context import set_active_session_id
                 set_active_session_id(self.config, session_id)
@@ -910,6 +913,7 @@ class KnowDaemon:
         payload = {
             "query": query,
             "session_id": session_id,
+            "read_only": read_only,
             "daemon_api_version": DAEMON_API_VERSION,
             "workflow_mode": mode,
             "latency_budget_ms": max_latency_ms,
@@ -938,19 +942,20 @@ class KnowDaemon:
         }
 
         # Persist high-signal decision memory for future sessions.
-        try:
-            from know.memory_capture import capture_workflow_decision
+        if not read_only:
+            try:
+                from know.memory_capture import capture_workflow_decision
 
-            capture_workflow_decision(
-                self.config,
-                query,
-                payload,
-                session_id=session_id,
-                source="auto-workflow",
-                agent="daemon",
-            )
-        except Exception as e:
-            logger.debug(f"Daemon workflow decision capture failed: {e}")
+                capture_workflow_decision(
+                    self.config,
+                    query,
+                    payload,
+                    session_id=session_id,
+                    source="auto-workflow",
+                    agent="daemon",
+                )
+            except Exception as e:
+                logger.debug(f"Daemon workflow decision capture failed: {e}")
 
         return payload
 
