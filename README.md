@@ -30,34 +30,40 @@ Session dedup means the second query never re-sends code from the first.
 
 ## Benchmarks
 
-### Dual-Repo Parallel Benchmark (v0.8.7, February 26, 2026)
+### Workflow Benchmark (current `main`, July 3, 2026)
 
 Method:
-- Ran in parallel per query: `grep+read` baseline vs `know workflow` (single daemon RPC).
-- 10 shared architecture questions, on both repos.
-- File coverage in baseline search: `py, ts, tsx, js, jsx, go, rs, swift`.
-- Includes one warm-up workflow call per repo before measured queries (steady-state).
+- Repo: `know-cli`, 10 architecture/code-navigation queries.
+- Baseline: `grep+read` with common code extensions.
+- Candidate: `know workflow --json-compact --read-only`, measured across workflow modes.
+- Reported token reduction uses workflow payload tokens, with a separate quality-adjusted reduction that excludes degraded/fallback rows.
 
-| Repo | Grep Tokens (10 queries) | know Tokens (10 queries) | Token Reduction | Grep Time | know Time | Latency (know/grep) | Tool Calls (grep -> know) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `know-cli` | 670,957 | 48,687 | **92.7%** | 0.803s | 1.901s | 2.37x | 160 -> 10 |
-| `third-party-repo` | 817,029 | 38,064 | **95.3%** | 1.702s | 2.873s | 1.69x | 160 -> 10 |
+| Profile | Grep Tokens | know Tokens | Quality-Adjusted Reduction | Warm p50/p95 | Quality Gate | Deep Graph |
+|---|---:|---:|---:|---:|---:|---:|
+| `explore` | 715,514 | 12,993 | n/a | 0.419s / 0.430s | fail (deep skipped) | 0% available |
+| `implement --max-latency-ms 2000` | 715,514 | 24,501 | **96.6%** | 1.181s / 1.350s | pass | 100% available, 90% non-empty |
+| `implement` | 715,514 | 24,595 | **96.6%** | 1.369s / 1.528s | pass | 100% available, 90% non-empty |
+| `thorough` | 715,514 | 27,293 | **96.2%** | 1.423s / 1.573s | pass | 100% available, 100% non-empty |
 
-Deep call-graph quality snapshot from the same run:
-- `know-cli`: call-graph available in 100% of deep queries, non-empty edges in 100%.
-- `third-party-repo`: call-graph available in 90%, non-empty edges in 70%.
+Relevance check from `benchmark/bench_workflow_relevance.py`:
+- `implement --max-latency-ms 2000`: expected file surfaced in 10/10 cases; selected top target matched in 6/10.
+- `thorough --max-latency-ms 15000`: expected file surfaced in 10/10 cases; selected top target matched in 6/10.
+- No latency degradation or deep errors in either relevance run.
 
-Artifacts:
-- `benchmark/results/dual_repo_parallel.json`
-- `benchmark/results/DUAL_REPO_BENCHMARK.md`
-- Runner: `benchmark/bench_dual_repo_parallel.py`
+Reproduce:
+
+```bash
+python benchmark/bench_dual_repo_parallel.py --repo "$PWD" --workflow-mode implement --max-latency-ms 2000 --results-dir /tmp/know-bench
+python benchmark/bench_workflow_relevance.py --repo "$PWD" --workflow-mode implement --max-latency-ms 2000 --refresh-index --output /tmp/know-relevance.json
+```
 
 ### What this means
 
-- **Token and tool-call efficiency is strong now.**
+- **Best default for implementation work:** `know --json workflow "<query>" --mode implement --max-latency-ms 2000 --json-compact`.
 - **Single-daemon workflow significantly cuts orchestration overhead** (tool calls dropped to 1/query).
-- **Latency is still behind raw grep**, but the gap is much smaller than before.
-- The biggest product gap remains **deep call-graph completeness on large TSX/Python codebases**.
+- **Explore is fast but not implementation-safe** because it skips deep context.
+- **Thorough improves deep graph completeness** but did not improve expected-file relevance in this 10-case set.
+- The biggest product gap is now **top-target precision**: expected files are present, but the selected first target was correct in only 60% of the relevance cases.
 
 ---
 
