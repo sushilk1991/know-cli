@@ -60,6 +60,30 @@ def test_run_know_agent_reports_payload_and_fallback(monkeypatch, tmp_path):
     assert "fallback_triggered" in row
 
 
+def test_workflow_defaults_follow_selected_mode():
+    mod = _load_dual_repo_module()
+
+    explore = mod.resolve_workflow_defaults(
+        mode="explore",
+        max_latency_ms=None,
+        map_limit=None,
+        context_budget=None,
+        deep_budget=None,
+    )
+    implement = mod.resolve_workflow_defaults(
+        mode="implement",
+        max_latency_ms=None,
+        map_limit=None,
+        context_budget=None,
+        deep_budget=None,
+    )
+
+    assert explore["max_latency_ms"] == 2500
+    assert explore["deep_budget"] == 0
+    assert implement["max_latency_ms"] == 6000
+    assert implement["deep_budget"] == 3000
+
+
 def test_summary_contains_latency_percentiles():
     mod = _load_dual_repo_module()
 

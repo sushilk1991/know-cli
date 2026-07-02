@@ -173,6 +173,40 @@ def _parse_know_json(result: CommandResult) -> Dict[str, Any]:
         return {"error": "invalid_json", "raw": result.stdout[:500]}
 
 
+def resolve_workflow_defaults(
+    *,
+    mode: str,
+    max_latency_ms: int | None,
+    map_limit: int | None,
+    context_budget: int | None,
+    deep_budget: int | None,
+) -> Dict[str, int]:
+    """Resolve benchmark workflow knobs from the selected mode."""
+    defaults = MODE_DEFAULTS[mode]
+    return {
+        "max_latency_ms": (
+            max_latency_ms
+            if max_latency_ms is not None
+            else _env_int("KNOW_BENCH_MAX_LATENCY_MS", defaults["max_latency_ms"])
+        ),
+        "map_limit": (
+            map_limit
+            if map_limit is not None
+            else _env_int("KNOW_BENCH_MAP_LIMIT", defaults["map_limit"])
+        ),
+        "context_budget": (
+            context_budget
+            if context_budget is not None
+            else _env_int("KNOW_BENCH_CONTEXT_BUDGET", defaults["context_budget"])
+        ),
+        "deep_budget": (
+            deep_budget
+            if deep_budget is not None
+            else _env_int("KNOW_BENCH_DEEP_BUDGET", defaults["deep_budget"])
+        ),
+    }
+
+
 def run_know_agent(
     repo: Path,
     query: str,
@@ -636,26 +670,26 @@ def main():
     parser.add_argument(
         "--max-latency-ms",
         type=int,
-        default=DEFAULT_MAX_LATENCY_MS,
-        help="know workflow latency budget in ms",
+        default=None,
+        help="know workflow latency budget in ms (default: selected mode)",
     )
     parser.add_argument(
         "--map-limit",
         type=int,
-        default=DEFAULT_MAP_LIMIT,
-        help="know workflow map result limit",
+        default=None,
+        help="know workflow map result limit (default: selected mode)",
     )
     parser.add_argument(
         "--context-budget",
         type=int,
-        default=DEFAULT_CONTEXT_BUDGET,
-        help="know workflow context token budget",
+        default=None,
+        help="know workflow context token budget (default: selected mode)",
     )
     parser.add_argument(
         "--deep-budget",
         type=int,
-        default=DEFAULT_DEEP_BUDGET,
-        help="know workflow deep token budget",
+        default=None,
+        help="know workflow deep token budget (default: selected mode)",
     )
     parser.add_argument(
         "--allow-side-effects",
@@ -666,6 +700,13 @@ def main():
 
     repos = [Path(p).expanduser().resolve() for p in (args.repos or DEFAULT_REPOS)]
     queries = args.queries or COMMON_QUERIES
+    workflow_defaults = resolve_workflow_defaults(
+        mode=args.workflow_mode,
+        max_latency_ms=args.max_latency_ms,
+        map_limit=args.map_limit,
+        context_budget=args.context_budget,
+        deep_budget=args.deep_budget,
+    )
     results_dir = Path(args.results_dir).expanduser().resolve()
     results_json = results_dir / "dual_repo_parallel.json"
     results_md = results_dir / "DUAL_REPO_BENCHMARK.md"
@@ -678,10 +719,10 @@ def main():
             repo,
             queries,
             mode=args.workflow_mode,
-            max_latency_ms=args.max_latency_ms,
-            map_limit=args.map_limit,
-            context_budget=args.context_budget,
-            deep_budget=args.deep_budget,
+            max_latency_ms=workflow_defaults["max_latency_ms"],
+            map_limit=workflow_defaults["map_limit"],
+            context_budget=workflow_defaults["context_budget"],
+            deep_budget=workflow_defaults["deep_budget"],
             read_only=not args.allow_side_effects,
         )
         for repo in repos
@@ -692,7 +733,12 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_s": elapsed,
         "workflow_mode": args.workflow_mode,
-        "latency_budget_ms": args.max_latency_ms,
+        "latency_budget_ms": workflow_defaults["max_latency_ms"],
+        "workflow_budgets": {
+            "map_limit": workflow_defaults["map_limit"],
+            "context_budget": workflow_defaults["context_budget"],
+            "deep_budget": workflow_defaults["deep_budget"],
+        },
         "read_only": not args.allow_side_effects,
         "queries": queries,
         "repos": repo_rows,
