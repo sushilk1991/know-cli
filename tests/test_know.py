@@ -230,6 +230,20 @@ class TestConfig:
             assert config.project.name == Path(tmpdir).name
             assert "python" in config.languages
             assert config.output.directory == "docs"
+
+    def test_default_config_includes_benchmark_directories(self):
+        """Benchmark harnesses are source-like code and should be indexed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "benchmark").mkdir()
+            (root / "benchmarks").mkdir()
+
+            config = Config.create_default(root)
+
+            assert "src/" in config.include
+            assert "benchmark/" in config.include
+            assert "benchmarks/" in config.include
     
     def test_config_save_and_load(self):
         """Test saving and loading config."""

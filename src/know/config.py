@@ -68,7 +68,8 @@ class Config:
         "python", "javascript", "typescript", "go", "rust", "swift"
     ])
     include: List[str] = field(default_factory=lambda: [
-        "src/", "lib/", "app/", "packages/", "apps/", "cmd/", "internal/"
+        "src/", "lib/", "app/", "packages/", "apps/", "cmd/", "internal/",
+        "benchmark/", "benchmarks/"
     ])
     exclude: List[str] = field(default_factory=lambda: [
         "**/node_modules/**",
@@ -151,7 +152,8 @@ class Config:
         """Auto-detect common source directories."""
         common_paths = [
             "src", "lib", "app", "packages", "apps", "cmd", "internal",
-            "pkg", "api", "web", "server", "client", "frontend", "backend"
+            "pkg", "api", "web", "server", "client", "frontend", "backend",
+            "benchmark", "benchmarks"
         ]
         
         detected = []

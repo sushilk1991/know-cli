@@ -17,6 +17,16 @@ def _load_dual_repo_module():
     return module
 
 
+def _load_workflow_relevance_module():
+    module_path = Path(__file__).parent.parent / "benchmark" / "bench_workflow_relevance.py"
+    spec = importlib.util.spec_from_file_location("bench_workflow_relevance", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_common_queries_cover_ten_scenarios():
     mod = _load_dual_repo_module()
     assert len(mod.COMMON_QUERIES) == 10
@@ -115,3 +125,75 @@ def test_summary_contains_latency_percentiles():
     assert "Fallback rate" in md
     assert "Quality gate" in md
     assert "Lookup-call reduction" in md
+
+
+def test_workflow_relevance_collects_files_from_compact_payload():
+    mod = _load_workflow_relevance_module()
+
+    payload = {
+        "targets": {
+            "selected_file_path": "src/know/cli/agent.py",
+            "candidates": [{"file_path": "src/know/config.py"}],
+        },
+        "context": {
+            "source_files": ["src/know/stats.py"],
+            "snippets": [{"file": "src/know/daemon.py"}],
+        },
+        "deep": {
+            "target": {"file_path": "src/know/context_engine.py"},
+            "callers": 2,
+            "callees": 3,
+            "caller_examples": [{"file": "src/know/cli/search.py"}],
+            "callee_examples": [{"file_path": "src/know/token_counter.py"}],
+        },
+    }
+
+    files = mod.collect_workflow_files(payload)
+
+    assert "src/know/cli/agent.py" in files
+    assert "src/know/config.py" in files
+    assert "src/know/context_engine.py" in files
+    assert "src/know/token_counter.py" in files
+
+
+def test_workflow_relevance_summary_separates_selected_accuracy(monkeypatch, tmp_path):
+    mod = _load_workflow_relevance_module()
+
+    cases = [
+        {"id": "context", "query": "q1", "expected_files": ["expected.py"]},
+        {"id": "selected", "query": "q2", "expected_files": ["target.py"]},
+    ]
+
+    def _fake_run_workflow(_repo, query, **_kwargs):
+        if query == "q1":
+            return {
+                "ok": True,
+                "elapsed_s": 0.1,
+                "payload_tokens": 100,
+                "retrieval_tokens": 50,
+                "selected_file": "other.py",
+                "files": ["expected.py", "other.py"],
+            }
+        return {
+            "ok": True,
+            "elapsed_s": 0.2,
+            "payload_tokens": 120,
+            "retrieval_tokens": 60,
+            "selected_file": "target.py",
+            "files": ["target.py"],
+        }
+
+    monkeypatch.setattr(mod, "run_workflow", _fake_run_workflow)
+
+    result = mod.run_suite(
+        tmp_path,
+        mode="implement",
+        max_latency_ms=2000,
+        config_path=None,
+        refresh_index=False,
+        cases=cases,
+    )
+
+    assert result["summary"]["relevance_rate_pct"] == 100.0
+    assert result["summary"]["selected_rate_pct"] == 50.0
+    assert result["summary"]["payload_to_retrieval_ratio"] == 2.0

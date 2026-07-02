@@ -8,7 +8,7 @@ Suites 3+4 only run if ANTHROPIC_API_KEY is set.
 import sys
 import time
 
-from conftest import has_api_key, get_know_version
+from conftest import has_api_key, get_know_version, ROOT
 
 
 def main():
@@ -36,7 +36,13 @@ def main():
     from bench_memory_quality import run_suite as run_suite_memory
     run_suite_memory()
 
-    # Suite 2c: Dual-repo parallel benchmark
+    # Suite 2c: Workflow relevance
+    print()
+    print("─" * 60)
+    from bench_workflow_relevance import run_and_save as run_suite_relevance
+    run_suite_relevance(ROOT, mode="implement", max_latency_ms=2000)
+
+    # Suite 2d: Dual-repo parallel benchmark
     print()
     print("─" * 60)
     from bench_dual_repo_parallel import main as run_dual_repo
