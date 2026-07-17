@@ -1,6 +1,7 @@
 """Agent commands: next-file, signatures, related, generate-context."""
 
 import json
+import math
 import os
 import sys
 from typing import Optional
@@ -33,6 +34,13 @@ def _get_db_fallback(config):
     return DaemonDB(config.root)
 
 
+def _close_resource(resource) -> None:
+    """Close an optional runtime owner without constraining lightweight fakes."""
+    close = getattr(resource, "close", None)
+    if close is not None:
+        close()
+
+
 def _query_domain_intent(query: str) -> str:
     """Infer whether query is frontend/backend/mixed intent."""
     q = (query or "").lower()
@@ -54,7 +62,7 @@ def _query_domain_intent(query: str) -> str:
 
 
 def _file_intent_boost(file_path: str, intent: str) -> float:
-    """Score boost/penalty for query intent vs file path."""
+    """Small normalized boost/penalty for query intent vs file path."""
     fp = file_path.lower()
     ext = os.path.splitext(fp)[1]
     frontend_ext = {".ts", ".tsx", ".js", ".jsx", ".css", ".scss"}
@@ -65,22 +73,56 @@ def _file_intent_boost(file_path: str, intent: str) -> float:
     if intent == "frontend":
         boost = 0.0
         if ext in frontend_ext:
-            boost += 2.0
+            boost += 0.04
         if any(d in fp for d in frontend_dirs):
-            boost += 2.0
+            boost += 0.06
         if ext in backend_ext:
-            boost -= 1.0
+            boost -= 0.03
         return boost
     if intent == "backend":
         boost = 0.0
         if ext in backend_ext:
-            boost += 2.0
+            boost += 0.04
         if any(d in fp for d in backend_dirs):
-            boost += 2.0
+            boost += 0.06
         if ext in frontend_ext:
-            boost -= 1.0
+            boost -= 0.03
         return boost
     return 0.0
+
+
+def _rank_file_candidates(results: list[dict], intent: str) -> dict[str, float]:
+    """Rank files on a stable retrieval scale before applying intent hints.
+
+    Search results can carry raw BM25 scores, exact-match constants, or small
+    RRF scores. Their magnitudes are not comparable. Convert their ordering to
+    a bounded rank score so a path-intent hint has the same meaning in every
+    retrieval mode.
+    """
+    file_raw: dict[str, float] = {}
+    for chunk in results:
+        file_path = str(chunk.get("file_path", "") or "")
+        if not file_path:
+            continue
+        try:
+            raw = float(chunk.get("score", chunk.get("rank", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            raw = 0.0
+        if not math.isfinite(raw):
+            raw = 0.0
+        previous = file_raw.get(file_path)
+        if previous is None or raw > previous:
+            file_raw[file_path] = raw
+
+    raw_ranked = sorted(file_raw.items(), key=lambda item: (-item[1], item[0]))
+    scored = {
+        file_path: round(
+            max(0.0, 1.0 - (rank * 0.05)) + _file_intent_boost(file_path, intent),
+            12,
+        )
+        for rank, (file_path, _raw) in enumerate(raw_ranked)
+    }
+    return dict(sorted(scored.items(), key=lambda item: (-item[1], item[0])))
 
 
 def _pick_deep_target_from_context_payload(context_payload: dict, map_results: list) -> tuple[Optional[str], Optional[str]]:
@@ -311,23 +353,15 @@ def next_file(ctx: click.Context, query: str, exclude: tuple, budget: int) -> No
 
     if not client:
         db = _get_db_fallback(config)
-        results = db.search_chunks(query, limit=50)
-        db.close()
+        try:
+            results = db.search_chunks(query, limit=50)
+        finally:
+            _close_resource(db)
 
     # Rerank file candidates by inferred domain intent + best chunk score
     intent = _query_domain_intent(query)
-    file_best = {}
-    for chunk in results:
-        fp = chunk.get("file_path", "")
-        if not fp:
-            continue
-        raw = float(chunk.get("score", chunk.get("rank", 0.0)) or 0.0)
-        boosted = raw + _file_intent_boost(fp, intent)
-        prev = file_best.get(fp)
-        if prev is None or boosted > prev:
-            file_best[fp] = boosted
-
-    ranked_files = [fp for fp, _ in sorted(file_best.items(), key=lambda kv: kv[1], reverse=True)]
+    file_best = _rank_file_candidates(results, intent)
+    ranked_files = list(file_best)
 
     is_json = bool(ctx.obj.get("json"))
     is_quiet = bool(ctx.obj.get("quiet"))
@@ -373,8 +407,10 @@ def signatures(ctx: click.Context, file_path: Optional[str]) -> None:
 
     if not client:
         db = _get_db_fallback(config)
-        sigs = db.get_signatures(file_path)
-        db.close()
+        try:
+            sigs = db.get_signatures(file_path)
+        finally:
+            _close_resource(db)
 
     is_json = bool(ctx.obj.get("json"))
     if is_json:
@@ -407,10 +443,7 @@ def related(ctx: click.Context, file_path: str) -> None:
     except Exception as e:
         logger.debug(f"Related stale-file refresh skipped: {e}")
     finally:
-        try:
-            db_refresh.close()
-        except Exception:
-            pass
+        _close_resource(db_refresh)
 
     client = _get_daemon_client(config)
     imports = []
@@ -432,16 +465,16 @@ def related(ctx: click.Context, file_path: str) -> None:
     try:
         from know.import_graph import ImportGraph
         from know.scanner import CodebaseScanner
-        scanner = CodebaseScanner(config)
-        scanner.get_structure()  # Populates scanner.modules
-        modules_with_imports = [
-            {
-                "path": str(m.path),
-                "name": m.name,
-                "imports": list(getattr(m, "imports", []) or []),
-            }
-            for m in scanner.modules
-        ]
+        with CodebaseScanner(config) as scanner:
+            scanner.get_structure()  # Populates scanner.modules
+            modules_with_imports = [
+                {
+                    "path": str(m.path),
+                    "name": m.name,
+                    "imports": list(getattr(m, "imports", []) or []),
+                }
+                for m in scanner.modules
+            ]
         lang_imports, lang_imported_by = ImportGraph.related_files_from_modules(
             file_path, modules_with_imports,
         )
@@ -494,8 +527,10 @@ def callers(ctx: click.Context, function_name: str) -> None:
 
     if results is None:
         db = _get_db_fallback(config)
-        results = db.get_callers(function_name)
-        db.close()
+        try:
+            results = db.get_callers(function_name)
+        finally:
+            _close_resource(db)
 
     is_json = bool(ctx.obj.get("json"))
     if is_json:
@@ -532,8 +567,10 @@ def callees(ctx: click.Context, chunk_name: str) -> None:
 
     if results is None:
         db = _get_db_fallback(config)
-        results = db.get_callees(chunk_name)
-        db.close()
+        try:
+            results = db.get_callees(chunk_name)
+        finally:
+            _close_resource(db)
 
     is_json = bool(ctx.obj.get("json"))
     if is_json:
@@ -574,10 +611,12 @@ def generate_context(ctx: click.Context, budget: int) -> None:
 
     if not client:
         db = _get_db_fallback(config)
-        stats = db.get_stats()
-        sigs = db.get_signatures()
-        memories = db.recall_memories("project architecture patterns", limit=20)
-        db.close()
+        try:
+            stats = db.get_stats()
+            sigs = db.get_signatures()
+            memories = db.recall_memories("project architecture patterns", limit=20)
+        finally:
+            _close_resource(db)
 
     lines = [
         f"# {config.root.name}",
@@ -666,20 +705,23 @@ def map_cmd(
 
     if results is None:
         db = _get_db_fallback(config)
-        results = db.search_signatures(query, limit, chunk_type)
-        db.close()
+        try:
+            results = db.search_signatures(query, limit, chunk_type)
+        finally:
+            _close_resource(db)
 
     duration_ms = int((_time.monotonic() - started) * 1000)
     try:
         from know.stats import StatsTracker
 
-        StatsTracker(config).record_map(
-            query,
-            results_count=len(results),
-            duration_ms=duration_ms,
-            tokens_used=_estimate_map_tokens(results),
-            session_id=resolved_session_id or "",
-        )
+        with StatsTracker(config) as tracker:
+            tracker.record_map(
+                query,
+                results_count=len(results),
+                duration_ms=duration_ms,
+                tokens_used=_estimate_map_tokens(results),
+                session_id=resolved_session_id or "",
+            )
     except Exception as e:
         logger.debug(f"Stats tracking (map) failed: {e}")
 
@@ -785,7 +827,10 @@ def workflow(
     result = None
     workflow_started = time.monotonic()
     workflow_from_daemon = False
-    client = None if read_only else _get_daemon_client(config)
+    # The daemon's workflow API has an explicit read_only contract. Reuse its
+    # hot index for read-only calls instead of forcing an expensive local cold
+    # path; mixed-version responses still fall back through the guard below.
+    client = _get_daemon_client(config)
     if client:
         try:
             result = client.call_sync("workflow", {
@@ -882,10 +927,12 @@ def workflow(
                 # Memory injection parity with context command.
                 try:
                     from know.knowledge_base import KnowledgeBase
-                    kb = KnowledgeBase(config)
-                    memory_ctx = kb.get_relevant_context(
-                        query, max_tokens=min(500, context_budget // 10),
-                    )
+                    with KnowledgeBase(config) as kb:
+                        memory_ctx = kb.get_relevant_context(
+                            query,
+                            max_tokens=min(500, context_budget // 10),
+                            touch=not read_only,
+                        )
                     if memory_ctx:
                         context_result["memories_context"] = memory_ctx
                 except Exception as e:
@@ -975,7 +1022,7 @@ def workflow(
                 ),
             }
         finally:
-            db.close()
+            _close_resource(db)
 
     # Auto-capture key workflow decision for cross-session recall.
     # Daemon workflow already captures this; avoid duplicate work/memory rows.
@@ -999,17 +1046,18 @@ def workflow(
         from know.stats import StatsTracker
 
         if not read_only:
-            StatsTracker(config).record_workflow(
-                query=query,
-                duration_ms=int((result.get("latency_ms") or {}).get("total", 0) or 0),
-                tokens_used=int(result.get("total_tokens", 0) or 0),
-                mode=str(result.get("workflow_mode", mode) or mode),
-                degraded_by_latency=bool(result.get("degraded_by_latency", False)),
-                call_graph_available=deep_payload.get("call_graph_available"),
-                callers_count=len(deep_payload.get("callers", []) or []),
-                callees_count=len(deep_payload.get("callees", []) or []),
-                session_id=str(result.get("session_id", resolved_session_id) or ""),
-            )
+            with StatsTracker(config) as tracker:
+                tracker.record_workflow(
+                    query=query,
+                    duration_ms=int((result.get("latency_ms") or {}).get("total", 0) or 0),
+                    tokens_used=int(result.get("total_tokens", 0) or 0),
+                    mode=str(result.get("workflow_mode", mode) or mode),
+                    degraded_by_latency=bool(result.get("degraded_by_latency", False)),
+                    call_graph_available=deep_payload.get("call_graph_available"),
+                    callers_count=len(deep_payload.get("callers", []) or []),
+                    callees_count=len(deep_payload.get("callees", []) or []),
+                    session_id=str(result.get("session_id", resolved_session_id) or ""),
+                )
     except Exception as e:
         logger.debug(f"Stats tracking (workflow) failed: {e}")
 
@@ -1096,10 +1144,7 @@ def warm(ctx: click.Context) -> None:
             db = _get_db_fallback(config)
             stats = db.get_stats()
         finally:
-            try:
-                db.close()
-            except Exception:
-                pass
+            _close_resource(db)
 
     files = int(stats.get("files", 0) or 0)
     indexing_status = "complete" if files > 0 else "warming"
@@ -1175,16 +1220,17 @@ def deep(ctx: click.Context, name: str, budget: int, session_id: Optional[str],
     try:
         from know.stats import StatsTracker
 
-        StatsTracker(config).record_deep(
-            name=name,
-            duration_ms=duration_ms,
-            tokens_used=int(result.get("budget_used", result.get("used_tokens", 0)) or 0),
-            call_graph_available=result.get("call_graph_available"),
-            callers_count=len(result.get("callers", []) or []),
-            callees_count=len(result.get("callees", []) or []),
-            session_id=resolved_session_id or "",
-            error=str(result.get("error", "") or ""),
-        )
+        with StatsTracker(config) as tracker:
+            tracker.record_deep(
+                name=name,
+                duration_ms=duration_ms,
+                tokens_used=int(result.get("budget_used", result.get("used_tokens", 0)) or 0),
+                call_graph_available=result.get("call_graph_available"),
+                callers_count=len(result.get("callers", []) or []),
+                callees_count=len(result.get("callees", []) or []),
+                session_id=resolved_session_id or "",
+                error=str(result.get("error", "") or ""),
+            )
     except Exception as e:
         logger.debug(f"Stats tracking (deep) failed: {e}")
 

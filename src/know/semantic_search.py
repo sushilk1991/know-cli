@@ -5,8 +5,9 @@ Function-level uses AST to split Python files into individual chunks
 (functions, classes, module summaries).
 """
 
+from __future__ import annotations
+
 import hashlib
-import json
 import sqlite3
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -65,6 +66,22 @@ class EmbeddingCache:
             return self._conn
         return sqlite3.connect(self.db_path)
 
+    @staticmethod
+    def _decode_embedding(blob: bytes, dim: int) -> Optional[np.ndarray]:
+        """Decode a cache row, returning ``None`` when it is corrupt."""
+        try:
+            expected_dim = int(dim)
+            embedding = np.frombuffer(blob, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if (
+            expected_dim <= 0
+            or embedding.size != expected_dim
+            or not np.isfinite(embedding).all()
+        ):
+            return None
+        return embedding
+
     def _init_db(self):
         """Initialize SQLite cache for embeddings (project-scoped table)."""
         conn = self._get_conn()
@@ -108,15 +125,25 @@ class EmbeddingCache:
             )
             row = cursor.fetchone()
             if row:
-                # Deserialize from binary blob
-                embedding_bytes = row[0]
-                dim = row[1]
-                return np.frombuffer(embedding_bytes, dtype=np.float32).reshape(dim)
+                return self._decode_embedding(row[0], row[1])
         finally:
             if not self._conn:
                 conn.close()
         return None
     
+    def delete_path(self, file_path: str, model: str) -> None:
+        """Delete every cached version of one logical path/model pair."""
+        conn = self._get_conn()
+        try:
+            with conn:
+                conn.execute(
+                    f"DELETE FROM {self._table} WHERE file_path = ? AND model = ?",
+                    (file_path, model),
+                )
+        finally:
+            if not self._conn:
+                conn.close()
+
     def set(self, file_path: str, content_hash: str, embedding: np.ndarray, model: str):
         """Cache an embedding as binary blob."""
         file_hash = hashlib.sha256(f"{file_path}:{content_hash}:{model}".encode()).hexdigest()
@@ -126,6 +153,10 @@ class EmbeddingCache:
         conn = self._get_conn()
         try:
             with conn:
+                conn.execute(
+                    f"DELETE FROM {self._table} WHERE file_path = ? AND model = ?",
+                    (file_path, model),
+                )
                 conn.execute(
                     f"""INSERT OR REPLACE INTO {self._table} 
                        (file_hash, file_path, content_hash, embedding, model, dim)
@@ -141,8 +172,12 @@ class EmbeddingCache:
         if not items:
             return
             
-        data = []
+        latest = {}
         for file_path, content_hash, embedding, model in items:
+            latest[(file_path, model)] = (file_path, content_hash, embedding, model)
+
+        data = []
+        for file_path, content_hash, embedding, model in latest.values():
             file_hash = hashlib.sha256(f"{file_path}:{content_hash}:{model}".encode()).hexdigest()
             embedding_bytes = embedding.astype(np.float32).tobytes()
             dim = embedding.shape[0]
@@ -151,6 +186,10 @@ class EmbeddingCache:
         conn = self._get_conn()
         try:
             with conn:
+                conn.executemany(
+                    f"DELETE FROM {self._table} WHERE file_path = ? AND model = ?",
+                    [(row[1], row[4]) for row in data],
+                )
                 conn.executemany(
                     f"""INSERT OR REPLACE INTO {self._table} 
                        (file_hash, file_path, content_hash, embedding, model, dim)
@@ -195,21 +234,34 @@ class EmbeddingCache:
                 
                 for row in cursor:
                     key = (row[0], row[1], model)
-                    embedding = np.frombuffer(row[2], dtype=np.float32).reshape(row[3])
-                    results[key] = embedding
+                    embedding = self._decode_embedding(row[2], row[3])
+                    if embedding is not None:
+                        results[key] = embedding
         finally:
             if not self._conn:
                 conn.close()
         return results
 
-    def get_all_embeddings(self, model: str) -> Tuple[List[str], np.ndarray]:
+    def get_all_embeddings(
+        self,
+        model: str,
+        path_prefix: Optional[str] = None,
+        expected_dim: Optional[int] = None,
+    ) -> Tuple[List[str], np.ndarray]:
         """Get all embeddings for a model as a matrix. Returns (file_paths, embedding_matrix)."""
         conn = self._get_conn()
         try:
-            cursor = conn.execute(
-                f"SELECT file_path, embedding, dim FROM {self._table} WHERE model = ?",
-                (model,)
-            )
+            if path_prefix is None:
+                cursor = conn.execute(
+                    f"SELECT file_path, embedding, dim FROM {self._table} WHERE model = ?",
+                    (model,),
+                )
+            else:
+                cursor = conn.execute(
+                    f"""SELECT file_path, embedding, dim FROM {self._table}
+                        WHERE model = ? AND file_path LIKE ?""",
+                    (model, f"{path_prefix}%"),
+                )
             rows = cursor.fetchall()
         finally:
             if not self._conn:
@@ -218,15 +270,56 @@ class EmbeddingCache:
         if not rows:
             return [], np.array([])
         
-        file_paths = []
-        embeddings = []
+        decoded_rows = []
         
         for row in rows:
-            file_paths.append(row[0])
-            embedding = np.frombuffer(row[1], dtype=np.float32).reshape(row[2])
-            embeddings.append(embedding)
+            embedding = self._decode_embedding(row[1], row[2])
+            if embedding is not None:
+                decoded_rows.append((row[0], embedding))
+
+        if not decoded_rows:
+            return [], np.array([])
+
+        # A live query's dimension is authoritative. Without one, retain the
+        # dominant valid dimension for callers that only inspect the cache.
+        if expected_dim is None:
+            dimension_counts: dict[int, int] = {}
+            for _, embedding in decoded_rows:
+                dimension_counts[embedding.size] = (
+                    dimension_counts.get(embedding.size, 0) + 1
+                )
+            expected_dim = max(dimension_counts, key=dimension_counts.get)
+        compatible_rows = [
+            (path, embedding)
+            for path, embedding in decoded_rows
+            if embedding.size == expected_dim
+        ]
+        if not compatible_rows:
+            return [], np.array([])
         
-        return file_paths, np.array(embeddings)
+        return (
+            [path for path, _ in compatible_rows],
+            np.stack([embedding for _, embedding in compatible_rows]),
+        )
+
+    def prune_paths(self, model: str, path_prefix: str, keep: set[str]) -> None:
+        """Remove cached logical paths no longer present in an authoritative scan."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                f"SELECT DISTINCT file_path FROM {self._table} WHERE model = ? AND file_path LIKE ?",
+                (model, f"{path_prefix}%"),
+            ).fetchall()
+            stale = [(path, model) for (path,) in rows if path not in keep]
+            if stale:
+                with conn:
+                    conn.executemany(
+                        f"DELETE FROM {self._table} WHERE file_path = ? AND model = ?",
+                        stale,
+                    )
+        finally:
+            if not self._conn:
+                conn.close()
     
     def clear_model(self, model: str):
         """Clear all embeddings for a specific model."""
@@ -246,6 +339,8 @@ class SemanticSearcher:
     DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"  # 384-dim, good for code, ~100MB
     MODEL_DIM = 384
     MAX_FILE_SIZE = 1024 * 1024  # 1MB
+    FILE_CACHE_PREFIX = "file:"
+    CHUNK_CACHE_PREFIX = "chunk:"
     
     # Embedding model managed by know.embeddings (centralized)
 
@@ -253,6 +348,16 @@ class SemanticSearcher:
         self.model_name = model_name or self.DEFAULT_MODEL
         self.project_root = project_root
         self.cache = EmbeddingCache(project_root=project_root)
+
+    @staticmethod
+    def _path_is_within_root(file_path: Path, root: Path) -> bool:
+        """Reject lexical in-root paths whose symlink target escapes root."""
+        try:
+            file_path.resolve().relative_to(root.resolve())
+            file_path.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
 
     def _get_embedding_model(self):
         """Get embedding model from centralized manager."""
@@ -296,31 +401,49 @@ class SemanticSearcher:
     
     def index_file(self, file_path: Path) -> bool:
         """Index a single file. Returns True if indexed or already cached."""
+        cache_key = f"{self.FILE_CACHE_PREFIX}{file_path}"
         try:
+            if self.project_root is not None and not self._path_is_within_root(
+                file_path, self.project_root,
+            ):
+                self.cache.delete_path(cache_key, self.model_name)
+                return False
+
             # Check file size before reading
             size = file_path.stat().st_size
             if size > self.MAX_FILE_SIZE:
+                self.cache.delete_path(cache_key, self.model_name)
                 return False
 
             content = file_path.read_text(encoding="utf-8", errors="ignore")
             if not content.strip():
+                self.cache.delete_path(cache_key, self.model_name)
                 return False
             
             content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
             
             # Check cache
-            cached = self.cache.get(str(file_path), content_hash, self.model_name)
+            cached = self.cache.get(cache_key, content_hash, self.model_name)
             if cached is not None:
                 return True
+
+            # Never serve a prior version if recomputing the new content fails.
+            self.cache.delete_path(cache_key, self.model_name)
             
             # Get embedding
             embedding = self._get_embedding(content)
             
             # Cache it
-            self.cache.set(str(file_path), content_hash, embedding, self.model_name)
+            self.cache.set(cache_key, content_hash, embedding, self.model_name)
             return True
             
         except Exception:
+            # A terminal read/stat/embed failure must not leave an older
+            # version searchable as though the current file were indexed.
+            try:
+                self.cache.delete_path(cache_key, self.model_name)
+            except Exception:
+                pass
             return False
     
     def index_directory(self, root: Path, extensions: List[str] = None) -> int:
@@ -335,16 +458,20 @@ class SemanticSearcher:
         if gitignore_path.exists() and pathspec:
             try:
                 with open(gitignore_path, "r") as f:
-                    ignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", f)
+                    ignore_spec = pathspec.GitIgnoreSpec.from_lines(f)
             except Exception:
                 pass
 
         count = 0
+        discovered: set[str] = set()
         
         # Use persistent connection
         with self.cache:
             for ext in extensions:
                 for file_path in root.rglob(f"*{ext}"):
+                    if not self._path_is_within_root(file_path, root):
+                        continue
+
                     # Check .gitignore
                     if ignore_spec:
                         try:
@@ -355,21 +482,35 @@ class SemanticSearcher:
                             pass
                     
                     # Always skip runtime/build/cache paths even if .gitignore does not.
-                    if is_hard_excluded_path(file_path):
+                    try:
+                        filter_path = file_path.relative_to(root)
+                    except ValueError:
+                        filter_path = file_path
+                    if is_hard_excluded_path(filter_path):
                         continue
-                    
+
                     if self.index_file(file_path):
+                        discovered.add(f"{self.FILE_CACHE_PREFIX}{file_path}")
                         count += 1
+
+            self.cache.prune_paths(self.model_name, self.FILE_CACHE_PREFIX, discovered)
         
         return count
     
     def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """Search for files semantically similar to query."""
+        if top_k <= 0:
+            return []
+
         # Get query embedding
         query_embedding = self._get_embedding(query)
         
         # Get all cached embeddings as matrix
-        file_paths, embeddings_matrix = self.cache.get_all_embeddings(self.model_name)
+        file_paths, embeddings_matrix = self.cache.get_all_embeddings(
+            self.model_name,
+            path_prefix=self.FILE_CACHE_PREFIX,
+            expected_dim=query_embedding.size,
+        )
         
         if not file_paths or embeddings_matrix.size == 0:
             return []
@@ -382,7 +523,11 @@ class SemanticSearcher:
         top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
         
         # Return results
-        results = [(file_paths[i], float(similarities[i])) for i in top_indices if similarities[i] > 0]
+        results = [
+            (file_paths[i][len(self.FILE_CACHE_PREFIX):], float(similarities[i]))
+            for i in top_indices
+            if similarities[i] > 0
+        ]
         return results
     
     def search_code(self, query: str, root: Path, top_k: int = 10, auto_index: bool = True) -> List[dict]:
@@ -439,17 +584,25 @@ class SemanticSearcher:
         if gitignore_path.exists() and pathspec:
             try:
                 with open(gitignore_path, "r") as f:
-                    ignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", f)
+                    ignore_spec = pathspec.GitIgnoreSpec.from_lines(f)
             except Exception:
                 pass
 
         count = 0
+        discovered: set[str] = set()
 
         with self.cache:
             for ext in extensions:
                 for file_path in root.rglob(f"*{ext}"):
+                    if not self._path_is_within_root(file_path, root):
+                        continue
+
                     # Always skip runtime/build/cache paths even if .gitignore does not.
-                    if is_hard_excluded_path(file_path):
+                    try:
+                        filter_path = file_path.relative_to(root)
+                    except ValueError:
+                        filter_path = file_path
+                    if is_hard_excluded_path(filter_path):
                         continue
                     if ignore_spec:
                         try:
@@ -468,7 +621,9 @@ class SemanticSearcher:
 
                     chunks = extract_chunks_from_file(file_path, root)
                     for chunk in chunks:
-                        chunk_key = f"{chunk.file_path}::{chunk.name}::{chunk.line_start}"
+                        raw_chunk_key = f"{chunk.file_path}::{chunk.name}::{chunk.line_start}"
+                        chunk_key = f"{self.CHUNK_CACHE_PREFIX}{raw_chunk_key}"
+                        discovered.add(chunk_key)
                         # Build text for embedding
                         embed_text = f"{chunk.name} {chunk.signature}\n{chunk.docstring}\n{chunk.body[:2000]}"
                         content_hash = hashlib.sha256(embed_text.encode()).hexdigest()[:16]
@@ -479,20 +634,16 @@ class SemanticSearcher:
                             count += 1
                             continue
 
+                        self.cache.delete_path(chunk_key, self.model_name)
+
                         try:
                             embedding = self._get_embedding(embed_text)
-                            # Store with metadata in file_path field as JSON-encoded key
-                            metadata = json.dumps({
-                                "file": chunk.file_path,
-                                "name": chunk.name,
-                                "type": chunk.chunk_type,
-                                "line_start": chunk.line_start,
-                                "line_end": chunk.line_end,
-                            })
                             self.cache.set(chunk_key, content_hash, embedding, self.model_name)
                             count += 1
                         except Exception:
                             pass
+
+            self.cache.prune_paths(self.model_name, self.CHUNK_CACHE_PREFIX, discovered)
 
         return count
 
@@ -501,6 +652,9 @@ class SemanticSearcher:
         
         Returns list of dicts with: path, name, type, line_start, line_end, score, preview.
         """
+        if top_k <= 0:
+            return []
+
         if auto_index:
             self.index_chunks(root)
 
@@ -508,7 +662,11 @@ class SemanticSearcher:
         query_embedding = self._get_embedding(query)
 
         # Get all embeddings
-        file_paths, embeddings_matrix = self.cache.get_all_embeddings(self.model_name)
+        file_paths, embeddings_matrix = self.cache.get_all_embeddings(
+            self.model_name,
+            path_prefix=self.CHUNK_CACHE_PREFIX,
+            expected_dim=query_embedding.size,
+        )
         if not file_paths or embeddings_matrix.size == 0:
             return []
 
@@ -521,7 +679,8 @@ class SemanticSearcher:
         for i in top_indices:
             if similarities[i] <= 0:
                 continue
-            chunk_key = file_paths[i]
+            cache_key = file_paths[i]
+            chunk_key = cache_key[len(self.CHUNK_CACHE_PREFIX):]
             # Parse chunk key: "file_path::name::line_start"
             parts = chunk_key.split("::")
             if len(parts) >= 3:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import hashlib
 import re
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from know.logger import get_logger
@@ -68,31 +69,38 @@ def capture_workflow_decision(
     try:
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        # Explicit dedup check avoids duplicate auto-memories when workflow is
-        # retried with the same resolved target.
-        active = kb.list_all(source=source, memory_type="decision", decision_status="active")
-        for mem in active:
-            mem_tags = set((mem.tags or "").split(","))
-            if f"q:{query_hash}" in mem_tags and f"t:{target_slug}" in mem_tags:
-                return mem.id
-            if mem.text == text:
-                return mem.id
+        with KnowledgeBase(config) as kb:
+            # Explicit dedup check avoids duplicate auto-memories when workflow
+            # is retried, but expired rows must not suppress fresh capture.
+            active = kb.list_all(source=source, memory_type="decision", decision_status="active")
+            now = time.time()
+            for mem in active:
+                if mem.expires_at:
+                    try:
+                        if datetime.fromisoformat(mem.expires_at).timestamp() <= now:
+                            continue
+                    except ValueError:
+                        continue
+                mem_tags = set((mem.tags or "").split(","))
+                if f"q:{query_hash}" in mem_tags and f"t:{target_slug}" in mem_tags:
+                    return mem.id
+                if mem.text == text:
+                    return mem.id
 
-        expires_at = time.time() + (AUTO_WORKFLOW_DECISION_TTL_HOURS * 3600)
-        return kb.remember(
-            text=text,
-            source=source,
-            tags=tags,
-            memory_type="decision",
-            decision_status="active",
-            confidence=confidence,
-            evidence=evidence,
-            session_id=session_id or workflow_result.get("session_id", "") or "",
-            agent=agent,
-            trust_level="local_verified",
-            expires_at=expires_at,
-        )
+            expires_at = now + (AUTO_WORKFLOW_DECISION_TTL_HOURS * 3600)
+            return kb.remember(
+                text=text,
+                source=source,
+                tags=tags,
+                memory_type="decision",
+                decision_status="active",
+                confidence=confidence,
+                evidence=evidence,
+                session_id=session_id or workflow_result.get("session_id", "") or "",
+                agent=agent,
+                trust_level="local_verified",
+                expires_at=expires_at,
+            )
     except Exception as e:
         logger.debug(f"Workflow decision capture skipped: {e}")
         return None

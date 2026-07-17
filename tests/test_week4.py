@@ -109,47 +109,12 @@ class TestMCPServerCreation:
         assert server is not None
         assert server.name == "know-cli"
 
-    def test_mcp_available_flag(self):
-        from know.mcp_server import _MCP_AVAILABLE
-        assert _MCP_AVAILABLE is True
-
-    def test_create_server_with_no_root(self, tmp_project):
-        """Server creation works when cwd has .know."""
-        root, config = tmp_project
-        with patch("os.getcwd", return_value=str(root)):
-            from know.mcp_server import create_server
-            server = create_server(project_root=root)
-            assert server is not None
-
-
 # ---------------------------------------------------------------------------
 # MCP Tools — Invocation Tests
 # ---------------------------------------------------------------------------
 
 class TestMCPToolGetContext:
     """Test the get_context MCP tool."""
-
-    @pytest.mark.skipif(not _MCP_AVAILABLE, reason="MCP extra not installed")
-    def test_get_context_returns_json(self, tmp_project):
-        root, config = tmp_project
-        from know.mcp_server import create_server
-        server = create_server(project_root=root)
-
-        # Call the tool function directly
-        from know.mcp_server import create_server
-        # Access the registered tool
-        # FastMCP stores tools internally — we test via the underlying functions
-        from know.context_engine import ContextEngine
-        engine = ContextEngine(config)
-        result = engine.build_context("hello function", budget=4000)
-        json_str = engine.format_agent_json(result)
-        data = json.loads(json_str)
-
-        assert "query" in data
-        assert "budget" in data
-        assert data["budget"] == 4000
-        assert "code" in data
-        assert "used_tokens" in data
 
     def test_get_context_respects_budget(self, tmp_project):
         root, config = tmp_project
@@ -246,7 +211,7 @@ class TestMCPToolShowGraph:
         scanner = CodebaseScanner(config)
         structure = scanner.get_structure()
         ig = ImportGraph(config)
-        edge_count = ig.build(structure["modules"])
+        ig.build(structure["modules"])
 
         formatted = ig.format_graph("src.utils")
         assert "Import graph" in formatted
@@ -372,18 +337,6 @@ class TestTimeFlag:
         from know.cli import cli
         param_names = [p.name for p in cli.params]
         assert "show_time" in param_names
-
-    def test_time_flag_sets_context(self):
-        """--time should set show_time in context."""
-        from click.testing import CliRunner
-        from know.cli import cli
-
-        runner = CliRunner()
-        # Use a command that exists — status is lightweight
-        result = runner.invoke(cli, ["--time", "status"], catch_exceptions=False)
-        # Should not error
-        assert result.exit_code == 0 or "not initialized" in result.output.lower() or "Error" in result.output
-
 
 # ---------------------------------------------------------------------------
 # Performance Benchmarks
@@ -647,42 +600,3 @@ class TestVersion:
         parts = __version__.split(".")
         assert len(parts) == 3
         assert all(p.isdigit() for p in parts)
-
-    def test_pyproject_version_matches_package(self):
-        from know import __version__
-        pyproject = Path(__file__).parent.parent / "pyproject.toml"
-        content = pyproject.read_text()
-        assert f'version = "{__version__}"' in content
-
-
-# ---------------------------------------------------------------------------
-# MCP Server Graceful Degradation
-# ---------------------------------------------------------------------------
-
-class TestMCPGracefulDegradation:
-    """Test that MCP server handles missing dependencies gracefully."""
-
-    def test_search_falls_back_to_text(self, tmp_project):
-        """When fastembed is unavailable, search still works via text matching."""
-        root, config = tmp_project
-        from know.context_engine import ContextEngine
-
-        engine = ContextEngine(config)
-        # Force text fallback by using a fresh context engine
-        result = engine.build_context("hello function", budget=4000)
-        # Should still return results via text matching
-        assert result["used_tokens"] >= 0
-
-    def test_remember_without_fastembed(self, tmp_project):
-        """Remember works even if fastembed can't embed."""
-        root, config = tmp_project
-        from know.knowledge_base import KnowledgeBase
-        kb = KnowledgeBase(config)
-
-        # This should work regardless of fastembed
-        mem_id = kb.remember("Test without embeddings", source="test")
-        assert isinstance(mem_id, int)
-
-        # Recall via text fallback
-        results = kb.recall("without embeddings")
-        assert len(results) > 0

@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
+import tokenize
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -36,22 +39,46 @@ class TokenOptimizer:
     
     @staticmethod
     def compress_code(content: str, max_chars: int = 2000) -> str:
-        """Compress code by removing comments and excess whitespace."""
+        """Compress Python-like code without changing strings or operators."""
+        import io
         import re
-        
-        # Remove single-line C-style comments (but not URLs)
-        content = re.sub(r'(?<!:)//.*$', '', content, flags=re.MULTILINE)
-        
-        # Remove multi-line C-style comments
-        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-        
-        # Remove Python-style # comments (but not shebangs and not inside strings)
-        # This handles standalone and inline comments
-        content = re.sub(r'(?<!["\'])#(?!!/).*$', '', content, flags=re.MULTILINE)
-        
-        # Remove docstrings (Python-style)
-        content = re.sub(r'""".*?"""', '"""..."""', content, flags=re.DOTALL)
-        content = re.sub(r"'''.*?'''", "'''...'''", content, flags=re.DOTALL)
+
+        if max_chars <= 0:
+            return ""
+
+        # Regex comment removal corrupts valid syntax such as floor division
+        # and comment markers inside strings. Python's tokenizer can identify
+        # comments and standalone docstrings without guessing from characters.
+        try:
+            tokens = []
+            statement_start = True
+            for token in tokenize.generate_tokens(io.StringIO(content).readline):
+                token_type, token_text, start, end, line = token
+                if token_type == tokenize.COMMENT:
+                    token_text = ""
+                elif (
+                    token_type == tokenize.STRING
+                    and statement_start
+                    and re.match(r"(?is)^[rubf]*('{3}|\"{3})", token_text)
+                ):
+                    prefix_match = re.match(r"(?is)^([rubf]*)(('{3})|(\"{3}))", token_text)
+                    quote = prefix_match.group(2) if prefix_match else '"""'
+                    prefix = prefix_match.group(1) if prefix_match else ""
+                    token_text = f"{prefix}{quote}...{quote}"
+
+                tokens.append(tokenize.TokenInfo(token_type, token_text, start, end, line))
+
+                if token_type in {tokenize.ENCODING, tokenize.INDENT, tokenize.DEDENT}:
+                    statement_start = True
+                elif token_type == tokenize.NEWLINE:
+                    statement_start = True
+                elif token_type not in {tokenize.NL, tokenize.COMMENT}:
+                    statement_start = False
+            content = tokenize.untokenize(tokens)
+        except (IndentationError, tokenize.TokenError):
+            # Malformed or non-Python input is safer left intact than modified
+            # by an ambiguous comment regex.
+            pass
         
         # Remove extra blank lines
         content = re.sub(r'\n\s*\n+', '\n\n', content)
@@ -61,7 +88,11 @@ class TokenOptimizer:
         
         # Truncate if still too long
         if len(content) > max_chars:
-            content = content[:max_chars] + "\n// ... [truncated]"
+            marker = "\n# ... [truncated]"
+            if len(marker) >= max_chars:
+                content = content[:max_chars]
+            else:
+                content = content[:max_chars - len(marker)].rstrip() + marker
         
         return content.strip()
     
@@ -93,13 +124,29 @@ class AIResponseCache:
     
     def __init__(self, cache_dir: Path = None):
         self.cache_dir = cache_dir or Path.home() / ".cache" / "know-cli"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.cache_dir / "ai_cache.db"
-        self._init_db()
+        self._enabled = False
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+            self._enabled = True
+        except sqlite3.DatabaseError:
+            # A corrupt optional cache must not disable local fallbacks or AI.
+            try:
+                quarantine = self.db_path.with_name(
+                    f"{self.db_path.name}.corrupt-{time.time_ns()}"
+                )
+                self.db_path.replace(quarantine)
+                self._init_db()
+                self._enabled = True
+            except (OSError, sqlite3.Error):
+                self._enabled = False
+        except OSError:
+            self._enabled = False
     
     def _init_db(self):
         """Initialize SQLite cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache (
                     content_hash TEXT PRIMARY KEY,
@@ -114,33 +161,43 @@ class AIResponseCache:
             conn.execute(
                 "DELETE FROM cache WHERE created_at < datetime('now', '-30 days')"
             )
+            conn.commit()
     
     def get(self, content: str, task_type: str, model: str) -> Optional[str]:
         """Get cached response if available."""
+        if not self._enabled:
+            return None
         content_hash = hashlib.sha256(f"{content}:{task_type}:{model}".encode()).hexdigest()
-        
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "SELECT response FROM cache WHERE content_hash = ?",
-                (content_hash,)
-            )
-            row = cursor.fetchone()
-            if row:
-                console.print("[dim]♻️ Using cached response[/dim]")
-                return row[0]
+        try:
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                cursor = conn.execute(
+                    "SELECT response FROM cache WHERE content_hash = ?",
+                    (content_hash,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    console.print("[dim]♻️ Using cached response[/dim]")
+                    return row[0]
+        except (OSError, sqlite3.Error):
+            return None
         return None
     
     def set(self, content: str, task_type: str, model: str, response: str, tokens_used: int):
         """Cache a response."""
+        if not self._enabled:
+            return
         content_hash = hashlib.sha256(f"{content}:{task_type}:{model}".encode()).hexdigest()
-        
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO cache 
-                   (content_hash, task_type, model, response, tokens_used)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (content_hash, task_type, model, response, tokens_used)
-            )
+        try:
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO cache
+                       (content_hash, task_type, model, response, tokens_used)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (content_hash, task_type, model, response, tokens_used)
+                )
+                conn.commit()
+        except (OSError, sqlite3.Error):
+            return
 
 
 class AISummarizer:
@@ -168,8 +225,18 @@ class AISummarizer:
         if not self.api_key and self.provider == "anthropic":
             console.print("[yellow]⚠ ANTHROPIC_API_KEY not set. AI features will be limited.[/yellow]")
     
-    # Default API timeout in seconds (configurable via KNOW_API_TIMEOUT env var)
-    API_TIMEOUT = int(os.getenv("KNOW_API_TIMEOUT", "30"))
+    # Default API timeout in seconds (configurable via KNOW_API_TIMEOUT env var).
+    # Environment parsing is deliberately lazy so a typo cannot break imports.
+    API_TIMEOUT = 30
+
+    @classmethod
+    def _get_api_timeout(cls, override: Optional[int] = None) -> int:
+        candidate: Any = override if override is not None else os.getenv("KNOW_API_TIMEOUT", cls.API_TIMEOUT)
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            return cls.API_TIMEOUT
+        return parsed if parsed > 0 else cls.API_TIMEOUT
     
     def _call_claude(
         self, 
@@ -189,7 +256,7 @@ class AISummarizer:
             import anthropic
             import httpx
             
-            request_timeout = timeout or self.API_TIMEOUT
+            request_timeout = self._get_api_timeout(timeout)
             client = anthropic.Anthropic(
                 api_key=self.api_key,
                 timeout=httpx.Timeout(request_timeout, connect=10.0),
@@ -198,7 +265,10 @@ class AISummarizer:
             
             # Check cache first
             if cache_key:
-                cached = self.cache.get(cache_key, task_type, use_model)
+                try:
+                    cached = self.cache.get(cache_key, task_type, use_model)
+                except Exception:
+                    cached = None
                 if cached:
                     return cached
             
@@ -232,7 +302,12 @@ class AISummarizer:
             
             # Cache the response
             if cache_key:
-                self.cache.set(cache_key, task_type, use_model, response, total_tokens)
+                try:
+                    self.cache.set(cache_key, task_type, use_model, response, total_tokens)
+                except Exception:
+                    # A best-effort cache write must never discard a successful
+                    # provider response.
+                    pass
             
             return response
         except ImportError:

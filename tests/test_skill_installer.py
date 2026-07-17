@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 # Ensure src is on path
@@ -15,6 +16,12 @@ from know.skill_installer import (
     skill_bootstrap_marker_path,
     skill_target_paths,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_codex_home(tmp_path, monkeypatch):
+    """Never let skill-install tests write into the developer's real agent home."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
 
 def test_skill_target_paths_cover_common_agents(tmp_path):

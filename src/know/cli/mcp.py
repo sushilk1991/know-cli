@@ -1,11 +1,15 @@
 """MCP commands: mcp group with serve/config."""
 
-import sys
-from pathlib import Path
-
 import click
 
-from know.cli import console
+
+def _mcp_dependency_failure(error: ImportError) -> click.ClickException:
+    """Translate lazy optional-dependency failures into an actionable CLI error."""
+    detail = str(error).strip()
+    message = detail or "The 'mcp' package is required for the MCP server."
+    if "know-cli[mcp]" not in message:
+        message += "\n\nInstall it with:\n\n  pip install know-cli[mcp]"
+    return click.ClickException(message)
 
 
 @click.group()
@@ -16,7 +20,12 @@ def mcp() -> None:
 
 @mcp.command(name="serve")
 @click.option("--sse", is_flag=True, help="Use SSE transport instead of stdio")
-@click.option("--port", type=int, default=3000, help="Port for SSE transport (default 3000)")
+@click.option(
+    "--port",
+    type=click.IntRange(min=1, max=65535),
+    default=3000,
+    help="Port for SSE transport (default 3000)",
+)
 @click.pass_context
 def mcp_serve(ctx: click.Context, sse: bool, port: int) -> None:
     """Start the MCP server.
@@ -29,20 +38,15 @@ def mcp_serve(ctx: click.Context, sse: bool, port: int) -> None:
       know mcp serve                    # stdio transport
       know mcp serve --sse --port 3000  # SSE transport
     """
-    try:
-        from know.mcp_server import run_server
-    except ImportError:
-        click.echo(
-            "Error: The 'mcp' package is required.\n\n"
-            "  pip install mcp\n\n"
-            "Or install know-cli with:\n\n"
-            "  pip install know-cli[mcp]\n",
-            err=True,
-        )
-        sys.exit(1)
+    from know import mcp_server
 
-    config = ctx.obj["config"]
-    run_server(sse=sse, port=port, project_root=config.root)
+    try:
+        config = ctx.obj["config"]
+        mcp_server.run_server(sse=sse, port=port, project_root=config.root)
+    except ImportError as error:
+        if not mcp_server._MCP_AVAILABLE:
+            raise _mcp_dependency_failure(error) from error
+        raise
 
 
 @mcp.command(name="config")
@@ -52,15 +56,7 @@ def mcp_config(ctx: click.Context) -> None:
 
     Copy the output into your Claude Desktop config file.
     """
-    try:
-        from know.mcp_server import print_config
-    except ImportError:
-        click.echo(
-            "Error: The 'mcp' package is required.\n\n"
-            "  pip install mcp\n",
-            err=True,
-        )
-        sys.exit(1)
+    from know.mcp_server import print_config
 
     config = ctx.obj["config"]
     print_config(project_root=config.root)

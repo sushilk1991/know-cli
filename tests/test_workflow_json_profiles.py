@@ -289,7 +289,11 @@ class TestWorkflowProfiles:
         payload = json.loads(result.output)
         assert payload["session_id"] is None
         assert payload["usage"]["details"]["read_only"] is True
-        get_daemon_client.assert_not_called()
+        get_daemon_client.assert_called_once()
+        daemon_request = get_daemon_client.return_value.call_sync.call_args
+        assert daemon_request.args[0] == "workflow"
+        assert daemon_request.args[1]["read_only"] is True
+        assert daemon_request.args[1]["session_id"] is None
         capture.assert_not_called()
         record_workflow.assert_not_called()
 

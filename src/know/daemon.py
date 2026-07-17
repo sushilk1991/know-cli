@@ -11,14 +11,18 @@ Protocol: JSON-RPC 2.0 over Unix domain socket
 """
 
 import asyncio
+import fcntl
 import json
 import os
 import signal
+import socket
 import struct
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, Iterable, List, Tuple
+from typing import Any, Dict, Optional, Iterable, Iterator, List, Tuple
 
 import xxhash
 
@@ -35,6 +39,40 @@ PID_DIR = Path.home() / ".know" / "pids"
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_CHUNK_BODY_CHARS = 5000
 DAEMON_API_VERSION = 2
+MAX_RPC_RESULTS = 100
+MAX_RPC_TOKEN_BUDGET = 100_000
+
+
+def _bounded_rpc_int(name: str, value: Any, *, maximum: int) -> int:
+    """Validate resource-shaping JSON-RPC integers without coercion."""
+    # bool is an int subclass, while strings accepted by int() hide malformed
+    # JSON clients. Both must be rejected at the protocol boundary.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+_INDEX_LOCKS: Dict[str, threading.Lock] = {}
+_INDEX_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _serialized_index(root: Path) -> Iterator[None]:
+    """Serialize source validation and chunk publication per project."""
+    key = str(root.resolve())
+    with _INDEX_LOCKS_GUARD:
+        thread_lock = _INDEX_LOCKS.setdefault(key, threading.Lock())
+
+    with thread_lock:
+        lock_path = root / ".know" / "index.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -58,14 +96,14 @@ def _collect_project_file_mtimes(config: Config) -> Dict[str, int]:
     """Collect mtime_ns for source files included by scanner filters."""
     from know.scanner import CodebaseScanner
 
-    scanner = CodebaseScanner(config)
     mtimes: Dict[str, int] = {}
-    for path, _lang in scanner._discover_files():
-        try:
-            rel = str(path.relative_to(config.root)).replace("\\", "/")
-            mtimes[rel] = path.stat().st_mtime_ns
-        except (FileNotFoundError, OSError, ValueError):
-            continue
+    with CodebaseScanner(config) as scanner:
+        for path, _lang in scanner._discover_files():
+            try:
+                rel = str(path.relative_to(config.root)).replace("\\", "/")
+                mtimes[rel] = path.stat().st_mtime_ns
+            except (FileNotFoundError, OSError, ValueError):
+                continue
     return mtimes
 
 
@@ -180,19 +218,42 @@ def refresh_file_if_stale(
     force: bool = False,
     remove_missing: bool = False,
 ) -> Dict[str, Any]:
+    """Re-index one file as an atomic, generation-ordered operation."""
+    with _serialized_index(root):
+        return _refresh_file_if_stale_locked(
+            root,
+            config,
+            db,
+            file_path,
+            force=force,
+            remove_missing=remove_missing,
+        )
+
+
+def _refresh_file_if_stale_locked(
+    root: Path,
+    config: Config,
+    db: DaemonDB,
+    file_path: str | Path,
+    *,
+    force: bool = False,
+    remove_missing: bool = False,
+) -> Dict[str, Any]:
     """Re-index a single file when missing or stale.
 
     Returns metadata with keys: updated(bool), removed(bool), file_path, reason,
     and optional chunks/call_refs counts.
     """
+    from know.index import read_source_snapshot, source_snapshot_matches
     from know.parsers import ParserFactory
 
     candidate = Path(file_path)
-    abs_path = candidate if candidate.is_absolute() else (root / candidate)
+    resolved_root = root.resolve()
+    abs_path = candidate if candidate.is_absolute() else (resolved_root / candidate)
     abs_path = abs_path.resolve()
 
     try:
-        rel_path = str(abs_path.relative_to(root)).replace("\\", "/")
+        rel_path = str(abs_path.relative_to(resolved_root)).replace("\\", "/")
     except ValueError:
         # Ignore paths outside project root
         return {
@@ -227,8 +288,16 @@ def refresh_file_if_stale(
             "reason": "unsupported_extension",
         }
 
-    content = abs_path.read_text(encoding="utf-8", errors="replace")
-    content_hash = xxhash.xxh64(content.encode()).hexdigest()
+    before = read_source_snapshot(abs_path)
+    if before is None:
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "unstable_snapshot",
+        }
+    content = before["content"]
+    content_hash = before["content_hash"]
     stored_hash = db.get_file_hash(rel_path)
     if stored_hash == content_hash and not force:
         return {
@@ -248,7 +317,7 @@ def refresh_file_if_stale(
         }
 
     try:
-        mod_info = parser.parse(abs_path, root)
+        mod_info = parser.parse(abs_path, resolved_root)
     except Exception as e:
         return {
             "updated": False,
@@ -257,19 +326,29 @@ def refresh_file_if_stale(
             "reason": f"parse_failed:{e.__class__.__name__}",
         }
 
-    chunks = _build_chunks_from_module(content, mod_info)
-    db.upsert_chunks(rel_path, lang, chunks)
-    db.update_file_index(rel_path, content_hash, lang, len(chunks))
+    after = read_source_snapshot(abs_path)
+    if after is None or not source_snapshot_matches(before, after):
+        return {
+            "updated": False,
+            "removed": False,
+            "file_path": rel_path,
+            "reason": "changed_during_parse",
+        }
 
+    chunks = _build_chunks_from_module(content, mod_info)
     call_refs = []
     try:
         if hasattr(parser, "extract_call_refs"):
             call_refs = parser.extract_call_refs(content, mod_info) or []
-        # Always replace symbol refs so stale rows are removed on file edits.
-        db.upsert_symbol_refs(rel_path, call_refs)
     except Exception as e:
         logger.debug(f"Call extraction failed for {rel_path}: {e}")
-        db.upsert_symbol_refs(rel_path, [])
+        call_refs = []
+
+    with db.batch():
+        db.upsert_chunks(rel_path, lang, chunks)
+        db.update_file_index(rel_path, content_hash, lang, len(chunks))
+        # Always replace symbol refs so stale rows are removed on file edits.
+        db.upsert_symbol_refs(rel_path, call_refs)
 
     return {
         "updated": True,
@@ -315,6 +394,12 @@ def refresh_files_if_stale(
 
 
 def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
+    """Populate chunks as an atomic, generation-ordered operation."""
+    with _serialized_index(root):
+        return _populate_index_locked(root, config, db)
+
+
+def _populate_index_locked(root: Path, config: Config, db: DaemonDB) -> tuple:
     """Populate the daemon DB with code chunks (standalone, no daemon needed).
 
     Called by the context engine on first use when the DB is empty.
@@ -328,10 +413,13 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
     """
     from know.scanner import CodebaseScanner
 
-    scanner = CodebaseScanner(config)
-    scanner.scan()
-    modules = scanner.modules  # List[ModuleInfo] — already parsed
-    allowed_paths = {str(mod.path).replace("\\", "/") for mod in modules}
+    with CodebaseScanner(config) as scanner:
+        scanner.scan()
+        modules = list(scanner.modules)  # List[ModuleInfo] — already parsed
+        # Discovery scope, not successful parses, is authoritative for deletion.
+        # A transient syntax/read error must not purge the last known-good index.
+        allowed_paths = set(scanner.discovered_paths)
+        source_snapshots = dict(scanner.source_snapshots)
     count = 0
     purged = 0
 
@@ -355,8 +443,12 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
             if not lang:
                 continue
 
-            content = abs_path.read_text(encoding="utf-8", errors="replace")
-            content_hash = xxhash.xxh64(content.encode()).hexdigest()
+            snapshot = source_snapshots.get(path_str.replace("\\", "/"))
+            if snapshot is None:
+                logger.debug(f"No coherent parse snapshot for {path_str}; deferring it")
+                continue
+            content = snapshot["content"]
+            content_hash = snapshot["content_hash"]
             stored_hash = db.get_file_hash(path_str)
 
             if stored_hash == content_hash:
@@ -367,16 +459,17 @@ def populate_index(root: Path, config: Config, db: DaemonDB) -> tuple:
             db.upsert_chunks(path_str, lang, chunks)
             db.update_file_index(path_str, content_hash, lang, len(chunks))
 
-            # Extract call references for symbol_refs table
+            # Extract call references for symbol_refs table. Always replace,
+            # including zero refs, so edits cannot leave phantom callers.
+            call_refs = []
             try:
                 from know.parsers import ParserFactory
                 parser = ParserFactory.get_parser_for_file(abs_path)
                 if parser and hasattr(parser, "extract_call_refs"):
-                    call_refs = parser.extract_call_refs(content, mod_info)
-                    if call_refs:
-                        db.upsert_symbol_refs(path_str, call_refs)
+                    call_refs = parser.extract_call_refs(content, mod_info) or []
             except Exception as e:
                 logger.debug(f"Call extraction failed for {path_str}: {e}")
+            db.upsert_symbol_refs(path_str, call_refs)
 
             count += 1
 
@@ -427,20 +520,87 @@ def pid_path(root: Path) -> Path:
     return PID_DIR / f"{_project_hash(root)}.pid"
 
 
-def is_daemon_running(root: Path) -> bool:
-    """Check if a daemon is running for this project."""
+def _probe_daemon(root: Path, timeout: float = 0.25) -> bool:
+    """Validate that the project socket answers a usable status request."""
+    sock_path = socket_path(root)
+    if not sock_path.exists():
+        return False
+
+    request = {
+        "jsonrpc": "2.0",
+        "method": "status",
+        "params": {},
+        "id": 1,
+    }
+    payload = json.dumps(request).encode()
+
+    def _recv_exact(conn: socket.socket, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            part = conn.recv(size - len(chunks))
+            if not part:
+                raise ConnectionError("daemon closed status probe")
+            chunks.extend(part)
+        return bytes(chunks)
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(str(sock_path))
+            conn.sendall(struct.pack(">I", len(payload)) + payload)
+            header = _recv_exact(conn, 4)
+            length = struct.unpack(">I", header)[0]
+            if length <= 0 or length > MAX_MESSAGE_SIZE:
+                return False
+            response = json.loads(_recv_exact(conn, length).decode())
+
+        if not isinstance(response, dict):
+            return False
+        response_id = response.get("id")
+        if (
+            response.get("jsonrpc") != "2.0"
+            or type(response_id) is not int
+            or response_id != request["id"]
+            or "error" in response
+        ):
+            return False
+
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return False
+        project = result.get("project")
+        if (
+            result.get("running") is not True
+            or not isinstance(project, str)
+            or not project.strip()
+        ):
+            return False
+        return Path(project).resolve() == root.resolve()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _live_daemon_pid(root: Path) -> Optional[int]:
+    """Return the recorded PID when it is alive, cleaning only stale state."""
     pf = pid_path(root)
     if not pf.exists():
-        return False
+        return None
     try:
         stored_pid = int(pf.read_text().strip())
         os.kill(stored_pid, 0)  # Check if process exists
-        return True
     except (ValueError, OSError):
         # Stale PID file — clean up
         pf.unlink(missing_ok=True)
         socket_path(root).unlink(missing_ok=True)
+        return None
+    return stored_pid
+
+
+def is_daemon_running(root: Path) -> bool:
+    """Check for a live process *and* a usable project-specific daemon."""
+    if _live_daemon_pid(root) is None:
         return False
+    return _probe_daemon(root)
 
 
 class KnowDaemon:
@@ -509,19 +669,27 @@ class KnowDaemon:
     async def _auto_refresh_loop(self):
         """Background loop: keep index fresh for changed/deleted files."""
         try:
+            initial_index_succeeded = True
             if self._index_task:
                 try:
                     await self._index_task
                 except Exception as e:
+                    initial_index_succeeded = False
                     logger.debug(f"Initial index task failed before auto-refresh: {e}")
 
-            self._file_mtime_snapshot = await asyncio.to_thread(
+            current_snapshot = await asyncio.to_thread(
                 _collect_project_file_mtimes, self.config,
+            )
+            # A failed cold index must make every discovered source look new on
+            # the first refresh pass. Warming the baseline here would silently
+            # suppress the retry until files changed again.
+            self._file_mtime_snapshot = (
+                current_snapshot if initial_index_succeeded else {}
             )
             # One-time hygiene: purge indexed files outside current scanner scope
             # (for example old virtualenv/site-packages artifacts).
             try:
-                allowed = {str(p).replace("\\", "/") for p in self._file_mtime_snapshot.keys()}
+                allowed = {str(p).replace("\\", "/") for p in current_snapshot.keys()}
                 indexed = self.db.list_indexed_files()
                 out_of_scope = [fp for fp in indexed if str(fp).replace("\\", "/") not in allowed]
                 if out_of_scope:
@@ -549,7 +717,15 @@ class KnowDaemon:
 
             while True:
                 await asyncio.sleep(self._auto_refresh_interval)
-                summary = await asyncio.to_thread(self._incremental_refresh_once_sync)
+                try:
+                    summary = await asyncio.to_thread(self._incremental_refresh_once_sync)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # A transient filesystem/parser/SQLite failure must not
+                    # permanently kill the daemon's refresh task.
+                    logger.debug(f"Auto-refresh iteration failed; will retry: {e}")
+                    continue
                 if summary.get("refreshed", 0) or summary.get("removed", 0):
                     logger.info(
                         "Auto-refresh: refreshed=%s removed=%s skipped=%s",
@@ -566,7 +742,6 @@ class KnowDaemon:
         """Perform one incremental refresh pass."""
         current = _collect_project_file_mtimes(self.config)
         changed, removed = _diff_file_mtimes(self._file_mtime_snapshot, current)
-        self._file_mtime_snapshot = current
 
         if not changed and not removed:
             return {"refreshed": 0, "removed": 0, "skipped": 0, "results": []}
@@ -575,6 +750,13 @@ class KnowDaemon:
         summary = refresh_files_if_stale(
             self.root, self.config, self.db, paths, remove_missing=True,
         )
+
+        # Import edges are part of the index contract, not optional derived
+        # state. Rebuild authoritatively after every changed batch so removed
+        # imports and newly added imports are visible immediately.
+        from know.import_graph import ImportGraph
+        with ImportGraph(self.config) as graph:
+            graph.build()
 
         # Recomputing full graph importance on every tiny edit is expensive.
         # Refresh it only for larger batches or file removals.
@@ -585,6 +767,22 @@ class KnowDaemon:
                 self.db.compute_importance()
             except Exception as e:
                 logger.debug(f"Importance recompute after auto-refresh failed: {e}")
+
+        # Advance only successful paths. Parse/read failures retain their old
+        # mtime (or remain absent) so the next iteration retries them.
+        retry_paths = {
+            str(result.get("file_path", ""))
+            for result in summary.get("results", [])
+            if not result.get("updated")
+            and result.get("reason") != "up_to_date"
+        }
+        next_snapshot = dict(current)
+        for path in retry_paths:
+            if path in self._file_mtime_snapshot:
+                next_snapshot[path] = self._file_mtime_snapshot[path]
+            else:
+                next_snapshot.pop(path, None)
+        self._file_mtime_snapshot = next_snapshot
 
         return summary
 
@@ -647,14 +845,20 @@ class KnowDaemon:
     async def _handle_search(self, params: dict) -> dict:
         """BM25 search over code chunks."""
         query = params.get("query", "")
-        limit = params.get("limit", 20)
+        limit = _bounded_rpc_int(
+            "limit", params.get("limit", 20), maximum=MAX_RPC_RESULTS,
+        )
         results = self.db.search_chunks(query, limit)
         return {"results": results, "count": len(results)}
 
     async def _handle_context(self, params: dict) -> dict:
         """Build full v3 context for a query within a token budget."""
         query = params.get("query", "")
-        budget = int(params.get("budget", 8000))
+        budget = _bounded_rpc_int(
+            "budget",
+            params.get("budget", 8000),
+            maximum=MAX_RPC_TOKEN_BUDGET,
+        )
         include_tests = bool(params.get("include_tests", True))
         include_imports = bool(params.get("include_imports", True))
         include_patterns = params.get("include_patterns")
@@ -664,6 +868,7 @@ class KnowDaemon:
         include_markdown = bool(params.get("include_markdown", False))
         retrieval_profile = str(params.get("retrieval_profile", "balanced") or "balanced")
         semantic_max_ms = params.get("semantic_max_ms")
+        read_only = bool(params.get("read_only", False))
         if semantic_max_ms is not None:
             semantic_max_ms = int(semantic_max_ms)
 
@@ -687,8 +892,12 @@ class KnowDaemon:
         # Inject relevant memories into context (same behavior as CLI fallback).
         try:
             from know.knowledge_base import KnowledgeBase
-            kb = KnowledgeBase(self.config)
-            memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+            with KnowledgeBase(self.config) as kb:
+                memory_ctx = kb.get_relevant_context(
+                    query,
+                    max_tokens=min(500, budget // 10),
+                    touch=not read_only,
+                )
             if memory_ctx:
                 result["memories_context"] = memory_ctx
         except Exception as e:
@@ -754,9 +963,37 @@ class KnowDaemon:
             },
         }[mode]
 
-        map_limit = int(params.get("map_limit", defaults["map_limit"]))
-        context_budget = int(params.get("context_budget", defaults["context_budget"]))
-        deep_budget = int(params.get("deep_budget", defaults["deep_budget"]))
+        map_limit = _bounded_rpc_int(
+            "map_limit",
+            params.get("map_limit", defaults["map_limit"]),
+            maximum=MAX_RPC_RESULTS,
+        )
+        context_budget = _bounded_rpc_int(
+            "context_budget",
+            params.get("context_budget", defaults["context_budget"]),
+            maximum=MAX_RPC_TOKEN_BUDGET,
+        )
+        if "deep_budget" in params:
+            requested_deep_budget = params["deep_budget"]
+            if (
+                mode == "explore"
+                and not isinstance(requested_deep_budget, bool)
+                and requested_deep_budget == 0
+            ):
+                # Existing workflow clients send the documented explore-mode
+                # sentinel explicitly. It disables work rather than shaping a
+                # query, so retain it while validating every active budget.
+                deep_budget = 0
+            else:
+                deep_budget = _bounded_rpc_int(
+                    "deep_budget",
+                    requested_deep_budget,
+                    maximum=MAX_RPC_TOKEN_BUDGET,
+                )
+        else:
+            # Explore mode intentionally uses zero as an internal sentinel to
+            # skip deep expansion; explicit RPC values remain strictly positive.
+            deep_budget = defaults["deep_budget"]
         include_tests = bool(params.get("include_tests", False))
         include_imports = bool(params.get("include_imports", True))
         include_patterns = params.get("include_patterns")
@@ -837,6 +1074,7 @@ class KnowDaemon:
                 "include_markdown": False,
                 "retrieval_profile": retrieval_profile,
                 "semantic_max_ms": semantic_max_ms,
+                "read_only": read_only,
             })
         context_elapsed_ms = int((time.monotonic() - context_t0) * 1000)
 
@@ -995,21 +1233,21 @@ class KnowDaemon:
         try:
             from know.knowledge_base import KnowledgeBase
 
-            kb = KnowledgeBase(self.config)
-            mem_id = kb.remember(
-                content,
-                source=source,
-                tags=tags,
-                memory_type=params.get("memory_type", "note"),
-                decision_status=params.get("decision_status", "active"),
-                confidence=float(params.get("confidence", 0.5) or 0.5),
-                evidence=params.get("evidence", ""),
-                session_id=session_id,
-                agent=agent or "daemon",
-                trust_level=params.get("trust_level", "local_verified"),
-                supersedes_id=params.get("supersedes_id", ""),
-                expires_at=params.get("expires_at"),
-            )
+            with KnowledgeBase(self.config) as kb:
+                mem_id = kb.remember(
+                    content,
+                    source=source,
+                    tags=tags,
+                    memory_type=params.get("memory_type", "note"),
+                    decision_status=params.get("decision_status", "active"),
+                    confidence=float(params.get("confidence", 0.5) or 0.5),
+                    evidence=params.get("evidence", ""),
+                    session_id=session_id,
+                    agent=agent or "daemon",
+                    trust_level=params.get("trust_level", "local_verified"),
+                    supersedes_id=params.get("supersedes_id", ""),
+                    expires_at=params.get("expires_at"),
+                )
             return {"stored": True, "id": mem_id}
         except Exception as e:
             logger.debug(f"Daemon remember fallback path: {e}")
@@ -1018,38 +1256,46 @@ class KnowDaemon:
     async def _handle_recall(self, params: dict) -> dict:
         """Recall memories by query."""
         query = params.get("query", "")
-        limit = params.get("limit", 10)
+        limit = _bounded_rpc_int(
+            "limit", params.get("limit", 10), maximum=MAX_RPC_RESULTS,
+        )
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(self.config)
-        memories = kb.recall(
-            query,
-            top_k=limit,
-            memory_type=params.get("memory_type"),
-            decision_status=params.get("decision_status"),
-            include_blocked=bool(params.get("include_blocked", False)),
-            include_expired=bool(params.get("include_expired", False)),
-        )
+        with KnowledgeBase(self.config) as kb:
+            memories = kb.recall(
+                query,
+                top_k=limit,
+                memory_type=params.get("memory_type"),
+                decision_status=params.get("decision_status"),
+                include_blocked=bool(params.get("include_blocked", False)),
+                include_expired=bool(params.get("include_expired", False)),
+            )
         return {"memories": [m.to_dict() for m in memories], "count": len(memories)}
 
     async def _handle_callers(self, params: dict) -> dict:
         """Find callers of a function."""
         function_name = params.get("function_name", "")
-        limit = params.get("limit", 50)
+        limit = _bounded_rpc_int(
+            "limit", params.get("limit", 50), maximum=MAX_RPC_RESULTS,
+        )
         results = self.db.get_callers(function_name, limit)
         return {"callers": results, "count": len(results)}
 
     async def _handle_callees(self, params: dict) -> dict:
         """Find callees of a chunk."""
         chunk_name = params.get("chunk_name", "")
-        limit = params.get("limit", 50)
+        limit = _bounded_rpc_int(
+            "limit", params.get("limit", 50), maximum=MAX_RPC_RESULTS,
+        )
         results = self.db.get_callees(chunk_name, limit)
         return {"callees": results, "count": len(results)}
 
     async def _handle_map(self, params: dict) -> dict:
         """Lightweight signature search — no bodies."""
         query = params.get("query", "")
-        limit = params.get("limit", 20)
+        limit = _bounded_rpc_int(
+            "limit", params.get("limit", 20), maximum=MAX_RPC_RESULTS,
+        )
         chunk_type = params.get("chunk_type")
         results = self.db.search_signatures(query, limit, chunk_type)
         return {"results": results, "count": len(results)}
@@ -1057,7 +1303,11 @@ class KnowDaemon:
     async def _handle_deep(self, params: dict) -> dict:
         """Deep context: function body + callers + callees within budget."""
         name = params.get("name", "")
-        budget = params.get("budget", 3000)
+        budget = _bounded_rpc_int(
+            "budget",
+            params.get("budget", 3000),
+            maximum=MAX_RPC_TOKEN_BUDGET,
+        )
         include_tests = params.get("include_tests", False)
         session_id = params.get("session_id")
 
@@ -1098,13 +1348,21 @@ class KnowDaemon:
 
     def _full_index_sync(self) -> int:
         """Synchronous indexing implementation (runs in thread pool)."""
+        # Full indexing is a low-frequency lifecycle boundary and therefore a
+        # safe place to expire session dedup state without adding request-path
+        # latency or a separate maintenance thread.
+        try:
+            self.db.cleanup_expired_sessions()
+        except Exception as e:
+            logger.debug(f"Expired session cleanup skipped: {e}")
+
         count, modules = populate_index(self.root, self.config, self.db)
 
         # Build import graph so 'related' queries work
         try:
             from know.import_graph import ImportGraph
-            ig = ImportGraph(self.config)
-            ig.build(modules)
+            with ImportGraph(self.config) as graph:
+                graph.build(modules)
         except Exception as e:
             logger.debug(f"Import graph build failed: {e}")
 
@@ -1161,14 +1419,39 @@ def ensure_daemon(root: Path, config: Config) -> DaemonClient:
 
     Auto-starts the daemon as a background process if not running.
     """
-    if not is_daemon_running(root):
-        _start_daemon_background(root, config)
-        # Wait for socket to appear
-        sock = socket_path(root)
-        for _ in range(50):  # Wait up to 5 seconds
-            time.sleep(0.1)
-            if sock.exists():
-                break
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = PID_DIR / f"{_project_hash(root)}.startup.lock"
+    with lock_path.open("a+") as lock_file:
+        # Coordinate independent CLI processes as well as concurrent threads.
+        # The lock remains held until the spawned daemon answers a status probe.
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if not is_daemon_running(root):
+                live_pid = _live_daemon_pid(root)
+                if live_pid is not None:
+                    # A synchronous request can briefly keep the daemon event
+                    # loop from answering probes. Replacing that live process
+                    # would let two daemons unlink each other's socket/PID.
+                    for _ in range(20):
+                        if _probe_daemon(root):
+                            break
+                        time.sleep(0.25)
+                    else:
+                        raise RuntimeError(
+                            f"Daemon process {live_pid} is alive but not responding; "
+                            "refusing to replace it"
+                        )
+                    return DaemonClient(root)
+
+                _start_daemon_background(root, config)
+                for _ in range(50):  # Wait up to 5 seconds
+                    time.sleep(0.1)
+                    if is_daemon_running(root):
+                        break
+                else:
+                    raise RuntimeError("Daemon did not become ready within 5 seconds")
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     return DaemonClient(root)
 
@@ -1176,12 +1459,19 @@ def ensure_daemon(root: Path, config: Config) -> DaemonClient:
 def _start_daemon_background(root: Path, config: Config):
     """Fork a daemon process in the background."""
     import subprocess
-    subprocess.Popen(
+    process = subprocess.Popen(
         [sys.executable, "-m", "know.daemon", str(root)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # Popen warns when garbage-collected while still running. Retain ownership
+    # in a daemon waiter thread without making the CLI wait for daemon lifetime.
+    threading.Thread(
+        target=process.wait,
+        name=f"know-daemon-reaper-{process.pid}",
+        daemon=True,
+    ).start()
 
 
 # ---------------------------------------------------------------------------

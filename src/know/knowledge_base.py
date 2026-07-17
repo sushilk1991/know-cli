@@ -8,12 +8,14 @@ and text UUIDs (used by DaemonDB).
 from __future__ import annotations
 
 import json
+import math
 import re
+import sqlite3
 import time
 import uuid
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -23,6 +25,10 @@ if TYPE_CHECKING:
     from know.config import Config
 
 logger = get_logger()
+
+MEMORY_TYPES = frozenset({"note", "decision", "constraint", "fact", "todo", "risk"})
+DECISION_STATUSES = frozenset({"active", "resolved", "superseded", "rejected"})
+TRUST_LEVELS = frozenset({"local_verified", "imported_unverified", "blocked"})
 
 
 @dataclass
@@ -85,17 +91,21 @@ class KnowledgeBase:
         self._rebuild_id_map()
 
     def _rebuild_id_map(self):
-        """Build sequential integer IDs from all existing memories."""
+        """Build stable integer IDs from SQLite display IDs."""
         self._id_map.clear()
         self._reverse_map.clear()
         memories = self._db.list_memories()
-        # Sort by created_at ascending so oldest gets lowest ID
-        memories.sort(key=lambda m: m.get("created_at", 0))
-        for i, mem in enumerate(memories, 1):
+        fallback_id = 1
+        for mem in memories:
             text_id = mem["id"]
-            self._id_map[i] = text_id
-            self._reverse_map[text_id] = i
-        self._next_id = len(memories) + 1
+            display_id = mem.get("_display_id")
+            if not isinstance(display_id, int) or display_id <= 0:
+                while fallback_id in self._id_map:
+                    fallback_id += 1
+                display_id = fallback_id
+            self._id_map[display_id] = text_id
+            self._reverse_map[text_id] = display_id
+        self._next_id = max(self._id_map, default=0) + 1
 
     def _assign_id(self, text_id: str) -> int:
         """Assign the next sequential integer ID to a text UUID."""
@@ -133,34 +143,62 @@ class KnowledgeBase:
         expires_at: Optional[float] = None,
     ) -> int:
         """Store a new memory. Returns the integer display ID."""
-        trust_level = self._normalize_trust_level(text, trust_level)
-        embedding_blob = self._embed_text(text)
-        text_id = str(uuid.uuid4())[:8]
-
-        # Map source names: DaemonDB uses source_type
-        stored = self._db.store_memory(
-            text_id, text, tags=tags, source_type=source,
-            embedding=embedding_blob,
+        text, memory_type, decision_status, confidence, trust_level = self._validate_memory_fields(
+            text=text,
             memory_type=memory_type,
             decision_status=decision_status,
             confidence=confidence,
-            evidence=evidence,
-            session_id=session_id,
-            agent=agent,
             trust_level=trust_level,
-            supersedes_id=supersedes_id,
-            expires_at=expires_at,
         )
-        if not stored:
-            # Duplicate content — find existing and return its display ID
-            for int_id, tid in self._id_map.items():
-                mem = self._db.get_memory_by_id(tid)
-                if mem and mem["content"] == text:
-                    return int_id
-            # Shouldn't reach here, but assign new ID as fallback
-            return self._assign_id(text_id)
+        trust_level = self._normalize_trust_level(text, trust_level)
+        embedding_blob = self._embed_text(text)
+        if expires_at in (None, ""):
+            expires_at = None
+        else:
+            try:
+                expires_at = float(expires_at)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("expires_at must be a finite timestamp") from exc
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite timestamp")
 
-        return self._assign_id(text_id)
+        stored = False
+        text_id = ""
+        for _attempt in range(3):
+            text_id = str(uuid.uuid4())
+            try:
+                # Map source names: DaemonDB uses source_type.
+                stored = self._db.store_memory(
+                    text_id, text, tags=tags, source_type=source,
+                    embedding=embedding_blob,
+                    memory_type=memory_type,
+                    decision_status=decision_status,
+                    confidence=confidence,
+                    evidence=evidence,
+                    session_id=session_id,
+                    agent=agent,
+                    trust_level=trust_level,
+                    supersedes_id=supersedes_id,
+                    expires_at=expires_at,
+                )
+                if stored:
+                    break
+                # INSERT OR IGNORE can mean duplicate content or an ID
+                # collision. Resolve the former; retry the latter.
+                self._rebuild_id_map()
+                for row in self._db.list_memories():
+                    if row.get("content") == text:
+                        return self._reverse_map[row["id"]]
+            except sqlite3.IntegrityError:
+                # UUID collisions are extraordinarily unlikely in production,
+                # but retrying keeps the storage contract correct under faults.
+                continue
+        else:
+            raise RuntimeError("Could not allocate a unique memory ID")
+
+        # Refresh so display IDs remain stable when multiple instances write.
+        self._rebuild_id_map()
+        return self._reverse_map[text_id]
 
     def forget(self, memory_id: int) -> bool:
         """Delete a memory by integer display ID. Returns True if deleted."""
@@ -202,7 +240,14 @@ class KnowledgeBase:
             text_id = row["id"]
             int_id = self._reverse_map.get(text_id)
             if int_id is None:
-                int_id = self._assign_id(text_id)
+                display_id = row.get("_display_id")
+                int_id = (
+                    display_id
+                    if isinstance(display_id, int) and display_id > 0
+                    else self._assign_id(text_id)
+                )
+                self._id_map[int_id] = text_id
+                self._reverse_map[text_id] = int_id
             result.append(self._dict_to_memory(row, int_id))
         return result
 
@@ -216,6 +261,7 @@ class KnowledgeBase:
 
     def resolve(self, memory_id: int, status: str = "resolved") -> bool:
         """Resolve/supersede/reject a memory by display ID."""
+        status = self._canonical_choice("decision_status", status, DECISION_STATUSES)
         text_id = self._id_map.get(memory_id)
         if not text_id:
             return False
@@ -237,8 +283,17 @@ class KnowledgeBase:
         decision_status: Optional[str] = None,
         include_blocked: bool = False,
         include_expired: bool = False,
+        touch: bool = True,
     ) -> List[Memory]:
         """Recall memories using hybrid retrieval (semantic + lexical + text + priors)."""
+        if top_k <= 0:
+            return []
+        if memory_type is not None:
+            memory_type = self._canonical_choice("memory_type", memory_type, MEMORY_TYPES)
+        if decision_status is not None:
+            decision_status = self._canonical_choice(
+                "decision_status", decision_status, DECISION_STATUSES,
+            )
         try:
             return self._recall_hybrid(
                 query,
@@ -247,6 +302,7 @@ class KnowledgeBase:
                 decision_status=decision_status,
                 include_blocked=include_blocked,
                 include_expired=include_expired,
+                touch=touch,
             )
         except Exception as e:
             logger.debug(f"Hybrid memory recall failed ({e}), using lexical fallback")
@@ -259,7 +315,8 @@ class KnowledgeBase:
                 include_expired=include_expired,
             )
             memories = self._rows_to_memories(rows[:top_k])
-            self._touch_memories(memories)
+            if touch:
+                self._touch_memories(memories)
             return memories
 
     def _recall_hybrid(
@@ -270,6 +327,7 @@ class KnowledgeBase:
         decision_status: Optional[str],
         include_blocked: bool,
         include_expired: bool,
+        touch: bool,
     ) -> List[Memory]:
         from know.ranking import fuse_rankings
 
@@ -338,7 +396,8 @@ class KnowledgeBase:
         )
 
         memories = self._rows_to_memories(fused_rows[:top_k])
-        self._touch_memories(memories)
+        if touch:
+            self._touch_memories(memories)
         return memories
 
     def _recall_semantic(self, query: str, top_k: int) -> List[Memory]:
@@ -420,14 +479,33 @@ class KnowledgeBase:
     @staticmethod
     def _prior_utility(row: Dict[str, Any]) -> float:
         now = time.time()
-        created_at = float(row.get("created_at", now) or now)
+        created_at = KnowledgeBase._safe_float(row.get("created_at"), now)
         age_days = max(0.0, (now - created_at) / 86400.0)
         recency = 1.0 / (1.0 + age_days / 30.0)
-        quality = float(row.get("quality_score", 1.0) or 1.0)
-        confidence = float(row.get("confidence", 0.5) or 0.5)
-        access_count = float(row.get("access_count", 0) or 0)
+        quality = KnowledgeBase._safe_float(row.get("quality_score"), 1.0)
+        confidence = KnowledgeBase._safe_float(row.get("confidence"), 0.5, 0.0, 1.0)
+        access_count = KnowledgeBase._safe_float(row.get("access_count"), 0.0, 0.0)
         access = min(access_count, 20.0) / 20.0
         return 0.45 * recency + 0.25 * quality + 0.20 * confidence + 0.10 * access
+
+    @staticmethod
+    def _safe_float(
+        value: Any,
+        default: float,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(parsed):
+            return default
+        if minimum is not None and parsed < minimum:
+            return default
+        if maximum is not None and parsed > maximum:
+            return default
+        return parsed
 
     def _filter_rows(
         self,
@@ -445,7 +523,10 @@ class KnowledgeBase:
                 continue
             if decision_status and row.get("decision_status", "active") != decision_status:
                 continue
-            if not include_blocked and row.get("trust_level", "local_verified") == "blocked":
+            trust_level = str(row.get("trust_level", "local_verified") or "").strip().lower()
+            if not include_blocked and trust_level not in {
+                "local_verified", "imported_unverified",
+            }:
                 continue
             expires_at = row.get("expires_at")
             if not include_expired and expires_at is not None:
@@ -453,7 +534,9 @@ class KnowledgeBase:
                     if float(expires_at) <= now:
                         continue
                 except Exception:
-                    pass
+                    # Corrupt lifecycle metadata must fail closed rather than
+                    # making a memory effectively immortal.
+                    continue
             out.append(row)
         return out
 
@@ -471,10 +554,7 @@ class KnowledgeBase:
 
     @staticmethod
     def _normalize_trust_level(text: str, requested: str) -> str:
-        level = (requested or "local_verified").strip()
-        if level != "local_verified":
-            return level
-
+        level = (requested or "local_verified").strip().lower()
         lowered = (text or "").lower()
         suspicious_markers = (
             "ignore previous instructions",
@@ -488,6 +568,42 @@ class KnowledgeBase:
             return "blocked"
         return level
 
+    @staticmethod
+    def _canonical_choice(field_name: str, value: Any, allowed: frozenset[str]) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be one of: {', '.join(sorted(allowed))}")
+        normalized = value.strip().lower()
+        if normalized not in allowed:
+            raise ValueError(f"{field_name} must be one of: {', '.join(sorted(allowed))}")
+        return normalized
+
+    @classmethod
+    def _validate_memory_fields(
+        cls,
+        *,
+        text: Any,
+        memory_type: Any,
+        decision_status: Any,
+        confidence: Any,
+        trust_level: Any,
+    ) -> tuple[str, str, str, float, str]:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-blank string")
+        memory_type = cls._canonical_choice("memory_type", memory_type, MEMORY_TYPES)
+        decision_status = cls._canonical_choice(
+            "decision_status", decision_status, DECISION_STATUSES,
+        )
+        trust_level = cls._canonical_choice("trust_level", trust_level, TRUST_LEVELS)
+        if isinstance(confidence, bool):
+            raise ValueError("confidence must be a finite number between 0 and 1")
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be a finite number between 0 and 1") from exc
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be a finite number between 0 and 1")
+        return text.strip(), memory_type, decision_status, confidence, trust_level
+
     # ------------------------------------------------------------------
     # Export / Import
     # ------------------------------------------------------------------
@@ -499,40 +615,106 @@ class KnowledgeBase:
     def import_json(self, data: str) -> int:
         """Import memories from JSON string. Returns count imported."""
         records = json.loads(data)
+        if not isinstance(records, list):
+            raise ValueError("Memory import must be a JSON array")
         if not records:
             return 0
 
-        count = 0
-        for rec in records:
+        # Normalize the entire payload before writing anything, preventing a
+        # malformed later record from leaving a misleading partial import.
+        normalized_records: list[dict[str, Any]] = []
+        string_fields = {
+            "source": "manual",
+            "tags": "",
+            "evidence": "",
+            "session_id": "",
+            "agent": "",
+            "supersedes_id": "",
+        }
+        for index, rec in enumerate(records, 1):
+            if not isinstance(rec, dict):
+                raise ValueError(f"Invalid memory import record {index}: expected an object")
             try:
-                self.remember(
-                    text=rec["text"],
-                    source=rec.get("source", "manual"),
-                    tags=rec.get("tags", ""),
-                    memory_type=rec.get("memory_type", "note"),
-                    decision_status=rec.get("decision_status", "active"),
-                    confidence=float(rec.get("confidence", 0.5) or 0.5),
-                    evidence=rec.get("evidence", ""),
-                    session_id=rec.get("session_id", ""),
-                    agent=rec.get("agent", ""),
-                    trust_level=rec.get("trust_level", "imported_unverified"),
-                    supersedes_id=rec.get("supersedes_id", ""),
-                    expires_at=rec.get("expires_at"),
+                text, memory_type, decision_status, confidence, trust_level = (
+                    self._validate_memory_fields(
+                        text=rec.get("text"),
+                        memory_type=rec.get("memory_type", "note"),
+                        decision_status=rec.get("decision_status", "active"),
+                        confidence=rec.get("confidence", 0.5),
+                        trust_level=rec.get("trust_level", "imported_unverified"),
+                    )
                 )
-                count += 1
-            except Exception:
-                pass
+                normalized = {
+                    "text": text,
+                    "memory_type": memory_type,
+                    "decision_status": decision_status,
+                    "confidence": confidence,
+                    "trust_level": trust_level,
+                }
+                for field_name, default in string_fields.items():
+                    value = rec.get(field_name, default)
+                    if not isinstance(value, str):
+                        raise ValueError(f"{field_name} must be a string")
+                    normalized[field_name] = value
+
+                expires_at = rec.get("expires_at")
+                if expires_at in (None, ""):
+                    expires_at = None
+                elif isinstance(expires_at, bool):
+                    raise ValueError("expires_at must be an ISO timestamp or epoch seconds")
+                elif isinstance(expires_at, str):
+                    try:
+                        parsed_expiry = datetime.fromisoformat(expires_at)
+                        if parsed_expiry.tzinfo is None:
+                            parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+                        expires_at = parsed_expiry.timestamp()
+                    except ValueError as exc:
+                        raise ValueError(
+                            "expires_at must be an ISO timestamp or epoch seconds"
+                        ) from exc
+                else:
+                    try:
+                        expires_at = float(expires_at)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "expires_at must be an ISO timestamp or epoch seconds"
+                        ) from exc
+                if expires_at is not None and not math.isfinite(expires_at):
+                    raise ValueError("expires_at must be an ISO timestamp or epoch seconds")
+                normalized["expires_at"] = expires_at
+                normalized_records.append(normalized)
+            except ValueError as exc:
+                raise ValueError(f"Invalid memory import record {index}: {exc}") from exc
+
+        count = 0
+        try:
+            with self._db.batch():
+                for rec in normalized_records:
+                    before = self.count()
+                    self.remember(**rec)
+                    count += int(self.count() > before)
+        finally:
+            # remember() refreshes the in-memory maps after each row. A later
+            # runtime failure rolls the DB batch back, so rebuild the maps from
+            # committed truth on both success and failure.
+            self._rebuild_id_map()
 
         return count
 
     # ------------------------------------------------------------------
     # Relevant memories for context engine
     # ------------------------------------------------------------------
-    def get_relevant_context(self, query: str, max_tokens: int = 500) -> str:
+    def get_relevant_context(
+        self,
+        query: str,
+        max_tokens: int = 500,
+        *,
+        touch: bool = True,
+    ) -> str:
         """Return relevant memories formatted for context engine injection."""
         from know.token_counter import count_tokens
 
-        memories = self.recall(query, top_k=10)
+        memories = self.recall(query, top_k=10, touch=touch)
         if not memories:
             return ""
 
@@ -568,7 +750,7 @@ class KnowledgeBase:
             return ""
         if isinstance(value, (int, float)):
             try:
-                return datetime.fromtimestamp(value).isoformat()
+                return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
             except Exception:
                 return ""
         return str(value)
@@ -578,17 +760,26 @@ class KnowledgeBase:
         created = self._fmt_ts(row.get("created_at", ""))
         resolved = self._fmt_ts(row.get("resolved_at", ""))
         expires = self._fmt_ts(row.get("expires_at", ""))
+        memory_type = str(row.get("memory_type", "note") or "").strip().lower()
+        if memory_type not in MEMORY_TYPES:
+            memory_type = "note"
+        decision_status = str(row.get("decision_status", "active") or "").strip().lower()
+        if decision_status not in DECISION_STATUSES:
+            decision_status = "active"
+        trust_level = str(row.get("trust_level", "local_verified") or "").strip().lower()
+        if trust_level not in TRUST_LEVELS:
+            trust_level = "blocked"
         return Memory(
             id=int_id,
             text=row.get("content", ""),
             source=row.get("source_type", "manual"),
-            memory_type=row.get("memory_type", "note"),
-            decision_status=row.get("decision_status", "active"),
-            confidence=float(row.get("confidence", 0.5) or 0.5),
+            memory_type=memory_type,
+            decision_status=decision_status,
+            confidence=self._safe_float(row.get("confidence"), 0.5, 0.0, 1.0),
             evidence=row.get("evidence", ""),
             session_id=row.get("session_id", ""),
             agent=row.get("agent", ""),
-            trust_level=row.get("trust_level", "local_verified"),
+            trust_level=trust_level,
             supersedes_id=row.get("supersedes_id", ""),
             tags=row.get("tags", ""),
             created_at=str(created),
@@ -604,6 +795,13 @@ class KnowledgeBase:
             text_id = row["id"]
             int_id = self._reverse_map.get(text_id)
             if int_id is None:
-                int_id = self._assign_id(text_id)
+                display_id = row.get("_display_id")
+                int_id = (
+                    display_id
+                    if isinstance(display_id, int) and display_id > 0
+                    else self._assign_id(text_id)
+                )
+                self._id_map[int_id] = text_id
+                self._reverse_map[text_id] = int_id
             result.append(self._dict_to_memory(row, int_id))
         return result

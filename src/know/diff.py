@@ -69,7 +69,9 @@ class ArchitectureDiff:
         if not self._check_git_repo():
             return []
         
-        output = self._run_git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash])
+        output = self._run_git([
+            "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit_hash,
+        ])
         return [f for f in output.split("\n") if f]
     
     def get_structure_at_commit(self, commit_hash: str) -> Dict[str, Any]:
@@ -113,8 +115,8 @@ class ArchitectureDiff:
                     from know.scanner import CodebaseScanner
                     
                     config = Config.create_default(worktree_path)
-                    scanner = CodebaseScanner(config)
-                    structure = scanner.get_structure()
+                    with CodebaseScanner(config) as scanner:
+                        structure = scanner.get_structure()
                     
                     return {
                         "files": structure.get("file_count", 0),

@@ -29,11 +29,26 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 
 _MCP_AVAILABLE = False
+FastMCP = None
 try:
     from mcp.server.fastmcp import FastMCP
     _MCP_AVAILABLE = True
 except ImportError:
     pass
+
+
+_MAX_CONTEXT_BUDGET = 100_000
+_MAX_RESULTS = 100
+_MAX_MEMORY_ID = 2**31 - 1
+
+
+def _bounded_int(name: str, value: Any, *, maximum: int) -> int:
+    """Validate direct MCP inputs before they can allocate or query broadly."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
 
 
 def _check_mcp():
@@ -116,6 +131,7 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
                    "help me fix the auth bug").
             budget: Maximum number of tokens to return (default 8000).
         """
+        budget = _bounded_int("budget", budget, maximum=_MAX_CONTEXT_BUDGET)
         config = _get_config()
 
         from know.context_engine import ContextEngine
@@ -126,8 +142,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         # Inject memories
         try:
             from know.knowledge_base import KnowledgeBase
-            kb = KnowledgeBase(config)
-            mem_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+            with KnowledgeBase(config) as kb:
+                mem_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
             if mem_ctx:
                 result["memories_context"] = mem_ctx
         except Exception:
@@ -146,6 +162,7 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
             query: What to search for (natural language or code terms).
             top_k: Maximum number of results to return (default 5).
         """
+        top_k = _bounded_int("top_k", top_k, maximum=_MAX_RESULTS)
         config = _get_config()
 
         from know.semantic_search import SemanticSearcher
@@ -182,24 +199,25 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
 
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        mem_id = kb.remember(
-            text,
-            source="mcp",
-            tags=tags,
-            memory_type=memory_type,
-            decision_status=decision_status,
-            confidence=confidence,
-            evidence=evidence,
-            session_id=session_id,
-            agent=agent,
-            trust_level=trust_level,
-        )
+        with KnowledgeBase(config) as kb:
+            mem_id = kb.remember(
+                text,
+                source="mcp",
+                tags=tags,
+                memory_type=memory_type,
+                decision_status=decision_status,
+                confidence=confidence,
+                evidence=evidence,
+                session_id=session_id,
+                agent=agent,
+                trust_level=trust_level,
+            )
 
         # Track stats
         try:
             from know.stats import StatsTracker
-            StatsTracker(config).record_remember(text, "mcp")
+            with StatsTracker(config) as tracker:
+                tracker.record_remember(text, "mcp")
         except Exception:
             pass
 
@@ -227,26 +245,28 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         Args:
             query: What to look up (e.g. "how does auth work?").
         """
+        top_k = _bounded_int("top_k", top_k, maximum=_MAX_RESULTS)
         config = _get_config()
 
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        memories = kb.recall(
-            query,
-            top_k=top_k,
-            memory_type=memory_type or None,
-            decision_status=decision_status or None,
-            include_blocked=include_blocked,
-            include_expired=include_expired,
-        )
+        with KnowledgeBase(config) as kb:
+            memories = kb.recall(
+                query,
+                top_k=top_k,
+                memory_type=memory_type or None,
+                decision_status=decision_status or None,
+                include_blocked=include_blocked,
+                include_expired=include_expired,
+            )
 
         results = [m.to_dict() for m in memories]
 
         # Track stats
         try:
             from know.stats import StatsTracker
-            StatsTracker(config).record_recall(query, len(results), 0)
+            with StatsTracker(config) as tracker:
+                tracker.record_recall(query, len(results), 0)
         except Exception:
             pass
 
@@ -255,11 +275,12 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
     @server.tool()
     async def resolve_memory(memory_id: int, status: str = "resolved") -> str:
         """Resolve/supersede/reject a stored memory."""
+        memory_id = _bounded_int("memory_id", memory_id, maximum=_MAX_MEMORY_ID)
         config = _get_config()
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        updated = kb.resolve(memory_id, status=status)
+        with KnowledgeBase(config) as kb:
+            updated = kb.resolve(memory_id, status=status)
         return json.dumps({"id": memory_id, "updated": updated, "status": status})
 
     @server.tool()
@@ -268,12 +289,12 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         config = _get_config()
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        payload = {
-            "schema_version": 1,
-            "project_root": str(config.root),
-            "memories": [m.to_dict() for m in kb.list_all()],
-        }
+        with KnowledgeBase(config) as kb:
+            payload = {
+                "schema_version": 1,
+                "project_root": str(config.root),
+                "memories": [m.to_dict() for m in kb.list_all()],
+            }
         return json.dumps(payload, indent=2)
 
     @server.tool()
@@ -292,8 +313,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         from know.scanner import CodebaseScanner
         from know.ai import AISummarizer
 
-        scanner = CodebaseScanner(config)
-        matches = scanner.find_component(component)
+        with CodebaseScanner(config) as scanner:
+            matches = scanner.find_component(component)
 
         if not matches:
             return json.dumps({"error": f"Component '{component}' not found"})
@@ -307,12 +328,12 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         # Auto-store as memory
         try:
             from know.knowledge_base import KnowledgeBase
-            kb = KnowledgeBase(config)
-            kb.remember(
-                f"[{component}] {explanation[:300]}",
-                source="auto-explain",
-                tags=component,
-            )
+            with KnowledgeBase(config) as kb:
+                kb.remember(
+                    f"[{component}] {explanation[:300]}",
+                    source="auto-explain",
+                    tags=component,
+                )
         except Exception:
             pass
 
@@ -335,19 +356,19 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         from know.import_graph import ImportGraph
         from know.scanner import CodebaseScanner
 
-        scanner = CodebaseScanner(config)
-        structure = scanner.get_structure()
-        ig = ImportGraph(config)
-        ig.build(structure["modules"])
+        with CodebaseScanner(config) as scanner:
+            structure = scanner.get_structure()
+        with ImportGraph(config) as ig:
+            ig.build(structure["modules"])
 
-        rel = str(Path(file_path).with_suffix("")).replace("/", ".").replace("\\", ".")
+            rel = str(Path(file_path).with_suffix("")).replace("/", ".").replace("\\", ".")
 
-        return json.dumps({
-            "module": rel,
-            "imports": ig.imports_of(rel),
-            "imported_by": ig.imported_by(rel),
-            "formatted": ig.format_graph(rel),
-        }, indent=2)
+            return json.dumps({
+                "module": rel,
+                "imports": ig.imports_of(rel),
+                "imported_by": ig.imported_by(rel),
+                "formatted": ig.format_graph(rel),
+            }, indent=2)
 
     # ===================================================================
     # RESOURCES
@@ -364,8 +385,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
 
         from know.scanner import CodebaseScanner
 
-        scanner = CodebaseScanner(config)
-        structure = scanner.get_structure()
+        with CodebaseScanner(config) as scanner:
+            structure = scanner.get_structure()
 
         modules = structure.get("modules", [])
         funcs = structure.get("function_count", 0)
@@ -393,8 +414,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
         # Include memories summary
         try:
             from know.knowledge_base import KnowledgeBase
-            kb = KnowledgeBase(config)
-            mem_count = kb.count()
+            with KnowledgeBase(config) as kb:
+                mem_count = kb.count()
             if mem_count > 0:
                 lines.append("")
                 lines.append(f"## Knowledge Base: {mem_count} memories stored")
@@ -410,8 +431,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
 
         from know.scanner import CodebaseScanner
 
-        scanner = CodebaseScanner(config)
-        structure = scanner.get_structure()
+        with CodebaseScanner(config) as scanner:
+            structure = scanner.get_structure()
 
         # Build tree view
         modules = structure.get("modules", [])
@@ -447,8 +468,8 @@ def create_server(project_root: Optional[Path] = None) -> "FastMCP":
 
         from know.knowledge_base import KnowledgeBase
 
-        kb = KnowledgeBase(config)
-        memories = kb.list_all()
+        with KnowledgeBase(config) as kb:
+            memories = kb.list_all()
 
         if not memories:
             return "No memories stored yet. Use the `remember` tool to store knowledge."

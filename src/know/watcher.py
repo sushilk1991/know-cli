@@ -1,6 +1,7 @@
 """File system watcher for auto-updating documentation."""
 
 import time
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Set
 
@@ -24,6 +25,11 @@ class DocUpdateHandler(FileSystemEventHandler):
         self.debounce_seconds = config.output.watch.debounce_seconds
         self.last_update = 0
         self.pending_paths: Set[Path] = set()
+        self._lock = threading.RLock()
+        self._update_lock = threading.Lock()
+        self._trailing_timer: threading.Timer | None = None
+        self._timer_generation = 0
+        self._closed = False
     
     def on_modified(self, event: FileSystemEvent) -> None:
         """Handle file modification."""
@@ -36,14 +42,32 @@ class DocUpdateHandler(FileSystemEventHandler):
         if self._should_ignore(path):
             return
         
-        self.pending_paths.add(path)
-        
-        # Debounce updates
-        current_time = time.time()
-        if current_time - self.last_update < self.debounce_seconds:
-            return
-        
-        self._trigger_update()
+        trigger_now = False
+        with self._lock:
+            if self._closed:
+                return
+            self.pending_paths.add(path)
+
+            # Keep the leading-edge update for responsiveness. Events arriving
+            # during the debounce window also arm a trailing flush, so the last
+            # burst is not stranded until some unrelated future event.
+            current_time = time.time()
+            if current_time - self.last_update >= self.debounce_seconds:
+                self._cancel_timer_locked()
+                trigger_now = True
+            else:
+                self._cancel_timer_locked()
+                generation = self._timer_generation
+                self._trailing_timer = threading.Timer(
+                    max(0.0, float(self.debounce_seconds)),
+                    self._flush_trailing,
+                    args=(generation,),
+                )
+                self._trailing_timer.daemon = True
+                self._trailing_timer.start()
+
+        if trigger_now:
+            self._trigger_update()
     
     def on_created(self, event: FileSystemEvent) -> None:
         """Handle file creation."""
@@ -91,37 +115,48 @@ class DocUpdateHandler(FileSystemEventHandler):
     
     def _trigger_update(self) -> None:
         """Trigger documentation update."""
-        self.last_update = time.time()
-        
-        if not self.pending_paths:
-            return
+        # Timer callbacks can arrive while a leading-edge scan is still
+        # running. Serialize the complete scan/generate cycle; the second
+        # caller will drain paths accumulated during the first cycle.
+        with self._update_lock:
+            self._trigger_update_serialized()
+
+    def _trigger_update_serialized(self) -> None:
+        """Run one already-serialized documentation update."""
+        with self._lock:
+            if self._closed or not self.pending_paths:
+                return
+            self.last_update = time.time()
+            pending_paths = set(self.pending_paths)
+            self.pending_paths.clear()
+            self._trailing_timer = None
         
         from know.scanner import CodebaseScanner
         from know.generator import DocGenerator
         
-        pending_count = len(self.pending_paths)
+        pending_count = len(pending_paths)
         console.print(f"\n[dim]Detected changes in {pending_count} files, updating docs...[/dim]")
         
         try:
-            scanner = CodebaseScanner(self.config)
             generator = DocGenerator(self.config)
             from know.parsers import ParserFactory
 
             # Filter to only code files we care about
             supported_exts = ParserFactory.supported_extensions()
             code_paths = [
-                p for p in self.pending_paths 
+                p for p in pending_paths
                 if p.suffix in supported_exts
             ]
             
-            if code_paths:
-                # Use incremental scan for specific files
-                stats = scanner.scan_files(code_paths)
-            else:
-                # No code files changed, do full scan
-                stats = scanner.scan()
-            
-            structure = scanner.get_structure()
+            with CodebaseScanner(self.config) as scanner:
+                if code_paths:
+                    # Use incremental scan for specific files
+                    stats = scanner.scan_files(code_paths)
+                else:
+                    # No code files changed, do full scan
+                    stats = scanner.scan()
+
+                structure = scanner.get_structure()
             generator.generate_readme(structure)
             
             # Show efficiency stats
@@ -139,8 +174,32 @@ class DocUpdateHandler(FileSystemEventHandler):
                 
         except Exception as e:
             console.print(f"[red]✗[/red] Update failed: {e}")
-        
-        self.pending_paths.clear()
+
+    def _cancel_timer_locked(self) -> None:
+        """Cancel the pending trailing timer while holding ``_lock``."""
+        if self._trailing_timer is not None:
+            self._trailing_timer.cancel()
+            self._trailing_timer = None
+        self._timer_generation += 1
+
+    def _flush_trailing(self, generation: int) -> None:
+        """Flush a completed debounce burst from the timer thread."""
+        # Recheck the generation only after any active scan completes. Events
+        # arriving while this callback waits may replace this timer, and a
+        # stale callback must not flush their newer debounce burst early.
+        with self._update_lock:
+            with self._lock:
+                if self._closed or generation != self._timer_generation:
+                    return
+                self._trailing_timer = None
+            self._trigger_update_serialized()
+
+    def close(self) -> None:
+        """Cancel pending timer work and reject future events."""
+        with self._lock:
+            self._closed = True
+            self._cancel_timer_locked()
+            self.pending_paths.clear()
 
 
 class FileWatcher:
@@ -166,11 +225,14 @@ class FileWatcher:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
+            pass
+        finally:
+            self.handler.close()
             self.observer.stop()
-        
-        self.observer.join()
+            self.observer.join()
     
     def stop(self) -> None:
         """Stop the watcher."""
+        self.handler.close()
         self.observer.stop()
         self.observer.join()

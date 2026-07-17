@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Optional
 
 
+def teardown_logging(logger: Optional[logging.Logger] = None) -> None:
+    """Detach and close handlers that may reference short-lived CLI streams."""
+    target = logger or logging.getLogger("know")
+    for handler in list(target.handlers):
+        target.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
 def setup_logging(
     verbose: bool = False,
     quiet: bool = False,
@@ -22,8 +33,9 @@ def setup_logging(
         Configured logger instance
     """
     logger = logging.getLogger("know")
-    logger.handlers = []  # Clear existing handlers
+    teardown_logging(logger)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = False
     
     # Console handler
     if quiet:

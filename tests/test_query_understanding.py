@@ -83,8 +83,7 @@ class TestAnalyzeQuery:
     def test_all_stop_words_fallback(self):
         """If every word is a stop word, fall back to original tokens."""
         plan = analyze_query("the is a")
-        # Should have some terms (fallback behavior)
-        assert len(plan.all_search_terms) >= 0  # graceful handling
+        assert plan.all_search_terms == ["the", "is"]
 
     def test_dotted_path_identifier(self):
         plan = analyze_query("know.daemon_db.search_chunks")

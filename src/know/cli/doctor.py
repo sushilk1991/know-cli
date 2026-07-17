@@ -40,12 +40,61 @@ def _probe_embedding_model(model_name: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def _repair_fastembed_cache(cache_root: Path) -> str:
-    """Clear fastembed cache root and recreate directory."""
-    if cache_root.exists():
-        shutil.rmtree(cache_root, ignore_errors=True)
-    cache_root.mkdir(parents=True, exist_ok=True)
-    return f"cleared cache at {cache_root}"
+def _validated_fastembed_cache_root(
+    cache_root: Path, *, project_root: Optional[Path] = None
+) -> Path:
+    """Resolve a cache root only when it has a narrow FastEmbed identity."""
+    candidate = cache_root.expanduser()
+    refusal = "Refusing to clear unsafe FastEmbed cache"
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise ValueError(f"{refusal}: {cache_root}")
+
+    try:
+        resolved = candidate.resolve(strict=False)
+        home = Path.home().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{refusal}: {cache_root}") from exc
+
+    filesystem_root = Path(resolved.anchor)
+    if resolved == filesystem_root or resolved == home or resolved in home.parents:
+        raise ValueError(f"{refusal}: {cache_root}")
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"{refusal}: {cache_root}")
+
+    if project_root is not None:
+        try:
+            project = project_root.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"{refusal}: {cache_root}") from exc
+        if resolved == project or resolved in project.parents or project in resolved.parents:
+            raise ValueError(f"{refusal}: {cache_root}")
+
+    default_root = (Path.home() / ".cache" / "know-cli" / "fastembed").resolve(strict=False)
+    # Whole-cache deletion is intentionally restricted to know's exact default
+    # cache. A custom FASTEMBED_CACHE_PATH may point at a shared or user-managed
+    # directory; targeted model repair can still handle it, but doctor must not
+    # recursively clear it based on an environment variable alone.
+    if resolved != default_root:
+        raise ValueError(f"{refusal}: {cache_root}")
+    return resolved
+
+
+def _repair_fastembed_cache(cache_root: Path, *, project_root: Optional[Path] = None) -> str:
+    """Clear a narrowly validated FastEmbed cache root and recreate it."""
+    resolved_root = _validated_fastembed_cache_root(cache_root, project_root=project_root)
+    if resolved_root.exists():
+        shutil.rmtree(resolved_root)
+    resolved_root.mkdir(parents=True, exist_ok=True)
+    return f"cleared cache at {resolved_root}"
+
+
+def _dependencies_ok(dependencies: dict) -> bool:
+    """Return whether all dependency checks required by embeddings pass."""
+    return bool(
+        dependencies.get("fastembed_installed")
+        and dependencies.get("onnxruntime_installed")
+        and not dependencies.get("version_mismatch")
+    )
 
 
 def _run_reindex_silent(config) -> Tuple[bool, Optional[int], Optional[str]]:
@@ -154,16 +203,9 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         "error": model_error,
     }
 
-    if not model_ok:
-        report["ok"] = False
-
     deps = report["checks"].get("dependency_integrity", {})
-    if (
-        not deps.get("fastembed_installed")
-        or not deps.get("onnxruntime_installed")
-        or deps.get("version_mismatch")
-    ):
-        report["ok"] = False
+    deps_ok = _dependencies_ok(deps)
+    report["ok"] = bool(model_ok and deps_ok)
 
     if deps.get("editable_install"):
         report["repair_command"] = (
@@ -171,23 +213,36 @@ def doctor(ctx: click.Context, repair: bool, run_reindex: bool) -> None:
         )
 
     if repair and not model_ok:
-        action = _repair_fastembed_cache(cache_root)
-        report["actions"].append(action)
+        try:
+            _validated_fastembed_cache_root(cache_root, project_root=config.root)
+            action = _repair_fastembed_cache(cache_root)
+        except (OSError, ValueError) as exc:
+            report["checks"]["fastembed_cache_repair"] = {
+                "ok": False,
+                "error": str(exc),
+            }
+            report["actions"].append(f"cache repair failed: {exc}")
+        else:
+            report["checks"]["fastembed_cache_repair"] = {
+                "ok": True,
+                "error": None,
+            }
+            report["actions"].append(action)
 
-        model_ok_after, model_error_after = _probe_embedding_model(DEFAULT_MODEL)
-        report["checks"]["embedding_model_after_repair"] = {
-            "model": DEFAULT_MODEL,
-            "ok": model_ok_after,
-            "error": model_error_after,
-        }
-        report["ok"] = model_ok_after
+            model_ok_after, model_error_after = _probe_embedding_model(DEFAULT_MODEL)
+            report["checks"]["embedding_model_after_repair"] = {
+                "model": DEFAULT_MODEL,
+                "ok": model_ok_after,
+                "error": model_error_after,
+            }
+            report["ok"] = bool(model_ok_after and deps_ok)
 
-        if model_ok_after and run_reindex:
-            ok, count, error = _run_reindex_silent(config)
-            if ok:
-                report["actions"].append(f"reindex indexed {count} chunks")
-            else:
-                report["actions"].append(f"reindex failed: {error}")
+            if report["ok"] and run_reindex:
+                ok, count, error = _run_reindex_silent(config)
+                if ok:
+                    report["actions"].append(f"reindex indexed {count} chunks")
+                else:
+                    report["actions"].append(f"reindex failed: {error}")
 
     if ctx.obj.get("json"):
         click.echo(json.dumps(report))

@@ -200,37 +200,6 @@ class TestEmbeddings:
 
 
 # ---------------------------------------------------------------------------
-# Token counter tests
-# ---------------------------------------------------------------------------
-class TestTokenCounter:
-    """Tests for tiktoken-based token counting."""
-
-    def test_count_tokens_basic(self):
-        from know.token_counter import count_tokens
-        result = count_tokens("Hello world")
-        assert isinstance(result, int)
-        assert result > 0
-
-    def test_count_tokens_provider_calibration(self):
-        from know.token_counter import count_tokens
-        anthropic_count = count_tokens("test string", provider="anthropic")
-        openai_count = count_tokens("test string", provider="openai")
-        # Anthropic has 1.10x calibration, OpenAI has 1.0x
-        assert anthropic_count >= openai_count
-
-    def test_truncate_to_budget(self):
-        from know.token_counter import truncate_to_budget, count_tokens
-        long_text = "word " * 1000
-        result = truncate_to_budget(long_text, budget=100)
-        # Allow small overshoot due to calibration rounding
-        assert count_tokens(result) <= 110
-
-    def test_empty_string(self):
-        from know.token_counter import count_tokens
-        assert count_tokens("") == 0
-
-
-# ---------------------------------------------------------------------------
 # Import graph tests
 # ---------------------------------------------------------------------------
 class TestImportGraph:

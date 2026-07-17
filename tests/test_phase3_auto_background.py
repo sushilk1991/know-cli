@@ -150,10 +150,14 @@ def test_incremental_refresh_skips_importance_for_tiny_updates(tmp_project, monk
 
 
 class TestSessionAutofill:
-    def test_remember_autofills_session_from_runtime_context(self, tmp_project):
+    def test_remember_autofills_session_from_runtime_context(self, tmp_project, monkeypatch):
         root, config = tmp_project
         from know.cli import cli
         from know.knowledge_base import KnowledgeBase
+
+        # Session propagation is the behavior under test; model loading is an
+        # unrelated network/runtime dependency that can write progress to CLI IO.
+        monkeypatch.setattr(KnowledgeBase, "_embed_text", lambda self, text: None)
 
         (root / ".know" / "current_session").write_text("sess_auto_1\n", encoding="utf-8")
 
@@ -172,16 +176,18 @@ class TestSessionAutofill:
         assert result.exit_code == 0
         payload = json.loads(result.output)
 
-        kb = KnowledgeBase(config)
-        mem = kb.get(payload["id"])
+        with KnowledgeBase(config) as kb:
+            mem = kb.get(payload["id"])
         assert mem is not None
         assert mem.session_id == "sess_auto_1"
         assert mem.agent == "know-cli"
 
-    def test_decide_autofills_session_from_runtime_context(self, tmp_project):
+    def test_decide_autofills_session_from_runtime_context(self, tmp_project, monkeypatch):
         root, config = tmp_project
         from know.cli import cli
         from know.knowledge_base import KnowledgeBase
+
+        monkeypatch.setattr(KnowledgeBase, "_embed_text", lambda self, text: None)
 
         (root / ".know" / "current_session").write_text("sess_auto_2\n", encoding="utf-8")
 
@@ -200,8 +206,8 @@ class TestSessionAutofill:
         assert result.exit_code == 0
         payload = json.loads(result.output)
 
-        kb = KnowledgeBase(config)
-        mem = kb.get(payload["id"])
+        with KnowledgeBase(config) as kb:
+            mem = kb.get(payload["id"])
         assert mem is not None
         assert mem.memory_type == "decision"
         assert mem.session_id == "sess_auto_2"

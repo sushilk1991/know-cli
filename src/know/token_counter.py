@@ -70,32 +70,29 @@ def truncate_to_budget(
     Returns:
         Truncated text that fits within budget.
     """
+    if budget <= 0:
+        return ""
+
     current = count_tokens(text, provider=provider)
     if current <= budget:
         return text
 
-    # Binary search for the right cutoff point
-    lines = text.split("\n")
-    lo, hi = 0, len(lines)
+    marker = "\n... [truncated]"
+    suffix = marker if count_tokens(marker, provider=provider) <= budget else ""
+
+    # Binary search characters so the returned text, including its marker,
+    # satisfies the advertised hard token limit even for tiny budgets.
+    lo, hi = 0, len(text)
 
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        candidate = "\n".join(lines[:mid])
+        candidate = text[:mid] + suffix
         if count_tokens(candidate, provider=provider) <= budget:
             lo = mid
         else:
             hi = mid - 1
 
-    if lo == 0:
-        # Even one line exceeds budget — truncate by characters
-        ratio = budget / max(current, 1)
-        char_limit = int(len(text) * ratio * 0.9)  # 10% safety margin
-        return text[:char_limit] + "\n... [truncated]"
-
-    result = "\n".join(lines[:lo])
-    if lo < len(lines):
-        result += "\n... [truncated]"
-    return result
+    return text[:lo] + suffix
 
 
 def format_budget(used: int, total: int) -> str:

@@ -266,23 +266,8 @@ def _class_to_chunk(node: ast.ClassDef, lines: list, rel_path: str) -> Optional[
     end = node.end_lineno or start
     full_body = "".join(lines[start - 1 : end]).rstrip()
 
-    # Build a compact summary: class declaration + docstring + method stubs
     sig_line = lines[start - 1].strip() if start - 1 < len(lines) else ""
     docstring = ast.get_docstring(node) or ""
-
-    summary_lines = [sig_line]
-    if docstring:
-        summary_lines.append(f'    """{docstring}"""')
-    for item in node.body:
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            mline = lines[item.lineno - 1].strip() if item.lineno - 1 < len(lines) else ""
-            summary_lines.append(f"    {mline}")
-            mdoc = ast.get_docstring(item)
-            if mdoc:
-                summary_lines.append(f'        """{mdoc}"""')
-            summary_lines.append("        ...")
-
-    summary = "\n".join(summary_lines)
     return CodeChunk(
         file_path=rel_path,
         name=node.name,
@@ -292,7 +277,7 @@ def _class_to_chunk(node: ast.ClassDef, lines: list, rel_path: str) -> Optional[
         body=full_body,
         signature=sig_line,
         docstring=docstring,
-        tokens=count_tokens(summary),
+        tokens=count_tokens(full_body),
     )
 
 
@@ -374,7 +359,7 @@ def _get_batch_file_recency(root: Path, rel_paths: List[str]) -> Dict[str, float
                     # Check if this is a timestamp
                     if line.isdigit():
                         current_time = int(line)
-                    elif current_time and line in rel_paths:
+                    elif current_time:
                         age_days = (time.time() - current_time) / 86400
                         score = max(0.0, 1.0 - age_days / 30.0)
                         if line not in scores or score > scores[line]:
@@ -559,6 +544,13 @@ class ContextEngine:
             semantic_max_ms=semantic_max_ms,
         )
 
+        if not include_tests:
+            from know.file_categories import categorize_file
+            raw_results = [
+                chunk for chunk in raw_results
+                if categorize_file(chunk.get("file_path", ""), root=self.root) != "test"
+            ]
+
         if not raw_results:
             # Zero-result intelligence
             nearest = db.get_nearest_terms(query, limit=5)
@@ -571,7 +563,7 @@ class ContextEngine:
             return result
 
         # Step 2: Apply file category demotion
-        raw_results = apply_category_demotion(raw_results, query)
+        raw_results = apply_category_demotion(raw_results, query, root=self.root)
 
         # Step 2.5: Importance boost — boost high-in-degree modules
         try:
@@ -736,6 +728,15 @@ class ContextEngine:
             db, code_chunks, code_used, budget_code, seen_chunk_keys,
         )
 
+        # Neighborhood expansion is a separate retrieval boundary and must
+        # honor the same no-tests contract as the primary result lane.
+        if not include_tests:
+            from know.file_categories import categorize_file
+            code_chunks = [
+                chunk for chunk in code_chunks
+                if categorize_file(chunk.get("file_path", ""), root=self.root) != "test"
+            ]
+
         # Step 7.6: Chunk deduplication — remove overlapping class/method chunks
         code_chunks, code_used = self._deduplicate_chunks(code_chunks)
 
@@ -755,7 +756,7 @@ class ContextEngine:
         dep_used = 0
         if include_imports and seen_files:
             dep_chunks, dep_used = self._get_dependency_sigs(
-                db, seen_files, budget_imports,
+                db, seen_files, budget_imports, include_tests=include_tests,
             )
 
         # Step 11: File summaries
@@ -1407,7 +1408,7 @@ class ContextEngine:
         return result
 
     def _get_dependency_sigs(
-        self, db, seen_files: set, budget: int,
+        self, db, seen_files: set, budget: int, *, include_tests: bool = True,
     ) -> Tuple[List[Dict], int]:
         """Get dependency signatures from DaemonDB."""
         seen_modules = [
@@ -1425,6 +1426,10 @@ class ContextEngine:
             fp = mod.replace(".", "/") + ".py"
             if fp in seen_files:
                 continue
+            if not include_tests:
+                from know.file_categories import categorize_file
+                if categorize_file(fp, root=self.root) == "test":
+                    continue
             sigs = db.get_signatures(fp)
             if not sigs:
                 continue
@@ -1518,6 +1523,12 @@ class ContextEngine:
 
         warnings: List[str] = []
         all_chunks = self._collect_all_chunks()
+        if not include_tests:
+            from know.file_categories import categorize_file
+            all_chunks = [
+                chunk for chunk in all_chunks
+                if categorize_file(chunk.file_path, root=self.root) != "test"
+            ]
         if not all_chunks:
             warnings.append("No code chunks found. Run 'know init' first.")
             return self._empty_result(query, budget, warnings)
@@ -1538,7 +1549,12 @@ class ContextEngine:
 
         dep_chunks, dep_used = ([], 0)
         if include_imports and code_chunks:
-            dep_chunks, dep_used = self._expand_imports(seen_files, budget_imports, scored)
+            dep_chunks, dep_used = self._expand_imports(
+                seen_files,
+                budget_imports,
+                scored,
+                include_tests=include_tests,
+            )
 
         test_chunks, test_used = ([], 0)
         if include_tests:
@@ -1577,8 +1593,8 @@ class ContextEngine:
         """Collect all code chunks from the project (legacy filesystem scan)."""
         chunks: List[CodeChunk] = []
         from know.scanner import CodebaseScanner
-        scanner = CodebaseScanner(self.config)
-        files = list(scanner._discover_files())
+        with CodebaseScanner(self.config) as scanner:
+            files = list(scanner._discover_files())
 
         for file_path, lang in files:
             if lang == "python":
@@ -1660,7 +1676,12 @@ class ContextEngine:
     # Internal: import expansion (legacy)
     # ------------------------------------------------------------------
     def _expand_imports(
-        self, seen_files: set, budget: int, all_chunks: List[CodeChunk],
+        self,
+        seen_files: set,
+        budget: int,
+        all_chunks: List[CodeChunk],
+        *,
+        include_tests: bool = True,
     ) -> Tuple[List[CodeChunk], int]:
         """For each relevant file, include signatures of its imports."""
         try:
@@ -1669,38 +1690,43 @@ class ContextEngine:
         except Exception:
             return [], 0
 
-        dep_modules: set = set()
-        for fp in seen_files:
-            mod_name = Path(fp).stem
-            for imp in graph.imports_of(mod_name):
-                dep_modules.add(imp)
+        with graph:
+            dep_modules: set = set()
+            for fp in seen_files:
+                mod_name = Path(fp).stem
+                for imp in graph.imports_of(mod_name):
+                    dep_modules.add(imp)
 
-        dep_chunks: List[CodeChunk] = []
-        used = 0
-        for mod_name in dep_modules:
-            fpath = graph.file_for_module(mod_name)
-            if fpath is None or not fpath.exists():
-                continue
-            rel = str(fpath.relative_to(self.root))
-            if rel in seen_files:
-                continue
-            sigs = _extract_signatures(fpath)
-            if not sigs:
-                continue
-            tokens = count_tokens(sigs)
-            if used + tokens > budget:
-                sigs = truncate_to_budget(sigs, budget - used)
+            dep_chunks: List[CodeChunk] = []
+            used = 0
+            for mod_name in dep_modules:
+                fpath = graph.file_for_module(mod_name)
+                if fpath is None or not fpath.exists():
+                    continue
+                rel = str(fpath.relative_to(self.root))
+                if rel in seen_files:
+                    continue
+                if not include_tests:
+                    from know.file_categories import categorize_file
+                    if categorize_file(rel, root=self.root) == "test":
+                        continue
+                sigs = _extract_signatures(fpath)
+                if not sigs:
+                    continue
                 tokens = count_tokens(sigs)
                 if used + tokens > budget:
-                    continue
-            dep_chunks.append(CodeChunk(
-                file_path=rel, name=f"{fpath.stem} (signatures)",
-                chunk_type="module", line_start=1,
-                line_end=sigs.count("\n") + 1, body=sigs,
-                signature="# signatures only", tokens=tokens,
-            ))
-            used += tokens
-        return dep_chunks, used
+                    sigs = truncate_to_budget(sigs, budget - used)
+                    tokens = count_tokens(sigs)
+                    if used + tokens > budget:
+                        continue
+                dep_chunks.append(CodeChunk(
+                    file_path=rel, name=f"{fpath.stem} (signatures)",
+                    chunk_type="module", line_start=1,
+                    line_end=sigs.count("\n") + 1, body=sigs,
+                    signature="# signatures only", tokens=tokens,
+                ))
+                used += tokens
+            return dep_chunks, used
 
     # ------------------------------------------------------------------
     # Internal: test discovery (legacy)
@@ -1941,6 +1967,7 @@ class ContextEngine:
             key_field="ref_name", line_field="line_number",
             exclude_target=target_chunk,
             allow_method_suffix_fallback=True,
+            include_tests=include_tests,
         )
 
         # Step 5: Fetch full bodies for callers
@@ -1949,6 +1976,7 @@ class ContextEngine:
             key_field="containing_chunk", line_field="line_number",
             exclude_target=target_chunk,
             allow_method_suffix_fallback=False,
+            include_tests=include_tests,
         )
         overflow.extend(overflow_callers)
 
@@ -2176,12 +2204,12 @@ class ContextEngine:
 
         # 5. Filter test files by default.
         if not include_tests:
-            source_only = [
+            candidates = [
                 c for c in candidates
-                if categorize_file(c["file_path"]) == "source"
+                if categorize_file(c["file_path"], root=self.root) != "test"
             ]
-            if source_only:
-                candidates = source_only
+            if not candidates:
+                return []
 
         # 6. Prefer executable symbols over constants/modules when mixed.
         type_priority = {
@@ -2212,6 +2240,7 @@ class ContextEngine:
         line_field: str,
         exclude_target: Optional[Dict] = None,
         allow_method_suffix_fallback: bool = True,
+        include_tests: bool = True,
     ) -> Tuple[List[Dict], int, List[str]]:
         """Fill budget with related chunk bodies, sorted by locality then size.
 
@@ -2221,7 +2250,10 @@ class ContextEngine:
             return [], 0, []
 
         # Fetch chunk bodies for all refs
+        from know.file_categories import categorize_file
+
         enriched = []
+        seen_resolved_chunks = set()
         for ref in refs:
             name = ref.get(key_field, "")
             if not name:
@@ -2256,12 +2288,32 @@ class ContextEngine:
                 # stored as `ClassName.create_agent` chunk names.
                 chunks = db.get_method_chunks_by_suffix(name)
                 chunks = _exclude_target(chunks)
+            if not include_tests:
+                had_candidate_chunks = bool(chunks)
+                chunks = [
+                    chunk for chunk in chunks
+                    if categorize_file(
+                        chunk.get("file_path", ""), root=self.root,
+                    ) != "test"
+                ]
+                if had_candidate_chunks and not chunks:
+                    # This reference is intentionally hidden by policy, not
+                    # unresolved or external.
+                    continue
             if chunks:
                 chunk = chunks[0]
                 # Prefer same-file chunk
                 same_file = [c for c in chunks if c["file_path"] == target_file]
                 if same_file:
                     chunk = same_file[0]
+                chunk_key = (
+                    chunk.get("file_path"),
+                    chunk.get("chunk_name"),
+                    chunk.get("start_line"),
+                )
+                if chunk_key in seen_resolved_chunks:
+                    continue
+                seen_resolved_chunks.add(chunk_key)
                 enriched.append({
                     "chunk": chunk,
                     "ref": ref,

@@ -10,7 +10,7 @@ from functools import partial
 import os
 import logging
 
-from pathspec import PathSpec
+from pathspec import GitIgnoreSpec
 
 from know.exceptions import ParseError, ScanError
 from know.logger import get_logger
@@ -20,6 +20,7 @@ from know.path_filters import is_hard_excluded_path
 
 if TYPE_CHECKING:
     from know.config import Config
+    from know.index import CodebaseIndex
 
 # Tree-sitter availability check
 try:
@@ -41,11 +42,9 @@ TS_JS_LANGUAGES = {"typescript", "tsx", "javascript", "jsx"}
 # Maximum TS/JS-family files to scan (0 = no cap, default).
 MAX_TS_FILES = int(os.environ.get("KNOW_MAX_TS_FILES", "0"))
 
-# Timeout for parsing individual files (seconds)
-FILE_PARSE_TIMEOUT = 30
-
-
-def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str, Dict]]:
+def parse_file_task(
+    args: Tuple[str, str, str, bool],
+) -> Optional[Tuple[str, str, Dict, Dict[str, Any]]]:
     """Standalone function for process pool parsing.
     
     Must be at module level to be picklable for ProcessPool.
@@ -61,12 +60,23 @@ def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str
     root = Path(root_path_str)
     
     try:
+        from know.index import read_source_snapshot, source_snapshot_matches
+
+        before = read_source_snapshot(path)
+        if before is None:
+            return None
+
         parser = ParserFactory.get_parser(language, use_treesitter)
         if not parser:
             return None
         
         module = parser.parse(path, root)
         if not module:
+            return None
+
+        after = read_source_snapshot(path)
+        if after is None or not source_snapshot_matches(before, after):
+            logger.debug(f"File changed while parsing {path}; deferring it")
             return None
         
         # Convert to dict for serialization
@@ -113,7 +123,7 @@ def parse_file_task(args: Tuple[str, str, str, bool]) -> Optional[Tuple[str, str
             "imports": module.imports
         }
         
-        return str(module.path), language, module_dict
+        return str(module.path), language, module_dict, after
     except ParseError as e:
         logger.debug(f"Parse error in {path}: {e}")
         return None
@@ -129,6 +139,8 @@ class CodebaseScanner:
         self.config = config
         self.root = config.root
         self.modules: List[ModuleInfo] = []
+        self.discovered_paths: Set[str] = set()
+        self.source_snapshots: Dict[str, Dict[str, Any]] = {}
         self._pathspec = self._build_pathspec()
         self._index: Optional["CodebaseIndex"] = None
         self._use_processes = True  # Enable ProcessPool by default
@@ -140,16 +152,36 @@ class CodebaseScanner:
             self._index = CodebaseIndex(self.config)
         return self._index
 
-    def _build_pathspec(self) -> PathSpec:
+    def close(self) -> None:
+        if self._index is not None:
+            self._index.close()
+            self._index = None
+
+    def __enter__(self) -> "CodebaseScanner":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _build_pathspec(self) -> GitIgnoreSpec:
         """Build pathspec for filtering files."""
         patterns = self.config.exclude
-        return PathSpec.from_lines("gitwildmatch", patterns)
+        return GitIgnoreSpec.from_lines(patterns)
 
     def _should_include(self, path: Path) -> bool:
         """Check if path should be included."""
         try:
+            # ``rglob`` follows file symlinks. Reject links whose targets escape
+            # the project even when the lexical link itself is under root.
+            path.resolve().relative_to(self.root.resolve())
             relative = path.relative_to(self.root)
-        except ValueError:
+        except (OSError, RuntimeError, ValueError):
             return False
 
         relative_str = str(relative)
@@ -176,7 +208,6 @@ class CodebaseScanner:
     def _discover_files(self) -> Iterator[Tuple[Path, str]]:
         """Discover all source files in a single filesystem walk."""
         ts_files: List[Tuple[Path, str]] = []
-        ts_count = 0
         
         logger.debug(f"Scanning filesystem: {self.root}")
         
@@ -194,18 +225,31 @@ class CodebaseScanner:
                 continue
             
             if language in TS_JS_LANGUAGES:
-                if MAX_TS_FILES <= 0 or ts_count < MAX_TS_FILES:
-                    ts_files.append((path, language))
-                    ts_count += 1
+                # Collect the full candidate set before applying the cap.
+                # Filesystem traversal order is not a relevance signal and can
+                # otherwise consume the entire budget with tests/specs.
+                ts_files.append((path, language))
                 continue
             
             yield path, language
         
         if ts_files:
-            ts_files.sort(key=lambda x: (
-                "test" in str(x[0]).lower(),
-                "spec" in str(x[0]).lower(),
-                "__tests__" in str(x[0]).lower()
+            def _is_test_file(candidate: Path) -> bool:
+                relative = candidate.relative_to(self.root)
+                parts = {part.lower() for part in relative.parts[:-1]}
+                name = relative.name.lower()
+                stem = relative.stem.lower()
+                return (
+                    bool(parts & {"test", "tests", "__tests__", "spec", "specs"})
+                    or name.startswith("test_")
+                    or stem.endswith("_test")
+                    or ".test." in name
+                    or ".spec." in name
+                )
+
+            ts_files.sort(key=lambda item: (
+                _is_test_file(item[0]),
+                str(item[0].relative_to(self.root)).replace("\\", "/"),
             ))
             selected = ts_files[:MAX_TS_FILES] if MAX_TS_FILES > 0 else ts_files
             for path, lang in selected:
@@ -214,11 +258,16 @@ class CodebaseScanner:
     def scan(self, max_workers: Optional[int] = None, progress_callback=None) -> Dict[str, int]:
         """Scan codebase and return statistics."""
         self.modules = []
+        self.source_snapshots = {}
         
         if max_workers is None:
             max_workers = min(32, (os.cpu_count() or 1))
 
         files_to_scan = list(self._discover_files())
+        self.discovered_paths = {
+            str(path.relative_to(self.root)).replace("\\", "/")
+            for path, _language in files_to_scan
+        }
         logger.info(f"Found {len(files_to_scan)} files to scan")
         
         return self._scan_incremental(files_to_scan, max_workers, progress_callback)
@@ -235,8 +284,9 @@ class CodebaseScanner:
         index = self._get_index()
         
         all_paths = [path for path, _ in files_to_scan]
-        changed_paths, cached_modules = index.get_changed_files(all_paths)
+        changed_paths, cached_modules, cached_snapshots = index.get_changed_files(all_paths)
         changed_set = set(str(p) for p in changed_paths)
+        self.source_snapshots.update(cached_snapshots)
         
         logger.info(f"Files to parse: {len(changed_paths)} new/changed, {len(cached_modules)} from cache")
         
@@ -291,20 +341,26 @@ class CodebaseScanner:
                     progress_callback(i + 1, len(tasks))
                 
                 try:
-                    result = future.result(timeout=FILE_PARSE_TIMEOUT)
+                    # as_completed() yields only completed futures, so passing
+                    # a timeout here cannot bound parser execution. A genuine
+                    # hard timeout requires killable per-file process isolation;
+                    # do not claim a guarantee that ThreadPoolExecutor cannot
+                    # provide without leaking a stuck worker.
+                    result = future.result()
                     if result:
-                        rel_path, lang, module_dict = result
+                        rel_path, lang, module_dict, snapshot = result
                         abs_path = self.root / rel_path
                         
                         # Cache the result
                         try:
-                            index.cache_file(abs_path, lang, module_dict)
+                            index.cache_file(abs_path, lang, module_dict, snapshot=snapshot)
                         except Exception as e:
                             logger.debug(f"Failed to cache {rel_path}: {e}")
                         
                         # Convert back to ModuleInfo
                         module = self._module_from_dict(module_dict)
                         if module:
+                            self.source_snapshots[rel_path] = snapshot
                             self.modules.append(module)
                             file_count += 1
                             function_count += len(module.functions)
@@ -508,69 +564,117 @@ class CodebaseScanner:
 
     def scan_files(self, paths: List[Path]) -> Dict[str, int]:
         """Scan specific files incrementally (used by watch mode)."""
+        from know.index import read_source_snapshot, source_snapshot_matches
+
         index = self._get_index()
-        
-        all_changed = set(str(p) for p in paths)
-        
-        # Load all cached modules first
-        all_cached = index.get_all_cached_modules()
-        for cached in all_cached:
+        self.modules = []
+        self.source_snapshots = {}
+
+        changed_paths: List[Path] = []
+        changed_rel: Set[str] = set()
+        for raw_path in paths:
             try:
-                if cached.get("path") in all_changed:
-                    continue
-                module = self._module_from_dict(cached)
-                if module:
-                    self.modules.append(module)
-            except Exception as e:
-                logger.debug(f"Failed to load cached module: {e}")
-        
-        file_count = len(self.modules)
-        function_count = sum(len(m.functions) for m in self.modules)
-        class_count = sum(len(m.classes) for m in self.modules)
-        
-        for path in paths:
+                candidate = raw_path if raw_path.is_absolute() else self.root / raw_path
+                relative = candidate.resolve().relative_to(self.root.resolve())
+                # Keep the scanner root's lexical spelling (macOS may expose
+                # /var as /private/var after resolve) so parser.relative_to(root)
+                # and CodebaseIndex use the same namespace.
+                path = self.root / relative
+                rel = str(relative).replace("\\", "/")
+            except (OSError, ValueError):
+                continue
+            changed_paths.append(path)
+            changed_rel.add(rel)
+
+        discovered = list(self._discover_files())
+        self.discovered_paths = {
+            str(path.relative_to(self.root)).replace("\\", "/")
+            for path, _language in discovered
+        }
+        fallback_modules: Dict[str, ModuleInfo] = {}
+        for cached in index.get_all_cached_modules():
+            rel = str(cached.get("path", "")).replace("\\", "/")
+            if rel not in changed_rel or rel not in self.discovered_paths:
+                continue
+            module = self._module_from_dict(cached)
+            if module:
+                fallback_modules[rel] = module
+
+        # Rebuild state from current in-scope cache entries, excluding targets
+        # that will be reparsed below. This makes repeated scan_files() calls
+        # idempotent instead of accumulating duplicate modules and counters.
+        for cached_path, _language in discovered:
+            rel = str(cached_path.relative_to(self.root)).replace("\\", "/")
+            if rel in changed_rel:
+                continue
+            cached_result = index.get_cached_module_snapshot(cached_path)
+            if cached_result is None:
+                continue
+            cached, snapshot = cached_result
+            module = self._module_from_dict(cached)
+            if module:
+                self.modules.append(module)
+                self.source_snapshots[rel] = snapshot
+
+        parsed_rel: Set[str] = set()
+        for path in changed_paths:
             try:
                 parser = ParserFactory.get_parser_for_file(path, TREESITTER_AVAILABLE)
                 if not parser:
                     continue
-                
+
+                before = read_source_snapshot(path)
+                if before is None:
+                    continue
                 module = parser.parse(path, self.root)
                 if not module:
                     continue
-                
+                after = read_source_snapshot(path)
+                if after is None or not source_snapshot_matches(before, after):
+                    logger.debug(f"File changed while parsing {path}; deferring it")
+                    continue
+
                 try:
-                    index.cache_file(path, parser.language, self._module_to_dict(module))
+                    index.cache_file(
+                        path,
+                        parser.language,
+                        self._module_to_dict(module),
+                        snapshot=after,
+                    )
                 except Exception as e:
                     logger.debug(f"Failed to cache {path}: {e}")
-                
-                # Replace or append
-                existing_idx = None
-                for i, m in enumerate(self.modules):
-                    if str(m.path) == str(module.path):
-                        existing_idx = i
-                        break
-                
-                if existing_idx is not None:
-                    self.modules[existing_idx] = module
-                else:
-                    self.modules.append(module)
-                    file_count += 1
-                    function_count += len(module.functions)
-                    class_count += len(module.classes)
-                    for cls in module.classes:
-                        function_count += len(cls.methods)
+
+                self.modules.append(module)
+                rel = str(module.path).replace("\\", "/")
+                self.source_snapshots[rel] = after
+                parsed_rel.add(rel)
                             
             except ParseError as e:
                 logger.debug(f"Parse error: {e}")
             except Exception as e:
                 logger.debug(f"Error processing {path}: {e}")
+
+        # A transient parse error should retain the last known-good module in
+        # this scanner view. The cache remains marked stale, so later scans
+        # still retry rather than mistaking the fallback for current data.
+        for rel in sorted(changed_rel - parsed_rel):
+            fallback = fallback_modules.get(rel)
+            if fallback is not None:
+                self.modules.append(fallback)
         
+        function_count = 0
+        class_count = 0
+        for module in self.modules:
+            function_count += len(module.functions)
+            class_count += len(module.classes)
+            function_count += sum(len(cls.methods) for cls in module.classes)
+
         return {
-            "files": file_count,
+            "files": len(self.modules),
             "functions": function_count,
             "classes": class_count,
             "modules": len(self.modules),
-            "changed_files": len(paths)
+            "changed_files": len(changed_paths)
         }
 
     def _module_to_dict(self, module: ModuleInfo) -> Dict[str, Any]:

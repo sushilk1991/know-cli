@@ -16,7 +16,13 @@ from know.config import Config
 
 
 @pytest.fixture
-def tmp_project(tmp_path):
+def tmp_project(tmp_path, monkeypatch):
+    # Workflow-mode tests exercise orchestration, not the optional embedding
+    # runtime. Keep them deterministic and offline.
+    monkeypatch.setattr(
+        "know.knowledge_base.KnowledgeBase._embed_text",
+        lambda _self, _text: None,
+    )
     (tmp_path / ".know").mkdir()
     (tmp_path / ".know" / "cache").mkdir()
     config = Config.create_default(tmp_path)
@@ -156,7 +162,7 @@ def test_workflow_explore_mode_skips_deep_in_fallback(tmp_project, monkeypatch):
             )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["workflow_mode"] == "explore"
     assert payload["deep"]["error"] == "skipped_by_mode"
     assert engine.deep_calls == 0
@@ -212,7 +218,7 @@ def test_workflow_tiny_latency_budget_skips_context_and_deep(tmp_project, monkey
             )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["context"]["error"] == "skipped_latency_budget"
     assert payload["deep"]["error"] == "skipped_latency_budget"
     assert payload["degraded_by_latency"] is True
@@ -284,7 +290,7 @@ def test_workflow_stale_daemon_response_falls_back_locally(tmp_project, monkeypa
             )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     # If fallback happened, new-mode fields are present.
     assert payload["workflow_mode"] == "implement"
     assert "latency_ms" in payload
@@ -349,6 +355,6 @@ def test_workflow_non_positive_latency_disables_sla(tmp_project, monkeypatch):
             )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["latency_budget_ms"] is None
     assert engine.context_calls == 1

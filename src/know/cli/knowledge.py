@@ -1,5 +1,6 @@
 """Knowledge commands: remember, recall, forget, memories group."""
 
+import math
 import sys
 from pathlib import Path
 from typing import Optional
@@ -7,19 +8,43 @@ from typing import Optional
 import click
 
 from know.cli import console, logger
+from know.knowledge_base import DECISION_STATUSES, MEMORY_TYPES, TRUST_LEVELS
+
+
+class _FiniteFloatRange(click.FloatRange):
+    """A Click float range that also rejects NaN."""
+
+    def convert(self, value, param, ctx):
+        converted = super().convert(value, param, ctx)
+        if not math.isfinite(converted):
+            self.fail(f"{value!r} is not a finite number", param, ctx)
+        return converted
+
+
+_MEMORY_TYPE = click.Choice(sorted(MEMORY_TYPES), case_sensitive=False)
+_DECISION_STATUS = click.Choice(sorted(DECISION_STATUSES), case_sensitive=False)
+_TRUST_LEVEL = click.Choice(sorted(TRUST_LEVELS), case_sensitive=False)
+_CONFIDENCE = _FiniteFloatRange(min=0.0, max=1.0)
+_TOP_K = click.IntRange(min=1, max=100)
 
 
 @click.command()
 @click.argument("text")
 @click.option("--tags", "-t", default="", help="Comma-separated tags")
 @click.option("--source", "-s", default="manual", help="Memory source (manual, auto-explain, auto-digest)")
-@click.option("--type", "memory_type", default="note", help="Memory type (note, decision, fact, constraint, todo, risk)")
-@click.option("--status", "decision_status", default="active", help="Decision status (active, resolved, superseded, rejected)")
-@click.option("--confidence", type=float, default=0.5, help="Confidence score [0-1]")
+@click.option("--type", "memory_type", type=_MEMORY_TYPE, default="note", help="Memory type")
+@click.option(
+    "--status",
+    "decision_status",
+    type=_DECISION_STATUS,
+    default="active",
+    help="Decision status",
+)
+@click.option("--confidence", type=_CONFIDENCE, default=0.5, help="Confidence score [0-1]")
 @click.option("--evidence", default="", help="Evidence pointer (path:line or note)")
 @click.option("--session-id", default="", help="Session identifier")
 @click.option("--agent", default="", help="Originating agent name")
-@click.option("--trust-level", default="local_verified", help="Trust level (local_verified, imported_unverified, blocked)")
+@click.option("--trust-level", type=_TRUST_LEVEL, default="local_verified", help="Trust level")
 @click.option("--expires-in-hours", type=float, default=None, help="Optional expiry in hours from now")
 @click.pass_context
 def remember(
@@ -45,7 +70,6 @@ def remember(
     import time as _time
     from know.runtime_context import get_active_session_id, infer_agent_name
 
-    kb = KnowledgeBase(config)
     if not session_id:
         session_id = get_active_session_id(config) or ""
     if not agent:
@@ -53,24 +77,26 @@ def remember(
     expires_at = None
     if expires_in_hours is not None:
         expires_at = _time.time() + (expires_in_hours * 3600)
-    mem_id = kb.remember(
-        text,
-        source=source,
-        tags=tags,
-        memory_type=memory_type,
-        decision_status=decision_status,
-        confidence=confidence,
-        evidence=evidence,
-        session_id=session_id,
-        agent=agent,
-        trust_level=trust_level,
-        expires_at=expires_at,
-    )
+    with KnowledgeBase(config) as kb:
+        mem_id = kb.remember(
+            text,
+            source=source,
+            tags=tags,
+            memory_type=memory_type,
+            decision_status=decision_status,
+            confidence=confidence,
+            evidence=evidence,
+            session_id=session_id,
+            agent=agent,
+            trust_level=trust_level,
+            expires_at=expires_at,
+        )
 
     # Track stats
     try:
         from know.stats import StatsTracker
-        StatsTracker(config).record_remember(text, source)
+        with StatsTracker(config) as tracker:
+            tracker.record_remember(text, source)
     except Exception as e:
         logger.debug(f"Stats tracking (remember) failed: {e}")
 
@@ -87,11 +113,17 @@ def remember(
 @click.argument("decision")
 @click.option("--why", default="", help="Why this decision was made")
 @click.option("--tags", "-t", default="decision", help="Comma-separated tags")
-@click.option("--confidence", type=float, default=0.7, help="Confidence score [0-1]")
+@click.option("--confidence", type=_CONFIDENCE, default=0.7, help="Confidence score [0-1]")
 @click.option("--evidence", default="", help="Evidence pointer (path:line)")
 @click.option("--session-id", default="", help="Session identifier")
 @click.option("--agent", default="", help="Originating agent name")
-@click.option("--status", "decision_status", default="active", help="Decision status")
+@click.option(
+    "--status",
+    "decision_status",
+    type=_DECISION_STATUS,
+    default="active",
+    help="Decision status",
+)
 @click.pass_context
 def decide(
     ctx: click.Context,
@@ -118,19 +150,19 @@ def decide(
     if not agent:
         agent = infer_agent_name("know-cli")
 
-    kb = KnowledgeBase(config)
-    mem_id = kb.remember(
-        text=text,
-        source="manual",
-        tags=tags,
-        memory_type="decision",
-        decision_status=decision_status,
-        confidence=confidence,
-        evidence=evidence,
-        session_id=session_id,
-        agent=agent,
-        trust_level="local_verified",
-    )
+    with KnowledgeBase(config) as kb:
+        mem_id = kb.remember(
+            text=text,
+            source="manual",
+            tags=tags,
+            memory_type="decision",
+            decision_status=decision_status,
+            confidence=confidence,
+            evidence=evidence,
+            session_id=session_id,
+            agent=agent,
+            trust_level="local_verified",
+        )
 
     if ctx.obj.get("json"):
         import json
@@ -143,9 +175,17 @@ def decide(
 
 @click.command()
 @click.argument("query")
-@click.option("--top-k", "-k", type=int, default=5, help="Max results")
-@click.option("--type", "memory_type", default=None, help="Filter by memory type")
-@click.option("--status", "decision_status", default=None, help="Filter by decision status")
+@click.option("--top-k", "-k", type=_TOP_K, default=5, help="Max results")
+@click.option(
+    "--type", "memory_type", type=_MEMORY_TYPE, default=None, help="Filter by memory type"
+)
+@click.option(
+    "--status",
+    "decision_status",
+    type=_DECISION_STATUS,
+    default=None,
+    help="Filter by decision status",
+)
 @click.option("--include-blocked", is_flag=True, help="Include blocked memories")
 @click.option("--include-expired", is_flag=True, help="Include expired memories")
 @click.pass_context
@@ -168,21 +208,22 @@ def recall(
     import time as _time
     t0 = _time.monotonic()
 
-    kb = KnowledgeBase(config)
-    memories = kb.recall(
-        query,
-        top_k=top_k,
-        memory_type=memory_type,
-        decision_status=decision_status,
-        include_blocked=include_blocked,
-        include_expired=include_expired,
-    )
+    with KnowledgeBase(config) as kb:
+        memories = kb.recall(
+            query,
+            top_k=top_k,
+            memory_type=memory_type,
+            decision_status=decision_status,
+            include_blocked=include_blocked,
+            include_expired=include_expired,
+        )
     duration_ms = int((_time.monotonic() - t0) * 1000)
 
     # Track stats
     try:
         from know.stats import StatsTracker
-        StatsTracker(config).record_recall(query, len(memories), duration_ms)
+        with StatsTracker(config) as tracker:
+            tracker.record_recall(query, len(memories), duration_ms)
     except Exception as e:
         logger.debug(f"Stats tracking (recall) failed: {e}")
 
@@ -204,7 +245,7 @@ def recall(
 
 
 @click.command()
-@click.argument("memory_id", type=int)
+@click.argument("memory_id", type=click.IntRange(min=1))
 @click.pass_context
 def forget(ctx: click.Context, memory_id: int) -> None:
     """Delete a memory by ID.
@@ -214,8 +255,8 @@ def forget(ctx: click.Context, memory_id: int) -> None:
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
 
-    kb = KnowledgeBase(config)
-    deleted = kb.forget(memory_id)
+    with KnowledgeBase(config) as kb:
+        deleted = kb.forget(memory_id)
 
     if ctx.obj.get("json"):
         import json
@@ -238,8 +279,16 @@ def memories() -> None:
 
 @memories.command(name="list")
 @click.option("--source", "-s", default=None, help="Filter by source")
-@click.option("--type", "memory_type", default=None, help="Filter by memory type")
-@click.option("--status", "decision_status", default=None, help="Filter by decision status")
+@click.option(
+    "--type", "memory_type", type=_MEMORY_TYPE, default=None, help="Filter by memory type"
+)
+@click.option(
+    "--status",
+    "decision_status",
+    type=_DECISION_STATUS,
+    default=None,
+    help="Filter by decision status",
+)
 @click.option("--session-id", default=None, help="Filter by session id")
 @click.pass_context
 def memories_list(
@@ -253,13 +302,13 @@ def memories_list(
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
 
-    kb = KnowledgeBase(config)
-    mems = kb.list_all(
-        source=source,
-        memory_type=memory_type,
-        decision_status=decision_status,
-        session_id=session_id,
-    )
+    with KnowledgeBase(config) as kb:
+        mems = kb.list_all(
+            source=source,
+            memory_type=memory_type,
+            decision_status=decision_status,
+            session_id=session_id,
+        )
 
     if ctx.obj.get("json"):
         import json
@@ -283,16 +332,16 @@ def memories_list(
 
 
 @memories.command(name="resolve")
-@click.argument("memory_id", type=int)
-@click.option("--status", default="resolved", help="resolved|superseded|rejected|active")
+@click.argument("memory_id", type=click.IntRange(min=1))
+@click.option("--status", type=_DECISION_STATUS, default="resolved", help="New decision status")
 @click.pass_context
 def memories_resolve(ctx: click.Context, memory_id: int, status: str) -> None:
     """Resolve/supersede/reject a memory."""
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
 
-    kb = KnowledgeBase(config)
-    ok = kb.resolve(memory_id, status=status)
+    with KnowledgeBase(config) as kb:
+        ok = kb.resolve(memory_id, status=status)
 
     if ctx.obj.get("json"):
         import json
@@ -313,8 +362,8 @@ def memories_export(ctx: click.Context) -> None:
     config = ctx.obj["config"]
     from know.knowledge_base import KnowledgeBase
 
-    kb = KnowledgeBase(config)
-    click.echo(kb.export_json())
+    with KnowledgeBase(config) as kb:
+        click.echo(kb.export_json())
 
 
 @memories.command(name="import")
@@ -326,8 +375,8 @@ def memories_import(ctx: click.Context, file: str) -> None:
     from know.knowledge_base import KnowledgeBase
 
     data = Path(file).read_text()
-    kb = KnowledgeBase(config)
-    count = kb.import_json(data)
+    with KnowledgeBase(config) as kb:
+        count = kb.import_json(data)
 
     if ctx.obj.get("json"):
         import json

@@ -7,8 +7,9 @@ SQLite database (`.know/stats.db`).  Powers the `know stats` command.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from know.logger import get_logger
 
@@ -39,9 +40,17 @@ class StatsTracker:
         return self._conn
 
     def close(self):
-        if self._conn:
-            self._conn.close()
+        conn = getattr(self, "_conn", None)
+        if conn:
+            conn.close()
             self._conn = None
+
+    def __del__(self):
+        """Best-effort fallback for short-lived callers that omit ``close``."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -250,17 +259,20 @@ class StatsTracker:
             "SELECT COUNT(*) FROM events WHERE event_type = 'recall'"
         ).fetchone()
 
-        avg_budget = ctx["avg_budget"] if ctx["avg_budget"] else 1
-        budget_util = (ctx["avg_tokens"] / avg_budget * 100) if avg_budget > 0 else 0
+        avg_tokens = self._safe_nonnegative_int(ctx["avg_tokens"])
+        avg_budget = self._safe_nonnegative_int(ctx["avg_budget"])
+        avg_context_ms = self._safe_nonnegative_int(ctx["avg_ms"])
+        avg_search_ms = self._safe_nonnegative_int(srch["avg_ms"])
+        budget_util = (avg_tokens / avg_budget * 100) if avg_budget > 0 else 0.0
 
         return {
             "context_queries": ctx["cnt"],
-            "context_avg_tokens": int(ctx["avg_tokens"]),
-            "context_avg_budget": int(ctx["avg_budget"]),
+            "context_avg_tokens": avg_tokens,
+            "context_avg_budget": avg_budget,
             "context_budget_util": round(budget_util, 1),
-            "context_avg_ms": int(ctx["avg_ms"]),
+            "context_avg_ms": avg_context_ms,
             "search_queries": srch["cnt"],
-            "search_avg_ms": int(srch["avg_ms"]),
+            "search_avg_ms": avg_search_ms,
             "remember_count": rem[0],
             "recall_count": rec[0],
         }
@@ -278,6 +290,26 @@ class StatsTracker:
         high = min(low + 1, len(ordered) - 1)
         frac = rank - low
         return int(round(ordered[low] * (1.0 - frac) + ordered[high] * frac))
+
+    @staticmethod
+    def _safe_nonnegative_int(raw: Any, default: int = 0) -> int:
+        """Coerce persisted telemetry without trusting its SQLite affinity.
+
+        SQLite permits text in INTEGER columns, and metadata JSON is user-
+        writable.  A corrupt row should contribute zero, not make every stats
+        query fail or inject negative/astronomically large measurements.
+        """
+        if isinstance(raw, bool) or raw is None:
+            return default
+        try:
+            if isinstance(raw, float) and not math.isfinite(raw):
+                return default
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        if value < 0 or value > 2**63 - 1:
+            return default
+        return value
 
     @staticmethod
     def _parse_metadata(raw: Any) -> dict[str, Any]:
@@ -326,8 +358,8 @@ class StatsTracker:
             if event_type not in counts:
                 continue
 
-            duration_ms = int(row["duration_ms"] or 0)
-            token_count = int(row["tokens_used"] or 0)
+            duration_ms = self._safe_nonnegative_int(row["duration_ms"])
+            token_count = self._safe_nonnegative_int(row["tokens_used"])
             counts[event_type] += 1
             durations[event_type].append(duration_ms)
             tokens[event_type].append(token_count)
@@ -339,8 +371,8 @@ class StatsTracker:
                     workflow_degraded += 1
                 if metadata.get("call_graph_available") is True:
                     workflow_call_graph_true += 1
-                callers_count = int(metadata.get("callers_count") or 0)
-                callees_count = int(metadata.get("callees_count") or 0)
+                callers_count = self._safe_nonnegative_int(metadata.get("callers_count"))
+                callees_count = self._safe_nonnegative_int(metadata.get("callees_count"))
                 if callers_count + callees_count > 0:
                     workflow_non_empty_edges += 1
 
@@ -398,16 +430,20 @@ class StatsTracker:
         """, (f"-{days} days",)).fetchall()
         
         daily_data = [
-            {"day": r["day"], "tokens": r["tokens"], "queries": r["queries"]}
+            {
+                "day": r["day"],
+                "tokens": self._safe_nonnegative_int(r["tokens"]),
+                "queries": self._safe_nonnegative_int(r["queries"]),
+            }
             for r in rows
         ]
         
         # Calculate totals and averages
-        total_tokens = sum(r["tokens"] for r in rows)
-        total_queries = sum(r["queries"] for r in rows)
+        total_tokens = sum(row["tokens"] for row in daily_data)
+        total_queries = sum(row["queries"] for row in daily_data)
         
         # Daily average (non-zero days only)
-        active_days = len(rows) if rows else 1
+        active_days = len(rows)
         daily_avg = total_tokens / active_days if active_days > 0 else 0
         
         # Weekly projection

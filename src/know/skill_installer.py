@@ -167,6 +167,18 @@ def auto_bootstrap_skill_install(home: Optional[Path] = None) -> dict:
 
     result = install_skill_file(home=home, force=False)
 
+    install_succeeded = (
+        bool(result.get("template_available"))
+        and result.get("error_count", len(result.get("errors", []))) == 0
+    )
+    if not install_succeeded:
+        return {
+            "attempted": True,
+            "reason": "install_failed",
+            "marker": str(marker),
+            "result": result,
+        }
+
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(

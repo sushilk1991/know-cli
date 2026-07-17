@@ -5,7 +5,8 @@ Applies score multipliers so non-source files rank lower.
 """
 
 import fnmatch
-from typing import Dict, List
+import re
+from pathlib import Path
 
 _TEST_PATTERNS = [
     "test_*", "*_test.*", "tests/*", "spec/*", "__tests__/*", "*_spec.*",
@@ -30,13 +31,21 @@ DEMOTION_MULTIPLIERS = {
 }
 
 
-def categorize_file(file_path: str) -> str:
+def categorize_file(
+    file_path: str | Path, root: str | Path | None = None,
+) -> str:
     """Classify a file path as 'source', 'test', 'vendor', or 'generated'.
 
-    Uses fnmatch patterns against path segments and full path.
+    Uses fnmatch patterns against path segments and full path. When an
+    absolute path is supplied, callers should also supply ``root`` so build
+    directories above the repository are not mistaken for repository paths.
     """
+    path = Path(file_path)
+    if root is not None and path.is_absolute() and path.is_relative_to(Path(root)):
+        path = path.relative_to(Path(root))
+
     # Normalize separators
-    normalized = file_path.replace("\\", "/")
+    normalized = str(path).replace("\\", "/")
     parts = normalized.split("/")
 
     for pattern in _VENDOR_PATTERNS:
@@ -68,19 +77,20 @@ def get_demotion(file_path: str) -> float:
 
 
 def apply_category_demotion(
-    chunks: List[Dict], query: str = ""
-) -> List[Dict]:
+    chunks: list[dict], query: str = "",
+    root: str | Path | None = None,
+) -> list[dict]:
     """Apply category-based score demotion to search results.
 
-    If query contains 'test', skips test file demotion.
+    If query contains the standalone word 'test' or 'tests', skips test file
+    demotion.
     Modifies the 'score' key of each chunk dict in-place.
     """
-    query_lower = query.lower()
-    skip_test_demotion = "test" in query_lower
+    skip_test_demotion = bool(re.search(r"\btests?\b", query, flags=re.IGNORECASE))
 
     for chunk in chunks:
         fp = chunk.get("file_path", "")
-        category = categorize_file(fp)
+        category = categorize_file(fp, root=root)
         if category == "test" and skip_test_demotion:
             continue
         multiplier = DEMOTION_MULTIPLIERS.get(category, 1.0)

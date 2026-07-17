@@ -564,8 +564,13 @@ class PythonParser(BaseParser):
                     module.imports.append(alias.name)
             elif isinstance(node, ast.ImportFrom):
                 level = getattr(node, "level", 0) or 0
-                dotted = "." * level + (node.module or "")
-                module.imports.append(dotted)
+                prefix = "." * level
+                if node.module:
+                    module.imports.append(prefix + node.module)
+                else:
+                    # ``from . import utils`` identifies the imported module
+                    # through aliases, not node.module (which is None).
+                    module.imports.extend(prefix + alias.name for alias in node.names)
 
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -592,14 +597,10 @@ class PythonParser(BaseParser):
         return module
 
     def _parse_function(self, node, is_async=False, is_method=False) -> FunctionInfo:
-        args = []
-        for arg in node.args.args:
-            arg_str = arg.arg
-            if arg.annotation:
-                arg_str += f": {ast.unparse(arg.annotation)}"
-            args.append(arg_str)
-
-        signature = f"{node.name}({', '.join(args)})"
+        # ast.unparse preserves positional-only markers, defaults, *args,
+        # keyword-only args, annotations and **kwargs. The prior hand-rolled
+        # loop silently dropped most of those semantics.
+        signature = f"{node.name}({ast.unparse(node.args)})"
 
         decorators = []
         for decorator in node.decorator_list:

@@ -165,7 +165,7 @@ def _format_context_payload_markdown(payload: dict) -> str:
 @click.option(
     "--top-k",
     "-k",
-    type=int,
+    type=click.IntRange(1, 100),
     default=10,
     help="Number of results to show"
 )
@@ -224,7 +224,8 @@ def _search_semantic(ctx, config, searcher, query, top_k, index, chunk):
     # Track stats
     try:
         from know.stats import StatsTracker
-        StatsTracker(config).record_search(query, len(results), duration_ms)
+        with StatsTracker(config) as tracker:
+            tracker.record_search(query, len(results), duration_ms)
     except Exception as e:
         logger.debug(f"Stats tracking (search) failed: {e}")
 
@@ -321,14 +322,20 @@ def _search_bm25_fallback(ctx, config, query, top_k, cause: Optional[Exception] 
 
     if not client:
         db = _get_db_fallback(config)
-        results = db.search_chunks(query, top_k)
+        try:
+            results = db.search_chunks(query, top_k)
+        finally:
+            close = getattr(db, "close", None)
+            if close is not None:
+                close()
 
     duration_ms = int((_time.monotonic() - t0) * 1000)
 
     # Track stats
     try:
         from know.stats import StatsTracker
-        StatsTracker(config).record_search(query, len(results), duration_ms)
+        with StatsTracker(config) as tracker:
+            tracker.record_search(query, len(results), duration_ms)
     except Exception as e:
         logger.debug(f"Stats tracking (search) failed: {e}")
 
@@ -508,8 +515,8 @@ def grep_cmd(
     # Track in generic search stats for trend visibility.
     try:
         from know.stats import StatsTracker
-
-        StatsTracker(config).record_search(query, len(rows), duration_ms)
+        with StatsTracker(config) as tracker:
+            tracker.record_search(query, len(rows), duration_ms)
     except Exception as e:
         logger.debug(f"Stats tracking (grep) failed: {e}")
 
@@ -710,8 +717,8 @@ def context(
         # Inject relevant memories into context
         try:
             from know.knowledge_base import KnowledgeBase
-            kb = KnowledgeBase(config)
-            memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
+            with KnowledgeBase(config) as kb:
+                memory_ctx = kb.get_relevant_context(query, max_tokens=min(500, budget // 10))
             if memory_ctx:
                 result["memories_context"] = memory_ctx
         except Exception as e:
@@ -726,18 +733,19 @@ def context(
     # Track stats
     try:
         from know.stats import StatsTracker
-        StatsTracker(config).record_context(
-            query,
-            budget,
-            int(payload.get("used_tokens", 0)),
-            duration_ms,
-            metadata={
-                "session_id": resolved_session_id or "",
-                "confidence": payload.get("confidence"),
-                "indexing_status": payload.get("indexing_status"),
-                "warnings_count": len(payload.get("warnings", []) or []),
-            },
-        )
+        with StatsTracker(config) as tracker:
+            tracker.record_context(
+                query,
+                budget,
+                int(payload.get("used_tokens", 0)),
+                duration_ms,
+                metadata={
+                    "session_id": resolved_session_id or "",
+                    "confidence": payload.get("confidence"),
+                    "indexing_status": payload.get("indexing_status"),
+                    "warnings_count": len(payload.get("warnings", []) or []),
+                },
+            )
     except Exception as e:
         logger.debug(f"Stats tracking (context) failed: {e}")
 
@@ -776,32 +784,32 @@ def graph(ctx: click.Context, file_path: str) -> None:
     from know.import_graph import ImportGraph
 
     # Ensure graph is built
-    scanner = CodebaseScanner(config)
-    structure = scanner.get_structure()
-    ig = ImportGraph(config)
-    ig.build(structure["modules"])
+    with CodebaseScanner(config) as scanner:
+        structure = scanner.get_structure()
+    with ImportGraph(config) as ig:
+        ig.build(structure["modules"])
 
-    # Resolve the module name from the file path
-    rel = str(Path(file_path).with_suffix("")).replace("/", ".").replace("\\", ".")
+        # Resolve the module name from the file path
+        rel = str(Path(file_path).with_suffix("")).replace("/", ".").replace("\\", ".")
 
-    output = ig.format_graph(rel)
+        output = ig.format_graph(rel)
 
-    if ctx.obj.get("json"):
-        import json
-        data = {
-            "module": rel,
-            "imports": ig.imports_of(rel),
-            "imported_by": ig.imported_by(rel),
-        }
-        click.echo(json.dumps(data, indent=2))
-    elif ctx.obj.get("quiet"):
-        click.echo(output)
-    else:
-        console.print(Panel(
-            output,
-            title=f"📊 Import Graph: {file_path}",
-            border_style="green",
-        ))
+        if ctx.obj.get("json"):
+            import json
+            data = {
+                "module": rel,
+                "imports": ig.imports_of(rel),
+                "imported_by": ig.imported_by(rel),
+            }
+            click.echo(json.dumps(data, indent=2))
+        elif ctx.obj.get("quiet"):
+            click.echo(output)
+        else:
+            console.print(Panel(
+                output,
+                title=f"📊 Import Graph: {file_path}",
+                border_style="green",
+            ))
 
 
 @click.command()

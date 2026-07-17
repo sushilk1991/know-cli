@@ -306,8 +306,9 @@ class TestSessionDedup:
 
         # There should be no overlap between chunk sets
         overlap = set(chunks1) & set(chunks2)
-        # Note: some overlap is OK if same chunk matches both queries
-        # but the session should reduce it
+        # Expansion may reintroduce a related chunk, but session history must
+        # still suppress at least one exact result from the first response.
+        assert len(overlap) < len(set(chunks1))
         assert result2.get("session_id") == "dedup-test"
 
     def test_no_session_backward_compatible(self, tmp_project, indexed_db):
@@ -338,19 +339,25 @@ class TestSessionDedup:
 
     def test_cleanup_expired_sessions(self, indexed_db):
         """cleanup_expired_sessions removes old sessions."""
+        indexed_db.create_session("expired-session")
+        indexed_db.mark_session_seen("expired-session", ["a:b:1"], [25])
+
         conn = indexed_db._get_conn()
         old_time = time.time() - 20000  # Well past 4-hour TTL
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
-            "VALUES (?, ?, ?)",
-            ("expired-session", old_time, old_time),
+            "UPDATE sessions SET created_at = ?, last_used_at = ? "
+            "WHERE session_id = ?",
+            (old_time, old_time, "expired-session"),
         )
         conn.commit()
 
         indexed_db.cleanup_expired_sessions(ttl_seconds=14400)
 
-        seen = indexed_db.get_session_seen("expired-session")
-        assert len(seen) == 0
+        assert indexed_db.get_session_seen("expired-session") == set()
+        assert conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?",
+            ("expired-session",),
+        ).fetchone() is None
 
 
 # ---------------------------------------------------------------------------

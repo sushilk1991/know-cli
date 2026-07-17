@@ -3,13 +3,76 @@
 import ast
 import json
 import os
+import re
+import secrets
+import stat
 from collections import Counter, defaultdict
+from html import escape as escape_html
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from know.config import Config
     from know.scanner import APIRoute
+
+
+def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> Path:
+    """Replace a text file atomically, creating its parent directories first."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_mode: Optional[int] = None
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        pass
+
+    temporary_path: Optional[Path] = None
+    temporary_fd: Optional[int] = None
+    try:
+        for _attempt in range(100):
+            temporary_path = path.parent / (
+                f".{path.name}.{secrets.token_hex(8)}.tmp"
+            )
+            try:
+                # Unlike mkstemp/NamedTemporaryFile, os.open applies the
+                # process umask to this requested mode. That gives a new final
+                # file the same permissions as an ordinary text-file create.
+                temporary_fd = os.open(
+                    temporary_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o666,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(f"Could not allocate temporary file for {path}")
+
+        temporary_stream = os.fdopen(temporary_fd, mode="w", encoding=encoding)
+        temporary_fd = None
+        with temporary_stream as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+
+        if existing_mode is not None:
+            temporary_path.chmod(existing_mode)
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+    return path
+
+
+def _audience_slug(audience: str) -> str:
+    """Turn free-form audience text into one bounded filename component."""
+    slug = re.sub(r"[^a-z0-9]+", "-", audience.casefold()).strip("-")
+    return slug[:80].rstrip("-") or "general"
 
 
 class DocGenerator:
@@ -30,17 +93,17 @@ class DocGenerator:
     def generate_all(self) -> None:
         """Generate all documentation."""
         from know.scanner import CodebaseScanner
-        
-        scanner = CodebaseScanner(self.config)
-        structure = scanner.get_structure()
-        
-        # Generate each type of doc
-        self.generate_system_doc(structure)  # Default: docs/arc.md
-        self.generate_c4_diagram(structure)
-        
-        routes = scanner.extract_api_routes()
-        if routes:
-            self.generate_openapi(routes)
+
+        with CodebaseScanner(self.config) as scanner:
+            structure = scanner.get_structure()
+
+            # Generate each type of doc
+            self.generate_system_doc(structure)  # Default: docs/arc.md
+            self.generate_c4_diagram(structure)
+
+            routes = scanner.extract_api_routes()
+            if routes:
+                self.generate_openapi(routes)
     
     def generate_system_doc(self, structure: Dict[str, Any], output: Optional[str] = None) -> Path:
         """Generate system documentation (arc.md or similar)."""
@@ -100,8 +163,7 @@ class DocGenerator:
             # Default to docs/arc.md instead of README.md
             path = self.output_dir / "arc.md"
         
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
 
     def _build_evidence_intro(self, structure: Dict[str, Any]) -> str:
@@ -316,7 +378,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "architecture.md"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def _generate_c4_plantuml(
@@ -359,7 +421,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "architecture-c4.md"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def generate_component_diagram(
@@ -467,7 +529,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "dependencies.md"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def generate_openapi(
@@ -510,7 +572,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "openapi.json"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def generate_postman(
@@ -551,7 +613,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "postman-collection.json"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def generate_api_markdown(
@@ -597,7 +659,7 @@ class DocGenerator:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             path = self.output_dir / "api.md"
         
-        path.write_text(content)
+        atomic_write_text(path, content)
         return path
     
     def save_onboarding(
@@ -607,27 +669,26 @@ class DocGenerator:
         format: str = "markdown"
     ) -> Path:
         """Save onboarding guide."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        safe_audience = audience.replace(" ", "_").lower()
-        
+        safe_audience = _audience_slug(audience)
+
         if format == "markdown":
             path = self.output_dir / f"onboarding-{safe_audience}.md"
-            path.write_text(guide)
         elif format == "html":
             path = self.output_dir / f"onboarding-{safe_audience}.html"
-            html = f"""<!DOCTYPE html>
+            guide = f"""<!DOCTYPE html>
 <html>
-<head><title>Onboarding - {audience}</title></head>
+<head><title>Onboarding - {escape_html(audience)}</title></head>
 <body>
 {guide}
 </body>
 </html>"""
-            path.write_text(html)
         else:
-            path = self.output_dir / f"onboarding-{safe_audience}.md"
-            path.write_text(guide)
-        
+            raise ValueError(f"Unsupported onboarding format: {format}")
+
+        if path.resolve().parent != self.output_dir.resolve():
+            raise ValueError("Onboarding output must stay within the configured output directory")
+        atomic_write_text(path, guide)
+
         return path
     
     def generate_onboarding(

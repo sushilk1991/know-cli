@@ -1,6 +1,6 @@
 """Configuration management for know."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional
 
@@ -213,36 +213,90 @@ class Config:
     def load(cls, path: Path) -> "Config":
         """Load configuration from YAML file."""
         with open(path) as f:
-            data = yaml.safe_load(f)
+            loaded = yaml.safe_load(f)
+
+        # Empty files are a common intermediate state during editor writes.
+        # A non-empty scalar/list is malformed, though, and silently treating
+        # it as defaults can make know operate with a configuration the user
+        # never requested.
+        if loaded is None:
+            data = {}
+        elif not isinstance(loaded, dict):
+            raise ValueError("Configuration root must be a YAML mapping")
+        else:
+            data = loaded
+
+        def _section(name: str) -> dict:
+            if name not in data:
+                return {}
+            value = data[name]
+            if not isinstance(value, dict):
+                raise ValueError(f"Configuration '{name}' must be a YAML mapping")
+            return value
+
+        def _string_list(name: str) -> Optional[List[str]]:
+            if name not in data:
+                return None
+            value = data[name]
+            if not isinstance(value, list) or any(
+                not isinstance(item, str) for item in value
+            ):
+                raise ValueError(
+                    f"Configuration '{name}' must be a YAML list of strings"
+                )
+            return value
+
+        def _known(dataclass_type, values: dict, *, exclude=()) -> dict:
+            allowed = {item.name for item in fields(dataclass_type)} - set(exclude)
+            return {key: value for key, value in values.items() if key in allowed}
         
         config = cls()
         config.root = path.parent.parent.resolve()
         
-        if "project" in data:
-            config.project = ProjectConfig(**data["project"])
-        if "languages" in data:
-            config.languages = data["languages"]
-        if "include" in data:
-            config.include = data["include"]
-        if "exclude" in data:
-            config.exclude = data["exclude"]
-        if "ai" in data:
-            config.ai = AIConfig(**{k: v for k, v in data["ai"].items() if k != "generate"})
-            if "generate" in data["ai"]:
-                config.ai.generate = data["ai"]["generate"]
-        if "output" in data:
+        project = _section("project")
+        if project:
+            config.project = ProjectConfig(**_known(ProjectConfig, project))
+        languages = _string_list("languages")
+        include = _string_list("include")
+        exclude = _string_list("exclude")
+        if languages is not None:
+            config.languages = languages
+        if include is not None:
+            config.include = include
+        if exclude is not None:
+            config.exclude = exclude
+        ai = _section("ai")
+        if ai:
+            config.ai = AIConfig(**_known(AIConfig, ai, exclude={"generate"}))
+            if "generate" in ai:
+                if not isinstance(ai["generate"], dict):
+                    raise ValueError("Configuration 'ai.generate' must be a YAML mapping")
+                config.ai.generate = ai["generate"]
+        output = _section("output")
+        if output:
             config.output = OutputConfig(
-                format=data["output"].get("format", "markdown"),
-                directory=data["output"].get("directory", "docs"),
+                **_known(OutputConfig, output, exclude={"git", "watch"}),
             )
-            if "git" in data["output"]:
-                config.output.git = OutputConfig.GitConfig(**data["output"]["git"])
-            if "watch" in data["output"]:
-                config.output.watch = OutputConfig.WatchConfig(**data["output"]["watch"])
-        if "diagrams" in data:
-            config.diagrams = DiagramConfig(**data["diagrams"])
-        if "api" in data:
-            config.api = APIConfig(**data["api"])
+            git = output.get("git")
+            if "git" in output and not isinstance(git, dict):
+                raise ValueError("Configuration 'output.git' must be a YAML mapping")
+            if isinstance(git, dict):
+                config.output.git = OutputConfig.GitConfig(
+                    **_known(OutputConfig.GitConfig, git)
+                )
+            watch = output.get("watch")
+            if "watch" in output and not isinstance(watch, dict):
+                raise ValueError("Configuration 'output.watch' must be a YAML mapping")
+            if isinstance(watch, dict):
+                config.output.watch = OutputConfig.WatchConfig(
+                    **_known(OutputConfig.WatchConfig, watch)
+                )
+        diagrams = _section("diagrams")
+        if diagrams:
+            config.diagrams = DiagramConfig(**_known(DiagramConfig, diagrams))
+        api = _section("api")
+        if api:
+            config.api = APIConfig(**_known(APIConfig, api))
         
         return config
 

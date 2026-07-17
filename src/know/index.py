@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
@@ -33,6 +34,57 @@ def _compute_hash(content: str) -> str:
     return hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
+def read_source_snapshot(path: Path) -> Optional[Dict[str, Any]]:
+    """Read content and metadata from one stable version of ``path``."""
+    try:
+        before = path.stat()
+        raw = path.read_bytes()
+        after = path.stat()
+    except (FileNotFoundError, OSError):
+        return None
+
+    before_key = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_size,
+    )
+    after_key = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_size,
+    )
+    if before_key != after_key or len(raw) != after.st_size:
+        return None
+
+    content = raw.decode("utf-8", errors="replace")
+    return {
+        "content": content,
+        "mtime": after.st_mtime,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "size": after.st_size,
+        "content_hash": _compute_hash(content),
+    }
+
+
+def source_snapshot_matches(
+    before: Dict[str, Any], after: Dict[str, Any],
+) -> bool:
+    """Return whether two snapshots identify the same file generation."""
+    return all(
+        before.get(key) == after.get(key)
+        for key in (
+            "content_hash", "mtime_ns", "ctime_ns", "device", "inode", "size",
+        )
+    )
+
+
 class CodebaseIndex:
     """SQLite-based index for efficient incremental scanning.
     
@@ -58,7 +110,7 @@ class CodebaseIndex:
         """Ensure database and tables exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS files (
                     path TEXT PRIMARY KEY,
@@ -84,9 +136,17 @@ class CodebaseIndex:
     
     def close(self) -> None:
         """Close database connection."""
-        if self._conn:
-            self._conn.close()
+        conn = getattr(self, "_conn", None)
+        if conn:
+            conn.close()
             self._conn = None
+
+    def __del__(self):
+        """Best-effort fallback for short-lived callers that omit ``close``."""
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def __enter__(self):
         return self
@@ -97,6 +157,15 @@ class CodebaseIndex:
     def _compute_file_hash(self, content: str) -> str:
         """Compute hash of file content."""
         return _compute_hash(content)
+
+    def read_file_snapshot(self, path: Path) -> Optional[Dict[str, Any]]:
+        """Read a stable source snapshot and its matching filesystem metadata.
+
+        The stat calls bracket the read so callers never associate parsed
+        content with metadata from a different file version. A concurrent
+        writer simply makes this scan retry the file on the next pass.
+        """
+        return read_source_snapshot(path)
     
     def get_file_metadata(self, path: Path) -> Optional[Dict[str, Any]]:
         """Get cached metadata for a file."""
@@ -121,53 +190,78 @@ class CodebaseIndex:
     
     def is_file_changed(self, path: Path) -> bool:
         """Check if file has changed since last scan."""
-        if not path.exists():
-            return True
-        
         cached = self.get_file_metadata(path)
         if not cached:
             return True
-        
-        try:
-            stat = path.stat()
-            if stat.st_mtime != cached["mtime"] or stat.st_size != cached["size"]:
-                return True
-            
-            # Double-check with content hash
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            content_hash = self._compute_file_hash(content)
-            return content_hash != cached["content_hash"]
-        except Exception as e:
-            logger.debug(f"Error checking file {path}: {e}")
+
+        snapshot = self.read_file_snapshot(path)
+        if snapshot is None:
             return True
-    
-    def get_cached_module(self, path: Path) -> Optional[Dict[str, Any]]:
-        """Get cached module data if file hasn't changed."""
-        if self.is_file_changed(path):
-            return None
-        
+        return (
+            snapshot["mtime"] != cached["mtime"]
+            or snapshot["size"] != cached["size"]
+            or snapshot["content_hash"] != cached["content_hash"]
+        )
+
+    def get_cached_module_snapshot(
+        self, path: Path,
+    ) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Return cached module plus the exact source snapshot it describes."""
         try:
             relative_path = str(path.relative_to(self.root))
         except ValueError:
             return None
-        
+
+        snapshot = self.read_file_snapshot(path)
+        if snapshot is None:
+            return None
+
         try:
             conn = self._get_connection()
-            cursor = conn.execute(
-                "SELECT data FROM modules WHERE path = ?",
-                (relative_path,)
-            )
-            row = cursor.fetchone()
-            
-            if row:
-                return json.loads(row["data"])
+            row = conn.execute(
+                """SELECT f.mtime, f.size, f.content_hash, m.data
+                   FROM files AS f
+                   JOIN modules AS m ON m.path = f.path
+                   WHERE f.path = ?""",
+                (relative_path,),
+            ).fetchone()
+            if row is None:
+                return None
+            if (
+                snapshot["mtime"] != row["mtime"]
+                or snapshot["size"] != row["size"]
+                or snapshot["content_hash"] != row["content_hash"]
+            ):
+                return None
+            module_data = json.loads(row["data"])
+            expected_path = relative_path.replace("\\", "/")
+            if (
+                not isinstance(module_data, dict)
+                or str(module_data.get("path", "")).replace("\\", "/")
+                != expected_path
+            ):
+                logger.warning(f"Invalid cached module identity for {path}")
+                return None
+            return module_data, snapshot
         except sqlite3.Error as e:
-            logger.debug(f"Database error in get_cached_module: {e}")
+            logger.debug(f"Database error in get_cached_module_snapshot: {e}")
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache data for {path}: {e}")
         return None
+
+    def get_cached_module(self, path: Path) -> Optional[Dict[str, Any]]:
+        """Get cached module data if file hasn't changed."""
+        cached = self.get_cached_module_snapshot(path)
+        return cached[0] if cached else None
     
-    def cache_file(self, path: Path, language: str, module_data: Optional[Dict] = None) -> None:
+    def cache_file(
+        self,
+        path: Path,
+        language: str,
+        module_data: Optional[Dict] = None,
+        *,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Cache file metadata and parsed module."""
         try:
             relative_path = str(path.relative_to(self.root))
@@ -176,34 +270,43 @@ class CodebaseIndex:
             return
         
         try:
-            stat = path.stat()
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            content_hash = self._compute_file_hash(content)
-            
-            conn = self._get_connection()
-            
-            # Update file metadata
-            conn.execute(
-                """INSERT OR REPLACE INTO files 
-                   (path, mtime, size, content_hash, language, parsed_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (relative_path, stat.st_mtime, stat.st_size, 
-                 content_hash, language, datetime.now().isoformat())
+            snapshot = snapshot or self.read_file_snapshot(path)
+            if snapshot is None:
+                logger.debug(f"File changed while reading; not caching {path}")
+                return
+
+            # Serialize before touching metadata. If serialization fails, the
+            # old file row must keep describing the old module row so the
+            # changed source remains eligible for a retry.
+            serialized_module = (
+                json.dumps(module_data) if module_data is not None else None
             )
-            
-            # Update module data if provided
-            if module_data:
+            conn = self._get_connection()
+
+            # The context manager commits both rows or rolls both back. In
+            # particular, a failed module write cannot make stale module data
+            # look current by publishing only the new file hash.
+            with conn:
                 conn.execute(
-                    """INSERT OR REPLACE INTO modules
-                       (path, name, docstring, data, updated_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (relative_path, module_data.get("name", ""),
-                     module_data.get("docstring"),
-                     json.dumps(module_data),
+                    """INSERT OR REPLACE INTO files
+                       (path, mtime, size, content_hash, language, parsed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (relative_path, snapshot["mtime"], snapshot["size"],
+                     snapshot["content_hash"], language,
                      datetime.now().isoformat())
                 )
-            
-            conn.commit()
+
+                if module_data is None:
+                    conn.execute("DELETE FROM modules WHERE path = ?", (relative_path,))
+                else:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO modules
+                           (path, name, docstring, data, updated_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (relative_path, module_data.get("name", ""),
+                         module_data.get("docstring"), serialized_module,
+                         datetime.now().isoformat())
+                    )
         except sqlite3.Error as e:
             logger.warning(f"Database error caching {path}: {e}")
         except Exception as e:
@@ -230,7 +333,9 @@ class CodebaseIndex:
         """Get all cached module data."""
         return list(self.iter_cached_modules())
     
-    def get_changed_files(self, candidate_files: List[Path]) -> tuple[List[Path], List[Dict]]:
+    def get_changed_files(
+        self, candidate_files: List[Path],
+    ) -> tuple[List[Path], List[Dict], Dict[str, Dict[str, Any]]]:
         """Split files into changed (need parsing) and unchanged (use cache).
         
         Returns:
@@ -238,15 +343,18 @@ class CodebaseIndex:
         """
         changed = []
         cached = []
+        snapshots: Dict[str, Dict[str, Any]] = {}
         
         for path in candidate_files:
-            cached_module = self.get_cached_module(path)
-            if cached_module:
+            cached_result = self.get_cached_module_snapshot(path)
+            if cached_result:
+                cached_module, snapshot = cached_result
                 cached.append(cached_module)
+                snapshots[str(cached_module.get("path", ""))] = snapshot
             else:
                 changed.append(path)
         
-        return changed, cached
+        return changed, cached, snapshots
     
     def remove_stale_entries(self, existing_files: List[Path]) -> int:
         """Remove cache entries for files that no longer exist."""

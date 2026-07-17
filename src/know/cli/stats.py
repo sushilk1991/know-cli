@@ -19,27 +19,27 @@ def stats(ctx: click.Context) -> None:
     from know.stats import StatsTracker
     from know.knowledge_base import KnowledgeBase
 
-    tracker = StatsTracker(config)
-    summary = tracker.get_summary()
-    retrieval = tracker.get_retrieval_summary(days=30)
+    with StatsTracker(config) as tracker:
+        summary = tracker.get_summary()
+        retrieval = tracker.get_retrieval_summary(days=30)
 
     # Codebase info
-    scanner = CodebaseScanner(config)
-    try:
-        structure = scanner.get_structure()
-        py_files = structure.get("file_count", len(structure.get("modules", [])))
-        functions = structure.get("function_count", 0)
-    except Exception as e:
-        logger.debug(f"Codebase stats scan failed: {e}")
-        py_files = 0
-        functions = 0
+    with CodebaseScanner(config) as scanner:
+        try:
+            structure = scanner.get_structure()
+            py_files = structure.get("file_count", len(structure.get("modules", [])))
+            functions = structure.get("function_count", 0)
+        except Exception as e:
+            logger.debug(f"Codebase stats scan failed: {e}")
+            py_files = 0
+            functions = 0
 
     # Memory info
     try:
-        kb = KnowledgeBase(config)
-        total_mem = kb.count()
-        manual_mem = kb.count(source="manual")
-        auto_mem = total_mem - manual_mem
+        with KnowledgeBase(config) as kb:
+            total_mem = kb.count()
+            manual_mem = kb.count(source="manual")
+            auto_mem = total_mem - manual_mem
     except Exception as e:
         logger.debug(f"Memory stats retrieval failed: {e}")
         total_mem = manual_mem = auto_mem = 0
@@ -107,21 +107,21 @@ def status(ctx: click.Context) -> None:
 
     # Codebase info
     from know.scanner import LANGUAGE_EXTENSIONS
-    scanner = CodebaseScanner(config)
     lang_counts: dict = {}
-    try:
-        structure = scanner.get_structure()
-        modules = structure.get("modules", [])
-        n_files = structure.get("file_count", len(modules))
-        n_functions = structure.get("function_count", 0)
-        for mod in modules:
-            path_str = mod["path"] if isinstance(mod, dict) else str(mod.path)
-            suffix = Path(path_str).suffix.lower()
-            lang = LANGUAGE_EXTENSIONS.get(suffix, "unknown")
-            lang_counts[lang] = lang_counts.get(lang, 0) + 1
-    except Exception as e:
-        logger.debug(f"Status codebase scan failed: {e}")
-        n_files = n_functions = 0
+    with CodebaseScanner(config) as scanner:
+        try:
+            structure = scanner.get_structure()
+            modules = structure.get("modules", [])
+            n_files = structure.get("file_count", len(modules))
+            n_functions = structure.get("function_count", 0)
+            for mod in modules:
+                path_str = mod["path"] if isinstance(mod, dict) else str(mod.path)
+                suffix = Path(path_str).suffix.lower()
+                lang = LANGUAGE_EXTENSIONS.get(suffix, "unknown")
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+        except Exception as e:
+            logger.debug(f"Status codebase scan failed: {e}")
+            n_files = n_functions = 0
 
     # Index info
     index_age = "unknown"
@@ -145,7 +145,8 @@ def status(ctx: click.Context) -> None:
     mem_count = 0
     try:
         from know.knowledge_base import KnowledgeBase
-        mem_count = KnowledgeBase(config).count()
+        with KnowledgeBase(config) as kb:
+            mem_count = kb.count()
     except Exception as e:
         logger.debug(f"Memory count retrieval failed: {e}")
 

@@ -17,10 +17,20 @@ def fuse_rankings(
     k=60 is the standard RRF constant from Cormack et al.
     Returns fused [(chunk_id, fused_score)] sorted descending.
     """
+    if k <= 0:
+        raise ValueError("k must be greater than zero")
     scores: Dict[str, float] = {}
     for ranked in ranked_lists:
-        for rank, (chunk_id, _) in enumerate(ranked):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+        seen: set[str] = set()
+        unique_rank = 0
+        for chunk_id, _ in ranked:
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            scores[chunk_id] = (
+                scores.get(chunk_id, 0.0) + 1.0 / (k + unique_rank + 1)
+            )
+            unique_rank += 1
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 

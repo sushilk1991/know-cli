@@ -8,8 +8,9 @@ vector embeddings are optional via know-cli[search].
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import xxhash
 
@@ -107,6 +108,13 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
 
+-- Stable human-facing IDs. Rows are intentionally retained after a memory is
+-- deleted so AUTOINCREMENT can never assign an old display ID to new content.
+CREATE TABLE IF NOT EXISTS memory_display_ids (
+    display_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id TEXT NOT NULL UNIQUE
+);
+
 -- FTS5 on memories
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, tags,
@@ -180,6 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(chunk_name);
 
 
 MAX_SEARCH_TERMS = 12
+_UNSET = object()
 
 
 class _BatchContext:
@@ -191,18 +200,31 @@ class _BatchContext:
 
     def __init__(self, db: "DaemonDB"):
         self._db = db
+        self._savepoint: Optional[str] = None
 
     def __enter__(self):
         local = self._db._local
         depth = getattr(local, "batch_depth", 0)
+        conn = self._db._get_conn()
+        if depth == 0:
+            conn.execute("BEGIN")
+        else:
+            self._savepoint = self._db._next_savepoint("batch")
+            conn.execute(f"SAVEPOINT {self._savepoint}")
         local.batch_depth = depth + 1
         return self._db
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         local = self._db._local
         local.batch_depth -= 1
-        if local.batch_depth == 0:
-            conn = self._db._get_conn()
+        conn = self._db._get_conn()
+        if self._savepoint is not None:
+            if exc_type is None:
+                conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+        elif local.batch_depth == 0:
             if exc_type is None:
                 conn.commit()
             else:
@@ -218,26 +240,99 @@ class DaemonDB:
         self.db_path = project_root / ".know" / "daemon.db"
         self._local = threading.local()
         self._lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
+        self._connection_owners: dict[sqlite3.Connection, threading.Thread] = {}
+        self._closed = False
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get a thread-local database connection."""
         conn = getattr(self._local, 'conn', None)
-        if conn is None:
-            with self._lock:
-                self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(self.db_path))
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("DaemonDB is closed")
+
+            # A thread-local connection normally disappears from reach when its
+            # owner thread exits, but the close-all registry intentionally holds
+            # a strong reference. Prune connections whose owners have finished
+            # before allocating another, so short-lived thread churn does not
+            # consume one file descriptor per historical thread.
+            current_thread = threading.current_thread()
+            stale_connections = [
+                owned_conn
+                for owned_conn, owner in self._connection_owners.items()
+                if owner is not current_thread and not owner.is_alive()
+            ]
+            for stale_conn in stale_connections:
+                self._connections.discard(stale_conn)
+                self._connection_owners.pop(stale_conn, None)
+                try:
+                    stale_conn.close()
+                except sqlite3.Error:
+                    pass
+
+            # ``close()`` clears the shared registry but cannot reach another
+            # thread's ``threading.local`` slot. Treat an unregistered local
+            # connection as stale and replace it on the next operation.
+            if conn is not None and conn in self._connections:
+                return conn
+
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+            except BaseException:
+                conn.close()
+                raise
+            self._connections.add(conn)
+            self._connection_owners[conn] = current_thread
             self._local.conn = conn
-        return conn
+            return conn
 
     def _commit(self, conn: sqlite3.Connection) -> None:
         """Commit unless inside a batch() context (thread-safe)."""
         if getattr(self._local, "batch_depth", 0) == 0:
             conn.commit()
+
+    def _next_savepoint(self, prefix: str) -> str:
+        """Return a thread-local, SQL-safe savepoint identifier."""
+        value = getattr(self._local, "savepoint_counter", 0) + 1
+        self._local.savepoint_counter = value
+        return f"know_{prefix}_{value}"
+
+    @contextmanager
+    def _atomic_replace(self, prefix: str) -> Iterator[sqlite3.Connection]:
+        """Protect a delete-then-insert operation from partial persistence.
+
+        BEGIN IMMEDIATE serializes competing writers before either can make a
+        partial change. SAVEPOINT composes with batch() and rolls back only
+        this replacement if a caller catches the exception and continues the
+        outer batch.
+        """
+        conn = self._get_conn()
+        in_batch = getattr(self._local, "batch_depth", 0) > 0
+        savepoint = self._next_savepoint(prefix) if in_batch else None
+        if savepoint is None:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except BaseException:
+            if savepoint is None:
+                conn.rollback()
+            else:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            if savepoint is None:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def batch(self):
         """Context manager for batched writes — single commit at the end.
@@ -354,6 +449,26 @@ class DaemonDB:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(decision_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_trust ON memories(trust_level)")
+        # store_memory has always promised content-level deduplication. Repair
+        # any historical race-created duplicates before enforcing that promise
+        # at SQLite's concurrency boundary.
+        conn.execute(
+            """DELETE FROM memories
+               WHERE rowid NOT IN (
+                   SELECT MIN(rowid) FROM memories GROUP BY content_hash
+               )"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash_unique "
+            "ON memories(content_hash)"
+        )
+        # Preserve the historical display-ID contract: the oldest created
+        # memory received the lowest ID, with rowid breaking timestamp ties.
+        # Future IDs come from this append-only AUTOINCREMENT table.
+        conn.execute(
+            """INSERT OR IGNORE INTO memory_display_ids (memory_id)
+               SELECT id FROM memories ORDER BY created_at, rowid"""
+        )
         conn.commit()
 
         # Rebuild FTS5 index if it was just migrated (has 0 rows but chunks exist)
@@ -401,14 +516,43 @@ class DaemonDB:
                     (6, time.time()),
                 )
                 conn.commit()
+            if current < 7:
+                # v7: persistent, non-reusable display IDs for memories.
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (7, time.time()),
+                )
+                conn.commit()
         except sqlite3.OperationalError:
             pass  # Table may not exist yet
 
     def close(self):
-        conn = getattr(self._local, 'conn', None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        lock = getattr(self, "_lock", None)
+        connections = getattr(self, "_connections", None)
+        if lock is None or connections is None:
+            return
+        with lock:
+            self._closed = True
+            pending = tuple(connections)
+            connections.clear()
+            owners = getattr(self, "_connection_owners", None)
+            if owners is not None:
+                owners.clear()
+            local = getattr(self, "_local", None)
+            if local is not None:
+                local.conn = None
+        for conn in pending:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    def __del__(self):
+        """Best-effort fallback for short-lived callers that omit ``close``."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -421,38 +565,36 @@ class DaemonDB:
     # ------------------------------------------------------------------
     def upsert_chunks(self, file_path: str, language: str, chunks: List[Dict[str, Any]]):
         """Replace all chunks for a file with new ones."""
-        conn = self._get_conn()
         now = time.time()
 
-        # Delete old chunks for this file
-        conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+        with self._atomic_replace("chunks") as conn:
+            conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
 
-        for chunk in chunks:
-            body = chunk.get("body", "")
-            body_hash = xxhash.xxh64(body.encode()).hexdigest()
-            token_count = count_tokens(body)
+            for chunk in chunks:
+                body = chunk.get("body", "")
+                body_hash = xxhash.xxh64(body.encode()).hexdigest()
+                token_count = count_tokens(body)
 
-            conn.execute(
-                """INSERT INTO chunks
-                   (file_path, chunk_name, chunk_type, language,
-                    start_line, end_line, signature, body,
-                    body_hash, token_count, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    file_path,
-                    chunk.get("name", ""),
-                    chunk.get("type", "module"),
-                    language,
-                    chunk.get("start_line", 0),
-                    chunk.get("end_line", 0),
-                    chunk.get("signature", ""),
-                    body,
-                    body_hash,
-                    token_count,
-                    now,
-                ),
-            )
-        self._commit(conn)
+                conn.execute(
+                    """INSERT INTO chunks
+                       (file_path, chunk_name, chunk_type, language,
+                        start_line, end_line, signature, body,
+                        body_hash, token_count, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        file_path,
+                        chunk.get("name", ""),
+                        chunk.get("type", "module"),
+                        language,
+                        chunk.get("start_line", 0),
+                        chunk.get("end_line", 0),
+                        chunk.get("signature", ""),
+                        body,
+                        body_hash,
+                        token_count,
+                        now,
+                    ),
+                )
 
     def _fts_column_count(self, conn: sqlite3.Connection) -> int:
         """Detect number of columns in FTS5 table for weight vector selection."""
@@ -478,6 +620,9 @@ class DaemonDB:
         Results fused via Reciprocal Rank Fusion with lane-specific weights:
         AND results get 2x weight, exact name matches get 3x.
         """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer between 1 and 1000")
+
         from know.query import analyze_query, build_fts_or_query, build_fts_and_query
         from know.ranking import fuse_rankings
 
@@ -708,11 +853,15 @@ class DaemonDB:
 
     def remove_file(self, file_path: str):
         """Remove a file and its chunks from the index."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
-        conn.execute("DELETE FROM file_index WHERE file_path = ?", (file_path,))
-        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
-        self._commit(conn)
+        module_name = str(Path(file_path).with_suffix("")).replace("\\", "/").replace("/", ".")
+        with self._atomic_replace("remove_file") as conn:
+            conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+            conn.execute("DELETE FROM file_index WHERE file_path = ?", (file_path,))
+            conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
+            conn.execute(
+                "DELETE FROM imports WHERE source_module = ? OR target_module = ?",
+                (module_name, module_name),
+            )
 
     def list_indexed_files(self) -> List[str]:
         """Return all file paths currently tracked in file_index."""
@@ -725,14 +874,19 @@ class DaemonDB:
     # ------------------------------------------------------------------
     def set_imports(self, source: str, targets: List[Tuple[str, str]]):
         """Set import edges for a module (replaces existing)."""
+        with self._atomic_replace("imports") as conn:
+            conn.execute("DELETE FROM imports WHERE source_module = ?", (source,))
+            if targets:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO imports (source_module, target_module, import_type) "
+                    "VALUES (?, ?, ?)",
+                    [(source, t, itype) for t, itype in targets],
+                )
+
+    def clear_imports(self) -> None:
+        """Clear every import edge as part of an authoritative rebuild."""
         conn = self._get_conn()
-        conn.execute("DELETE FROM imports WHERE source_module = ?", (source,))
-        if targets:
-            conn.executemany(
-                "INSERT OR REPLACE INTO imports (source_module, target_module, import_type) "
-                "VALUES (?, ?, ?)",
-                [(source, t, itype) for t, itype in targets],
-            )
+        conn.execute("DELETE FROM imports")
         self._commit(conn)
 
     def get_imports_of(self, module: str) -> List[str]:
@@ -813,36 +967,39 @@ class DaemonDB:
         """Store a memory. Returns False if duplicate content exists."""
         content_hash = xxhash.xxh64(content.encode()).hexdigest()
 
-        conn = self._get_conn()
-        existing = conn.execute(
-            "SELECT id FROM memories WHERE content_hash = ?",
-            (content_hash,),
-        ).fetchone()
-        if existing:
-            return False
-
-        conn.execute(
-            """INSERT INTO memories (
-                    id, content, tags, source_type, memory_type, decision_status,
+        stored = False
+        with self._atomic_replace("memory") as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO memories (
+                        id, content, tags, source_type, memory_type, decision_status,
+                        confidence, evidence, session_id, agent, trust_level,
+                        supersedes_id, created_at, resolved_at, expires_at,
+                        content_hash, embedding
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    memory_id, content, tags, source_type, memory_type, decision_status,
                     confidence, evidence, session_id, agent, trust_level,
-                    supersedes_id, created_at, resolved_at, expires_at,
-                    content_hash, embedding
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                memory_id, content, tags, source_type, memory_type, decision_status,
-                confidence, evidence, session_id, agent, trust_level,
-                supersedes_id, time.time(), resolved_at, expires_at,
-                content_hash, embedding,
-            ),
-        )
-        self._commit(conn)
-        return True
+                    supersedes_id, time.time(), resolved_at, expires_at,
+                    content_hash, embedding,
+                ),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    "INSERT INTO memory_display_ids (memory_id) VALUES (?)",
+                    (memory_id,),
+                )
+                stored = True
+        return stored
 
     def get_memory_by_id(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get a single memory by its ID."""
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            """SELECT d.display_id AS _display_id, m.*
+               FROM memories AS m
+               JOIN memory_display_ids AS d ON d.memory_id = m.id
+               WHERE m.id = ?""",
+            (memory_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -877,10 +1034,13 @@ class DaemonDB:
             where.append("session_id = ?")
             args.append(session_id)
 
-        sql = "SELECT * FROM memories"
+        sql = (
+            "SELECT d.display_id AS _display_id, m.* FROM memories AS m "
+            "JOIN memory_display_ids AS d ON d.memory_id = m.id"
+        )
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY created_at DESC"
+        sql += " ORDER BY m.created_at DESC"
         rows = conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
 
@@ -923,10 +1083,10 @@ class DaemonDB:
         memory_id: str,
         *,
         decision_status: Optional[str] = None,
-        resolved_at: Optional[float] = None,
+        resolved_at: Any = _UNSET,
         trust_level: Optional[str] = None,
         quality_score: Optional[float] = None,
-        expires_at: Optional[float] = None,
+        expires_at: Any = _UNSET,
     ) -> bool:
         """Update mutable memory fields. Returns True if a row changed."""
         sets: List[str] = []
@@ -934,7 +1094,7 @@ class DaemonDB:
         if decision_status is not None:
             sets.append("decision_status = ?")
             args.append(decision_status)
-        if resolved_at is not None:
+        if resolved_at is not _UNSET:
             sets.append("resolved_at = ?")
             args.append(resolved_at)
         if trust_level is not None:
@@ -943,7 +1103,7 @@ class DaemonDB:
         if quality_score is not None:
             sets.append("quality_score = ?")
             args.append(quality_score)
-        if expires_at is not None:
+        if expires_at is not _UNSET:
             sets.append("expires_at = ?")
             args.append(expires_at)
         if not sets:
@@ -962,24 +1122,41 @@ class DaemonDB:
         """Search memories by cosine similarity against stored embeddings."""
         import numpy as np
 
-        query_arr = np.frombuffer(query_embedding, dtype=np.float32)
+        if limit <= 0:
+            return []
+        try:
+            query_arr = np.frombuffer(query_embedding, dtype=np.float32)
+        except (TypeError, ValueError):
+            return []
+        if query_arr.size == 0 or not np.isfinite(query_arr).all():
+            return []
         q_norm = np.linalg.norm(query_arr)
-        if q_norm == 0:
+        if not np.isfinite(q_norm) or q_norm == 0:
             return []
         query_arr = query_arr / q_norm
 
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM memories WHERE embedding IS NOT NULL"
+            """SELECT d.display_id AS _display_id, m.*
+               FROM memories AS m
+               JOIN memory_display_ids AS d ON d.memory_id = m.id
+               WHERE m.embedding IS NOT NULL"""
         ).fetchall()
 
         scored = []
         for row in rows:
-            emb = np.frombuffer(row["embedding"], dtype=np.float32)
+            try:
+                emb = np.frombuffer(row["embedding"], dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+            if emb.shape != query_arr.shape or not np.isfinite(emb).all():
+                continue
             e_norm = np.linalg.norm(emb)
-            if e_norm == 0:
+            if not np.isfinite(e_norm) or e_norm == 0:
                 continue
             sim = float(np.dot(query_arr, emb / e_norm))
+            if not np.isfinite(sim):
+                continue
             scored.append((sim, dict(row)))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -993,9 +1170,10 @@ class DaemonDB:
             return []
         try:
             rows = conn.execute(
-                """SELECT m.*, rank
+                """SELECT d.display_id AS _display_id, m.*, rank
                    FROM memories_fts
                    JOIN memories m ON memories_fts.rowid = m.rowid
+                   JOIN memory_display_ids d ON d.memory_id = m.id
                    WHERE memories_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
@@ -1066,16 +1244,15 @@ class DaemonDB:
 
         Each ref dict has: ref_name, ref_type, line_number, containing_chunk.
         """
-        conn = self._get_conn()
-        conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
-        if refs:
-            conn.executemany(
-                "INSERT INTO symbol_refs (file_path, ref_name, ref_type, line_number, containing_chunk) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(file_path, r["ref_name"], r["ref_type"], r["line_number"], r["containing_chunk"])
-                 for r in refs],
-            )
-        self._commit(conn)
+        with self._atomic_replace("symbol_refs") as conn:
+            conn.execute("DELETE FROM symbol_refs WHERE file_path = ?", (file_path,))
+            if refs:
+                conn.executemany(
+                    "INSERT INTO symbol_refs (file_path, ref_name, ref_type, line_number, containing_chunk) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(file_path, r["ref_name"], r["ref_type"], r["line_number"], r["containing_chunk"])
+                     for r in refs],
+                )
 
     def get_callers(self, function_name: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Find chunks that call a given function."""
@@ -1146,22 +1323,26 @@ class DaemonDB:
         """Mark chunks as seen in a session."""
         if not chunk_keys:
             return
-        conn = self._get_conn()
         now = time.time()
-        if tokens is None:
-            tokens = [0] * len(chunk_keys)
-        # Ensure session exists
-        conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
-            "VALUES (?, COALESCE((SELECT created_at FROM sessions WHERE session_id = ?), ?), ?)",
-            (session_id, session_id, now, now),
-        )
-        conn.executemany(
-            "INSERT OR IGNORE INTO session_seen (session_id, chunk_key, provided_at, tokens) "
-            "VALUES (?, ?, ?, ?)",
-            [(session_id, key, now, tok) for key, tok in zip(chunk_keys, tokens)],
-        )
-        self._commit(conn)
+        normalized_tokens = list(tokens or [])[:len(chunk_keys)]
+        normalized_tokens.extend([0] * (len(chunk_keys) - len(normalized_tokens)))
+        with self._atomic_replace("session_seen") as conn:
+            # Session creation and all seen rows form one state transition. A
+            # malformed binding must not leave a partial session or an open
+            # transaction that poisons the caller's next write.
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, created_at, last_used_at) "
+                "VALUES (?, COALESCE((SELECT created_at FROM sessions WHERE session_id = ?), ?), ?)",
+                (session_id, session_id, now, now),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO session_seen "
+                "(session_id, chunk_key, provided_at, tokens) VALUES (?, ?, ?, ?)",
+                [
+                    (session_id, key, now, tok)
+                    for key, tok in zip(chunk_keys, normalized_tokens)
+                ],
+            )
 
     def cleanup_expired_sessions(self, ttl_seconds: int = 14400) -> int:
         """Remove sessions older than TTL. Returns count removed."""

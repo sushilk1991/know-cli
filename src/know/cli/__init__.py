@@ -9,7 +9,7 @@ import click
 from rich.console import Console
 
 from know.config import Config, load_config
-from know.logger import setup_logging, get_logger
+from know.logger import setup_logging, teardown_logging, get_logger
 from know.exceptions import KnowError
 from know.skill_installer import auto_bootstrap_skill_install
 
@@ -32,6 +32,22 @@ class KnowCLIGroup(click.Group):
         "status",
         "commands",
     )
+
+    def invoke(self, ctx: click.Context):
+        try:
+            return super().invoke(ctx)
+        finally:
+            # CliRunner and other embedders replace stdout/stderr with
+            # short-lived streams. Never retain those objects after a command.
+            console._file = None
+            try:
+                from know.ai import console as ai_console
+                from know.watcher import console as watcher_console
+                ai_console._file = None
+                watcher_console._file = None
+            except Exception:
+                pass
+            teardown_logging(logger)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         common_rows = []
@@ -102,7 +118,26 @@ def cli(
     log_file: Optional[str]
 ) -> None:
     """know — Context Intelligence for AI Coding Agents."""
+    global _timing_start, _timing_enabled, _timing_to_stderr
+
     ctx.ensure_object(dict)
+
+    # Reset process-global timing state for embedders that invoke the Click
+    # command more than once in one interpreter.
+    _timing_start = None
+    _timing_enabled = False
+    _timing_to_stderr = json_output
+
+    # Machine-readable mode reserves stdout for command JSON. Rich diagnostics
+    # from shared helpers still remain visible on stderr.
+    console._file = sys.stderr if json_output else None
+    try:
+        from know.ai import console as ai_console
+        from know.watcher import console as watcher_console
+        ai_console._file = sys.stderr if json_output else None
+        watcher_console._file = sys.stderr if json_output else None
+    except Exception:
+        pass
 
     # Validate flag combinations
     if verbose and quiet:
@@ -131,7 +166,6 @@ def cli(
     # Record start time for --time flag
     if show_time:
         import time as _time
-        global _timing_start, _timing_enabled
         _timing_start = _time.monotonic()
         _timing_enabled = True
 
@@ -152,6 +186,7 @@ def cli(
 # Global timing state — set by --time flag, read at exit
 _timing_start: Optional[float] = None
 _timing_enabled: bool = False
+_timing_to_stderr: bool = False
 
 
 def _print_timing():
@@ -160,10 +195,19 @@ def _print_timing():
     if _timing_enabled and _timing_start is not None:
         import time as _time
         elapsed = _time.monotonic() - _timing_start
+        target = sys.stderr if _timing_to_stderr else sys.stdout
+        timing_console = Console(file=target)
         if elapsed < 1:
-            console.print(f"[dim]⏱ {elapsed * 1000:.0f}ms[/dim]", highlight=False)
+            timing_console.print(
+                f"[dim]⏱ {elapsed * 1000:.0f}ms[/dim]",
+                highlight=False,
+            )
         else:
-            console.print(f"[dim]⏱ {elapsed:.2f}s[/dim]", highlight=False)
+            timing_console.print(
+                f"[dim]⏱ {elapsed:.2f}s[/dim]",
+                highlight=False,
+            )
+        _timing_enabled = False
 
 
 # -----------------------------------------------------------------------
@@ -197,10 +241,12 @@ def docs(ctx: click.Context, only: str) -> None:
     from know.scanner import CodebaseScanner
 
     config = ctx.obj["config"]
-    scanner = CodebaseScanner(config)
     generator = DocGenerator(config)
-
-    structure = scanner.get_structure()
+    scanner = CodebaseScanner(config)
+    try:
+        structure = scanner.get_structure()
+    finally:
+        scanner.close()
     results = {}
 
     def _render_local_system_doc() -> str:
@@ -270,7 +316,8 @@ def docs(ctx: click.Context, only: str) -> None:
 
     # API docs (if routes found)
     if only in ("all", "api"):
-        routes = scanner.extract_api_routes()
+        with CodebaseScanner(config) as scanner:
+            routes = scanner.extract_api_routes()
         if routes:
             api_path = generator.generate_openapi(routes)
             results["api"] = str(api_path)

@@ -56,8 +56,12 @@ _AGENT_PREFIXES = [
 
 # Regex for detecting code identifiers
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
-_CAMEL_CASE_RE = re.compile(r"^[A-Z][a-zA-Z0-9]*[a-z][a-zA-Z0-9]*$")
-_DOTTED_PATH_RE = re.compile(r"^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$")
+_CAMEL_TRANSITION_RE = re.compile(r"[a-z0-9][A-Z]")
+_ACRONYM_CAMEL_RE = re.compile(r"^[A-Z]{2,}[a-z]")
+_QUERY_TOKEN_RE = re.compile(
+    r"(?:[^\W\d]|_)\w*(?:\.(?:[^\W\d]|_)\w*)*",
+    flags=re.UNICODE,
+)
 
 
 QueryType = Literal["identifier", "concept", "error"]
@@ -109,7 +113,7 @@ def analyze_query(query: str) -> SearchPlan:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
 
     # Step 2: Tokenize
-    raw_tokens = re.findall(r"[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*", cleaned)
+    raw_tokens = _QUERY_TOKEN_RE.findall(cleaned)
 
     # Step 3: Detect identifiers and classify
     identifiers: List[str] = []
@@ -154,13 +158,15 @@ def analyze_query(query: str) -> SearchPlan:
 def _is_identifier(token: str) -> bool:
     """Check if a token looks like a code identifier."""
     # Dotted paths: know.daemon_db.search_chunks
-    if _DOTTED_PATH_RE.match(token):
+    if "." in token and all(part.isidentifier() for part in token.split(".")):
         return True
     # snake_case: verify_session, build_fts_query
     if _SNAKE_CASE_RE.match(token):
         return True
     # CamelCase: AuthMiddleware, DaemonDB
-    if _CAMEL_CASE_RE.match(token):
+    if token[:1].isupper() and (
+        _CAMEL_TRANSITION_RE.search(token) or _ACRONYM_CAMEL_RE.search(token)
+    ):
         return True
     # Contains underscore anywhere (likely code)
     if "_" in token and len(token) > 2:
@@ -201,11 +207,15 @@ def _classify_query(original: str, identifiers: List[str], terms: List[str]) -> 
         return "identifier"
 
     # Error queries contain error-related words
-    error_words = {"error", "exception", "traceback", "stack", "crash",
-                   "fail", "failure", "broken", "wrong", "issue", "bug",
-                   "raise", "raises", "throw", "throws", "panic"}
-    lower_original = original.lower()
-    if any(w in lower_original for w in error_words):
+    error_words = {
+        "error", "errors", "exception", "exceptions", "traceback", "tracebacks",
+        "stack", "crash", "crashed", "crashes", "fail", "failed", "fails",
+        "failing", "failure", "failures", "broken", "wrong", "issue", "issues",
+        "bug", "bugs", "raise", "raised", "raises", "throw", "throwing", "throws",
+        "thrown", "panic", "panicked", "panics",
+    }
+    original_words = set(re.findall(r"\w+", original.lower(), flags=re.UNICODE))
+    if original_words & error_words:
         return "error"
 
     return "concept"

@@ -8,10 +8,13 @@ modules with the same leaf name (e.g., auth.config vs db.config).
 """
 
 import ast
+import fcntl
 import posixpath
 import re
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from know.logger import get_logger
 from know.path_filters import is_hard_excluded_path
@@ -20,6 +23,27 @@ if TYPE_CHECKING:
     from know.config import Config
 
 logger = get_logger()
+
+_BUILD_LOCKS: Dict[str, threading.Lock] = {}
+_BUILD_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _serialized_build(root: Path) -> Iterator[None]:
+    """Serialize source snapshots and import-graph publication per project."""
+    key = str(root.resolve())
+    with _BUILD_LOCKS_GUARD:
+        thread_lock = _BUILD_LOCKS.setdefault(key, threading.Lock())
+
+    with thread_lock:
+        lock_path = root / ".know" / "import-graph.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 _JS_IMPORT_RE = re.compile(
     r"""(?:import\s+.*?\s+from\s+|import\s+|export\s+.*?\s+from\s+|require\()\s*["']([^"']+)["']"""
@@ -123,6 +147,12 @@ class ImportGraph:
     def close(self):
         self._db.close()
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __enter__(self):
         return self
 
@@ -142,6 +172,10 @@ class ImportGraph:
         Returns:
             Number of edges inserted.
         """
+        with _serialized_build(self.root):
+            return self._build_locked(modules)
+
+    def _build_locked(self, modules: Optional[list]) -> int:
         # Build two lookup tables:
         #   fqn_set: set of all fully-qualified module names
         #   leaf_to_fqn: leaf_name -> list of FQNs (detects ambiguity)
@@ -149,7 +183,7 @@ class ImportGraph:
         leaf_to_fqn: Dict[str, List[str]] = {}
         py_files: Dict[str, Path] = {}  # fqn -> abs path
 
-        if modules:
+        if modules is not None:
             for m in modules:
                 path_str = m["path"] if isinstance(m, dict) else str(m.path)
                 name = m["name"] if isinstance(m, dict) else m.name
@@ -157,13 +191,29 @@ class ImportGraph:
                 leaf = name.split(".")[-1]
                 leaf_to_fqn.setdefault(leaf, []).append(name)
                 py_files[name] = self.root / path_str
+
+            # The scanner omits files that fail parsing, but populate_index
+            # deliberately retains their last-known-good DB rows. Include that
+            # authoritative indexed scope so a transient full-scan failure does
+            # not make the import graph treat a still-present module as deleted.
+            for path_str in self._db.list_indexed_files():
+                path = Path(path_str)
+                if path.suffix != ".py":
+                    continue
+                name = str(path.with_suffix("")).replace("\\", "/").replace("/", ".")
+                if name in fqn_set:
+                    continue
+                fqn_set.add(name)
+                leaf_to_fqn.setdefault(name.split(".")[-1], []).append(name)
+                py_files[name] = self.root / path
         else:
             for py in self.root.rglob("*.py"):
-                if is_hard_excluded_path(py):
-                    continue
                 try:
                     rel = py.relative_to(self.root)
+                    py.resolve().relative_to(self.root.resolve())
                 except ValueError:
+                    continue
+                if is_hard_excluded_path(rel):
                     continue
                 name = str(rel.with_suffix("")).replace("/", ".")
                 fqn_set.add(name)
@@ -190,6 +240,7 @@ class ImportGraph:
 
         # Collect edges per source module
         edges_by_source: Dict[str, List[Tuple[str, str]]] = {}
+        failed_sources: Set[str] = set()
 
         for mod_name, abs_path in py_files.items():
             if not abs_path.exists() or not str(abs_path).endswith(".py"):
@@ -197,7 +248,8 @@ class ImportGraph:
             try:
                 source = abs_path.read_text(encoding="utf-8", errors="ignore")
                 tree = ast.parse(source)
-            except (SyntaxError, UnicodeDecodeError):
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                failed_sources.add(mod_name)
                 continue
 
             mod_edges: List[Tuple[str, str]] = []
@@ -212,21 +264,51 @@ class ImportGraph:
                             targets.append((resolved, "import"))
 
                 elif isinstance(node, ast.ImportFrom):
-                    if node.module:
-                        resolved = _resolve(node.module)
+                    candidates: List[str] = []
+                    if node.level:
+                        package = mod_name.split(".")[:-1]
+                        ascend = node.level - 1
+                        if ascend <= len(package):
+                            base = package[:len(package) - ascend] if ascend else package
+                            if node.module:
+                                candidates.append(".".join(base + [node.module]))
+                            else:
+                                candidates.extend(
+                                    ".".join(base + [alias.name])
+                                    for alias in node.names
+                                )
+                    elif node.module:
+                        candidates.append(node.module)
+
+                    for candidate in candidates:
+                        resolved = _resolve(candidate)
                         if resolved and resolved != mod_name:
                             targets.append((resolved, "from"))
 
                 for resolved, imp_type in targets:
                     mod_edges.append((resolved, imp_type))
 
-            edges_by_source[mod_name] = mod_edges
+            # Repeated imports should not inflate counts or perform redundant
+            # writes, while preserving the first import kind deterministically.
+            edges_by_source[mod_name] = list(dict.fromkeys(mod_edges))
 
-        # Persist via DaemonDB
+        # Successfully parsed sources are authoritative even when their import
+        # set is empty. Failed sources retain their last-good outgoing edges;
+        # sources absent from the authoritative module set are removed.
+        existing_sources = {source for source, _target in self._db.get_all_edges()}
         total_edges = 0
-        for source_mod, targets in edges_by_source.items():
-            self._db.set_imports(source_mod, targets)
-            total_edges += len(targets)
+        with self._db.batch():
+            for stale_source in existing_sources - fqn_set:
+                self._db.set_imports(stale_source, [])
+            for source_mod, targets in edges_by_source.items():
+                self._db.set_imports(source_mod, targets)
+                total_edges += len(targets)
+
+        if failed_sources:
+            logger.debug(
+                "Preserved last-good imports for %s unparseable modules",
+                len(failed_sources),
+            )
 
         return total_edges
 

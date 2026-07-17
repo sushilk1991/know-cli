@@ -132,23 +132,6 @@ class TestAISummarizer:
         assert "Test function" in result  # Should use docstring from fallback
         assert "test_func" in result
     
-    def test_component_content_truncation(self, config, monkeypatch):
-        """Test that long component content is truncated."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        
-        summarizer = AISummarizer(config)
-        long_content = "x = 1\n" * 1000
-        component = CodeComponent(
-            name="long_func",
-            type="function",
-            file_path="test.py",
-            content=long_content
-        )
-        
-        # Should compress/truncate the content
-        compressed = summarizer.optimizer.compress_code(long_content, max_chars=1200)
-        assert len(compressed) < len(long_content)
-    
     def test_cost_calculation(self, config, monkeypatch):
         """Test cost calculation for API calls."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")

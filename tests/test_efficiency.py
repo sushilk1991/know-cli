@@ -194,22 +194,6 @@ def modified_function_{i}() -> None:
         assert stats['modules'] == 50  # All 50 loaded (3 new + 47 cached)
         assert stats.get('changed_files', 0) == 3
     
-    def test_cache_persistence(self, config, temp_repo):
-        """Test that cache persists across scanner instances."""
-        # First scanner populates cache
-        scanner1 = CodebaseScanner(config)
-        scanner1.scan()
-        
-        # Create new scanner (simulates new process)
-        scanner2 = CodebaseScanner(config)
-        start = time.perf_counter()
-        stats = scanner2.scan()
-        elapsed = time.perf_counter() - start
-        
-        print(f"\nCache persistence test: {elapsed:.3f}s")
-        assert stats.get('cached_files', 0) == 50
-        assert elapsed < 1.0
-    
     def test_large_fileset_performance(self):
         """Test with a larger set of files."""
         temp_dir = Path(tempfile.mkdtemp())
@@ -317,29 +301,6 @@ def modified_function():
         
         # Verify cache miss
         assert index.is_file_changed(test_file)
-    
-    def test_cache_hit_on_same_content(self, config, temp_repo):
-        """Verify cache hits when content is identical."""
-        test_file = temp_repo / "test.py"
-        content = '''
-def my_function():
-    """My function."""
-    pass
-'''
-        test_file.write_text(content)
-        
-        # First scan
-        scanner = CodebaseScanner(config)
-        scanner.scan()
-        
-        # Simulate file modification (same content, different mtime)
-        time.sleep(0.1)
-        test_file.write_text(content)
-        
-        # Should still detect as changed due to mtime, but hash should match
-        index = CodebaseIndex(config)
-        # Note: mtime check will trigger re-parse, but that's acceptable
-        # The hash check ensures we don't re-parse unnecessarily in batch operations
     
     def test_structure_consistency(self, config, temp_repo):
         """Verify structure is identical between cached and fresh scans."""

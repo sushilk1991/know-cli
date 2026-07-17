@@ -26,9 +26,17 @@ _model_cache: Dict[str, Any] = {}
 _lock = threading.Lock()
 
 
+def _configured_fastembed_cache_root() -> Path:
+    """Return the cache root FastEmbed will use for this process."""
+    configured = os.environ.get("FASTEMBED_CACHE_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cache" / "know-cli" / "fastembed"
+
+
 def _configure_fastembed_cache_dir() -> None:
     """Prefer a stable cache path over ephemeral temp directories."""
-    cache_root = Path.home() / ".cache" / "know-cli" / "fastembed"
+    cache_root = _configured_fastembed_cache_root()
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -36,19 +44,49 @@ def _configure_fastembed_cache_dir() -> None:
     os.environ.setdefault("FASTEMBED_CACHE_PATH", str(cache_root))
 
 
-def _extract_fastembed_model_dir(err_text: str) -> Optional[Path]:
-    """Best-effort extraction of the model cache directory from fastembed errors."""
-    m = re.search(r"Load model from\s+(.+?model_optimized\.onnx)", err_text, flags=re.IGNORECASE)
+def _extract_fastembed_model_dir(
+    err_text: str, cache_root: Optional[Path] = None
+) -> Optional[Path]:
+    """Extract a direct child model directory from a FastEmbed error safely."""
+    m = re.search(
+        r"Load model from\s+[\"']?(.+?model_optimized\.onnx)[\"']?",
+        err_text,
+        flags=re.IGNORECASE,
+    )
     if not m:
         return None
-    onnx_path = Path(m.group(1).strip())
+    onnx_path = Path(m.group(1).strip()).expanduser()
+    configured_root = cache_root or _configured_fastembed_cache_root()
 
-    # Find ".../fastembed_cache/<model_dir>/..." and remove <model_dir>.
-    parts = onnx_path.parts
-    for idx, part in enumerate(parts):
-        if "fastembed_cache" in part.lower() and idx + 1 < len(parts):
-            return Path(*parts[: idx + 2])
-    return onnx_path.parent
+    # Cache-repair paths come from exception text, so treat anything ambiguous as
+    # untrusted. Resolving both paths closes ``..`` and symlink escapes before a
+    # destructive operation is considered.
+    if not onnx_path.is_absolute() or not configured_root.is_absolute():
+        return None
+    if configured_root.is_symlink():
+        return None
+
+    try:
+        resolved_root = configured_root.resolve(strict=False)
+        resolved_onnx = onnx_path.resolve(strict=False)
+        relative_onnx = resolved_onnx.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    # The model directory must be a real, direct child of the configured root.
+    # Never select the cache root itself or infer a target outside it.
+    if len(relative_onnx.parts) < 2:
+        return None
+    model_path = resolved_root / relative_onnx.parts[0]
+    if model_path.is_symlink():
+        return None
+    try:
+        resolved_model = model_path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if resolved_model.parent != resolved_root:
+        return None
+    return resolved_model
 
 
 def _is_fastembed_cache_error(exc: Exception) -> bool:
@@ -70,8 +108,8 @@ def _repair_fastembed_cache(exc: Exception) -> bool:
         return False
 
     try:
-        if model_dir.exists():
-            shutil.rmtree(model_dir, ignore_errors=True)
+        if model_dir.is_dir() and not model_dir.is_symlink():
+            shutil.rmtree(model_dir)
             logger.warning(f"Removed corrupted fastembed model cache: {model_dir}")
             return True
     except Exception as e:

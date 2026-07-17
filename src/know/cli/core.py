@@ -12,7 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from know.cli import console, logger
 from know.config import Config
 from know.scanner import CodebaseScanner
-from know.generator import DocGenerator
+from know.generator import DocGenerator, atomic_write_text
 from know.ai import AISummarizer
 from know.watcher import FileWatcher
 
@@ -38,7 +38,13 @@ def init(ctx: click.Context, path: str, force: bool) -> None:
     config_path = root / ".know" / "config.yaml"
 
     if config_path.exists() and not force:
-        if ctx.obj.get("quiet"):
+        if ctx.obj.get("json"):
+            import json
+            click.echo(json.dumps({
+                "status": "already_initialized",
+                "config_path": str(config_path),
+            }))
+        elif ctx.obj.get("quiet"):
             click.echo("Already initialized", err=True)
         else:
             console.print("[yellow]⚠ know is already initialized. Use --force to overwrite.[/yellow]")
@@ -59,14 +65,10 @@ def init(ctx: click.Context, path: str, force: bool) -> None:
     config = Config.create_default(root)
     config.save(config_path)
 
-    if ctx.obj.get("quiet"):
+    if ctx.obj.get("json"):
+        pass  # Emit one complete JSON document after scanning.
+    elif ctx.obj.get("quiet"):
         click.echo(config_path)
-    elif ctx.obj.get("json"):
-        import json
-        click.echo(json.dumps({
-            "status": "initialized",
-            "config_path": str(config_path)
-        }))
     else:
         console.print(f"[green]✓[/green] Created config at [cyan]{config_path}[/cyan]")
 
@@ -74,25 +76,28 @@ def init(ctx: click.Context, path: str, force: bool) -> None:
     if not ctx.obj.get("quiet"):
         console.print("\n[dim]Scanning codebase...[/dim]")
 
-    scanner = CodebaseScanner(config)
-
-    if ctx.obj.get("verbose") or ctx.obj.get("json"):
-        stats = scanner.scan()
-    else:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
-        ) as progress:
-            task = progress.add_task("Scanning files...", total=None)
+    with CodebaseScanner(config) as scanner:
+        if ctx.obj.get("verbose") or ctx.obj.get("json"):
             stats = scanner.scan()
-            progress.update(task, completed=True)
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+            ) as progress:
+                task = progress.add_task("Scanning files...", total=None)
+                stats = scanner.scan()
+                progress.update(task, completed=True)
 
-    if ctx.obj.get("quiet"):
-        pass  # No output
-    elif ctx.obj.get("json"):
+    if ctx.obj.get("json"):
         import json
-        click.echo(json.dumps(stats))
+        click.echo(json.dumps({
+            "status": "initialized",
+            "config_path": str(config_path),
+            "scan": stats,
+        }))
+    elif ctx.obj.get("quiet"):
+        pass  # No output
     else:
         console.print(f"[green]✓[/green] Found [bold]{stats['files']}[/bold] files")
         console.print(f"  - Functions: [bold]{stats['functions']}[/bold]")
@@ -139,11 +144,11 @@ def explain(ctx: click.Context, component: str, detailed: bool) -> None:
     if not ctx.obj.get("quiet"):
         console.print(f"[dim]Analyzing [bold]{component}[/bold]...[/dim]")
 
-    scanner = CodebaseScanner(config)
     ai = AISummarizer(config)
 
     # Find component
-    matches = scanner.find_component(component)
+    with CodebaseScanner(config) as scanner:
+        matches = scanner.find_component(component)
     if not matches:
         if ctx.obj.get("json"):
             import json
@@ -166,14 +171,14 @@ def explain(ctx: click.Context, component: str, detailed: bool) -> None:
     # Auto-store explanation as memory
     try:
         from know.knowledge_base import KnowledgeBase
-        kb = KnowledgeBase(config)
-        summary = explanation[:300].strip()
-        if summary:
-            kb.remember(
-                f"[{component}] {summary}",
-                source="auto-explain",
-                tags=component,
-            )
+        with KnowledgeBase(config) as kb:
+            summary = explanation[:300].strip()
+            if summary:
+                kb.remember(
+                    f"[{component}] {summary}",
+                    source="auto-explain",
+                    tags=component,
+                )
     except Exception as e:
         logger.debug(f"Auto-store explanation memory failed: {e}")
 
@@ -216,10 +221,10 @@ def diagram(ctx: click.Context, diagram_type: str, output: Optional[str]) -> Non
     if not ctx.obj.get("quiet"):
         console.print(f"[dim]Generating [bold]{diagram_type}[/bold] diagrams...[/dim]")
 
-    scanner = CodebaseScanner(config)
     generator = DocGenerator(config)
 
-    structure = scanner.get_structure()
+    with CodebaseScanner(config) as scanner:
+        structure = scanner.get_structure()
 
     results = []
 
@@ -269,10 +274,10 @@ def api(ctx: click.Context, output_format: str, output: Optional[str]) -> None:
     if not ctx.obj.get("quiet"):
         console.print(f"[dim]Generating API docs ([bold]{output_format}[/bold])...[/dim]")
 
-    scanner = CodebaseScanner(config)
     generator = DocGenerator(config)
 
-    routes = scanner.extract_api_routes()
+    with CodebaseScanner(config) as scanner:
+        routes = scanner.extract_api_routes()
 
     if not routes:
         if ctx.obj.get("json"):
@@ -312,7 +317,7 @@ def api(ctx: click.Context, output_format: str, output: Optional[str]) -> None:
 )
 @click.option(
     "--format",
-    type=click.Choice(["markdown", "pdf", "html"]),
+    type=click.Choice(["markdown", "html"]),
     default="markdown",
     help="Output format",
 )
@@ -324,11 +329,11 @@ def onboard(ctx: click.Context, audience: str, format: str) -> None:
     if not ctx.obj.get("quiet"):
         console.print(f"[dim]Creating onboarding guide for [bold]{audience}[/bold]...[/dim]")
 
-    scanner = CodebaseScanner(config)
     ai = AISummarizer(config)
     generator = DocGenerator(config)
 
-    structure = scanner.get_structure()
+    with CodebaseScanner(config) as scanner:
+        structure = scanner.get_structure()
     guide = ai.generate_onboarding_guide(structure, audience)
 
     path = generator.save_onboarding(guide, audience, format)
@@ -371,10 +376,10 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
     if not ctx.obj.get("quiet"):
         console.print("[dim]Generating codebase digest...[/dim]")
 
-    scanner = CodebaseScanner(config)
     ai = AISummarizer(config)
 
-    structure = scanner.get_structure()
+    with CodebaseScanner(config) as scanner:
+        structure = scanner.get_structure()
 
     if for_llm:
         digest_content = ai.generate_llm_digest(structure, compact=compact)
@@ -389,17 +394,16 @@ def digest(ctx: click.Context, for_llm: bool, compact: bool, output: Optional[st
         suffix += "-compact" if compact else ""
         out_path = Path(config.output.directory) / f"digest{suffix}.md"
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(digest_content)
+    atomic_write_text(out_path, digest_content)
 
     # Auto-store digest insights as memories
     try:
         from know.knowledge_base import KnowledgeBase
-        kb = KnowledgeBase(config)
-        digest_lines = [l.strip() for l in digest_content.splitlines() if l.strip() and not l.startswith("#")]
-        for insight in digest_lines[:3]:
-            if len(insight) > 20:
-                kb.remember(insight[:500], source="auto-digest", tags="digest")
+        with KnowledgeBase(config) as kb:
+            digest_lines = [l.strip() for l in digest_content.splitlines() if l.strip() and not l.startswith("#")]
+            for insight in digest_lines[:3]:
+                if len(insight) > 20:
+                    kb.remember(insight[:500], source="auto-digest", tags="digest")
     except Exception as e:
         logger.debug(f"Auto-store digest memory failed: {e}")
 
@@ -463,10 +467,10 @@ def update(
     if not quiet_mode and not ctx.obj.get("json"):
         console.print("[bold blue]Updating documentation...[/bold blue]")
 
-    scanner = CodebaseScanner(config)
     generator = DocGenerator(config)
 
-    structure = scanner.get_structure()
+    with CodebaseScanner(config) as scanner:
+        structure = scanner.get_structure()
 
     results = []
 
@@ -483,7 +487,8 @@ def update(
             console.print(f"[green]✓[/green] Architecture: [cyan]{path}[/cyan]")
 
     if only == "api" or run_all:
-        routes = scanner.extract_api_routes()
+        with CodebaseScanner(config) as scanner:
+            routes = scanner.extract_api_routes()
         if routes:
             path = generator.generate_openapi(routes)
             results.append({"type": "api", "path": str(path), "routes": len(routes)})
